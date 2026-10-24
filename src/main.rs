@@ -1,14 +1,16 @@
 mod app;
 mod artwork;
 mod config;
+mod db;
 mod desktop;
-mod fuzzy;
+mod index;
 mod library;
 mod metadata;
 mod models;
 mod mpris;
 mod player;
 mod player_bar;
+mod search;
 mod tray;
 
 use app::Omamusic;
@@ -201,22 +203,18 @@ fn dump_library() {
     let lib = Library::new().expect("library");
     for _ in 0..150 {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let s = lib.snapshot();
-        if !s.folders.is_empty() && !s.scanning && s.version > 0 {
+        if !lib.snapshot().scanning {
             break;
         }
     }
     let s = lib.snapshot();
-    println!("albums={} tracks={}", s.albums.len(), s.all_tracks.len());
-    for a in &s.albums {
+    println!("albums={} tracks={}", s.album_count, s.track_count);
+    for album in lib.album_page(0, 1_000_000) {
         println!(
             "ALBUM {:?} artist={:?} year={} n={}",
-            a.title,
-            a.artist,
-            a.year,
-            a.tracks.len()
+            album.title, album.artist, album.year, album.track_count
         );
-        for t in a.tracks.iter() {
+        for t in lib.album_tracks(&album.id) {
             println!(
                 "  TRK {:?} artist={:?} album={:?} no={} dur={:.1} file={}",
                 t.title,
@@ -237,11 +235,19 @@ fn dump_library() {
     ] {
         lib.set_query(q.to_string());
         let s = lib.snapshot();
+        let albums = s
+            .filter
+            .as_ref()
+            .map_or(s.album_count, |f| f.album_keys.len());
+        let tracks = s
+            .filter
+            .as_ref()
+            .map_or(s.track_count, |f| f.track_ids.len());
         println!(
             "query={q:?} albums={} tracks={} artists={}",
-            s.filtered_albums.len(),
-            s.filtered_tracks.len(),
-            s.artists.len()
+            albums,
+            tracks,
+            lib.artist_total()
         );
     }
 }

@@ -18,19 +18,21 @@ Run `omamusic`, open Settings, and add a music folder. Configuration is stored a
 
 ## Features
 
-- Local, read-only library scan with album, artist and song views; no database, accounts or network services.
+- Local, read-only library indexed into a SQLite database at `~/.cache/omamusic/library.db`; album, artist and song views; no accounts or network services.
 - Embedded metadata and cover art for MP3, FLAC, MP4/M4A and Vorbis comments, with folder cover art fallback.
 - In-process decoding through Rodio/Symphonia and output through CPAL. Supports MP3, FLAC, Vorbis, AAC/ALAC, WAV and AIFF without installed codecs.
 - Play/pause, seek, previous/next, shuffle, repeat and saved volume.
-- Fuzzy search and album detail views inspired by Overdrive.
-- Automatic rescan on filesystem changes, including folders added in Settings.
+- BM25 full-text search (SQLite FTS5) with partial-word matching, and album detail views inspired by Overdrive.
+- Background incremental rescan on filesystem changes: only new or changed files are re-read, and folders added in Settings are picked up.
 - Omarchy theme following through `gpui-omarchy`.
 
 Space toggles playback, Left/Right changes tracks, and Ctrl+R rescans the library. A folder picker uses `zenity` or `kdialog` if available.
 
 ## Architecture
 
-`src/library.rs` scans configured directories on a background thread and keeps an in-memory snapshot. `src/metadata.rs` reads local tags without requiring a codec plugin. `src/player.rs` decodes and buffers audio on a worker thread and feeds CPAL's output callback, keeping disk reads and decoding off the audio thread. `src/app.rs` renders the GPUI interface and consumes the library and playback snapshots. `src/config.rs` persists folders and volume.
+`src/library.rs` owns the in-memory library state and pages rows from SQLite on demand, so the full library is never held in memory. `src/db.rs` defines the schema: `tracks` is the source of truth, `albums` is a materialized roll-up, and two FTS5 tables back BM25 search through triggers. `src/index.rs` reconciles the configured directories in the background, comparing size and mtime so unchanged files are never re-read; cover art is stored as blobs and loaded lazily by `src/artwork.rs`. `src/search.rs` translates user input into safe FTS5 queries. `src/metadata.rs` reads local tags without requiring a codec plugin. `src/player.rs` decodes and buffers audio on a worker thread and feeds CPAL's output callback, keeping disk reads and decoding off the audio thread. `src/app.rs` renders the GPUI interface and consumes the library and playback snapshots. `src/config.rs` persists folders and volume.
+
+The SQLite index is disposable: if it is missing, corrupt or from an older schema it is rebuilt from the audio files on the next start. Deleting `~/.cache/omamusic/library.db` is always safe.
 
 Opus is not decoded by the bundled Symphonia version, so `.opus` files are not included in the library. Opus streams inside `.ogg` containers are also unsupported.
 

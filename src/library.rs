@@ -1,46 +1,45 @@
+//! Library state: SQLite-backed list paging, BM25 search and background
+//! reconciliation with the music folders.
+
 use crate::artwork::ArtworkCache;
 use crate::config::AppConfig;
-use crate::fuzzy::FuzzySearch;
-use crate::metadata;
-use crate::models::{Album, Track};
-use anyhow::Result;
+use crate::db::{self, Db};
+use crate::index;
+use crate::models::{Album, AlbumSummary, ArtistEntry, Track};
+use crate::search;
+use anyhow::{Context, Result};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Search results for the current query. Ids are small, so they are kept in
+/// memory; the rows themselves are paged from SQLite on demand.
+#[derive(Debug, Clone, Default)]
+pub struct Filter {
+    pub track_ids: Arc<[i64]>,
+    pub album_keys: Arc<[String]>,
+    pub artists: Arc<[ArtistEntry]>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct LibrarySnapshot {
     pub folders: Vec<PathBuf>,
-    pub albums: Vec<Album>,
-    pub filtered_albums: Arc<[Album]>,
-    pub all_tracks: Arc<[Track]>,
-    pub filtered_tracks: Arc<[Track]>,
-    pub artists: Vec<(String, Vec<Album>)>,
+    pub album_count: usize,
+    pub track_count: usize,
+    pub filter: Option<Filter>,
     pub scanning: bool,
     pub query: String,
     pub version: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LibraryCache {
-    folders: Vec<PathBuf>,
-    albums: Vec<Album>,
-    all_tracks: Vec<Track>,
-    artists: Vec<(String, Vec<Album>)>,
-    version: u64,
-    timestamp: u64,
 }
 
 type SharedSnapshot = Arc<RwLock<Arc<LibrarySnapshot>>>;
 
 pub struct Library {
     state: SharedSnapshot,
+    db: Arc<Db>,
     covers: ArtworkCache,
     watcher: Mutex<Option<RecommendedWatcher>>,
     rescan_tx: Sender<()>,
@@ -53,111 +52,132 @@ fn update(state: &SharedSnapshot, change: impl FnOnce(&mut LibrarySnapshot)) {
     snapshot.version += 1;
 }
 
-fn rank<T: Clone>(items: &[T], limit: usize, score: impl Fn(&T) -> i32) -> Vec<T> {
-    let mut scored: Vec<(i32, &T)> = items
-        .iter()
-        .map(|item| (score(item), item))
-        .filter(|(score, _)| *score > 0)
-        .collect();
-    scored.sort_by_key(|(score, _)| Reverse(*score));
-    scored
-        .into_iter()
-        .take(limit)
-        .map(|(_, item)| item.clone())
-        .collect()
-}
-
 impl Library {
     pub fn new() -> Result<Self> {
         let folders = AppConfig::load().folders;
+        let db_path = Self::db_path()?;
+        let db = Arc::new(Db::open(db_path)?);
+
         let (rescan_tx, rx) = mpsc::channel::<()>();
         let watcher = Self::make_watcher(&folders, &rescan_tx)?;
 
-        // Try to load cache for instant startup
-        let temp_state = Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
-            folders: folders.clone(),
-            ..Default::default()
-        })));
         let covers = ArtworkCache::default();
-        let mut lib = Self {
-            state: temp_state,
-            covers: covers.clone(),
-            watcher: Mutex::new(None),
-            rescan_tx: rescan_tx.clone(),
-        };
-
-        if let Some(cache) = lib.load_cache() {
-            if cache.folders == folders {
-                // Cache is valid for current folders, load it
-                let mut snapshot = LibrarySnapshot {
-                    folders: cache.folders,
-                    albums: cache.albums,
-                    all_tracks: cache.all_tracks.into(),
-                    filtered_tracks: Arc::new([]),
-                    filtered_albums: Arc::new([]),
-                    artists: cache.artists,
-                    scanning: false,
-                    query: String::new(),
-                    version: cache.version,
-                };
-                Self::apply_search(&mut snapshot);
-                let state = Arc::new(RwLock::new(Arc::new(snapshot)));
-                lib.state = state;
-            }
+        {
+            let db = db.clone();
+            covers.set_provider(Arc::new(move |key: &str| {
+                db.read(|conn| db::artwork(conn, key)).ok().flatten()
+            }));
         }
 
-        let state = lib.state.clone();
-        let covers = lib.covers.clone();
-        let rescan_tx_clone = lib.rescan_tx.clone();
+        let state: SharedSnapshot = Arc::new(RwLock::new(Arc::new(Self::load_snapshot(
+            &db,
+            folders.clone(),
+        )?)));
+        update(&state, |s| s.scanning = true);
 
+        let thread_state = state.clone();
+        let thread_db = db.clone();
+        let thread_covers = covers.clone();
         std::thread::spawn(move || {
-            Self::do_scan(&state, &covers);
-            while rx.recv().is_ok() {
+            let mut writer = match Db::open_writer(&thread_db.path) {
+                Ok(writer) => writer,
+                Err(err) => {
+                    eprintln!("open library database: {err:#}");
+                    return;
+                }
+            };
+            loop {
+                let folders = thread_state.read().folders.clone();
+                update(&thread_state, |s| s.scanning = true);
+                match index::reconcile(&mut writer, &folders) {
+                    Ok(stats) => {
+                        for key in &stats.changed_albums {
+                            thread_covers.remove(key);
+                        }
+                        if stats.removed > 0 {
+                            thread_covers.clear();
+                        }
+                        Self::reload(&thread_state, &thread_db);
+                    }
+                    Err(err) => eprintln!("scan library: {err:#}"),
+                }
+                update(&thread_state, |s| s.scanning = false);
+
+                if rx.recv().is_err() {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(800));
                 while rx.try_recv().is_ok() {}
-                Self::do_scan(&state, &covers);
             }
         });
 
         Ok(Self {
-            state: lib.state,
-            covers: lib.covers,
+            state,
+            db,
+            covers,
             watcher: Mutex::new(watcher),
-            rescan_tx: rescan_tx_clone,
+            rescan_tx,
         })
     }
 
-    fn cache_path() -> Option<PathBuf> {
-        dirs::cache_dir().map(|d| d.join("omamusic").join("library_cache.json"))
+    fn db_path() -> Result<PathBuf> {
+        let dir = dirs::cache_dir().context("no cache directory")?;
+        Ok(dir.join("omamusic").join("library.db"))
     }
 
-    fn load_cache(&self) -> Option<LibraryCache> {
-        let path = Self::cache_path()?;
-        let data = std::fs::read(path).ok()?;
-        serde_json::from_slice(&data).ok()
+    fn load_snapshot(db: &Db, folders: Vec<PathBuf>) -> Result<LibrarySnapshot> {
+        let (track_count, album_count) =
+            db.read(|conn| Ok((db::track_count(conn)?, db::album_count(conn)?)))?;
+        Ok(LibrarySnapshot {
+            folders,
+            album_count,
+            track_count,
+            ..Default::default()
+        })
     }
 
-    fn save_cache(snapshot: &LibrarySnapshot) {
-        if let Some(path) = Library::cache_path() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let cache = LibraryCache {
-                folders: snapshot.folders.clone(),
-                albums: snapshot.albums.clone(),
-                all_tracks: snapshot.all_tracks.iter().cloned().collect(),
-                artists: snapshot.artists.clone(),
-                version: snapshot.version,
-                timestamp: match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                {
-                    Ok(d) => d.as_secs(),
-                    Err(_) => 0,
-                },
-            };
-            if let Ok(data) = serde_json::to_vec(&cache) {
-                let _ = std::fs::write(path, data);
+    fn reload(state: &SharedSnapshot, db: &Db) {
+        let counts = db.read(|conn| Ok((db::track_count(conn)?, db::album_count(conn)?)));
+        let Ok((track_count, album_count)) = counts else {
+            return;
+        };
+        // Recompute until the query we searched for is still the current one,
+        // so a query typed while the scan was running is not left stale.
+        loop {
+            let query = state.read().query.clone();
+            let filter = Self::compute_filter(db, &query);
+            let mut installed = false;
+            update(state, |s| {
+                s.track_count = track_count;
+                s.album_count = album_count;
+                if s.query == query {
+                    s.filter = filter;
+                    installed = true;
+                }
+            });
+            if installed {
+                break;
             }
         }
+    }
+
+    fn compute_filter(db: &Db, query: &str) -> Option<Filter> {
+        if query.trim().is_empty() {
+            return None;
+        }
+        db.read(|conn| {
+            let Some(found) = search::search(conn, query)? else {
+                return Ok(None);
+            };
+            let artists = search::artists_from_albums(conn, &found.album_keys)?;
+            Ok(Some(Filter {
+                track_ids: found.track_ids.into(),
+                album_keys: found.album_keys.into(),
+                artists: artists.into(),
+            }))
+        })
+        .ok()
+        .flatten()
     }
 
     pub fn snapshot(&self) -> Arc<LibrarySnapshot> {
@@ -196,9 +216,10 @@ impl Library {
         if self.state.read().query == q {
             return;
         }
+        let filter = Self::compute_filter(&self.db, &q);
         update(&self.state, |s| {
             s.query = q;
-            Self::apply_search(s);
+            s.filter = filter;
         });
     }
 
@@ -259,158 +280,237 @@ impl Library {
         Ok(Some(watcher))
     }
 
-    fn apply_search(s: &mut LibrarySnapshot) {
-        if s.query.trim().is_empty() {
-            s.filtered_albums = s.albums.as_slice().into();
-            s.filtered_tracks = s.all_tracks.clone();
-        } else {
-            let search = FuzzySearch::new(&s.query);
-            s.filtered_albums = rank(&s.albums, 300, |a| {
-                search
-                    .score(&a.title)
-                    .max(search.score(&a.artist))
-                    .max(search.score(&a.track_titles))
-            })
-            .into();
-            s.filtered_tracks = rank(&s.all_tracks, 500, |t| {
-                search
-                    .score(&t.title)
-                    .max(search.score(&t.artist))
-                    .max(search.score(&t.album))
-            })
-            .into();
-        }
+    // -- Paged views ---------------------------------------------------------
 
-        let mut map: HashMap<String, Vec<Album>> = HashMap::new();
-        for a in s.filtered_albums.iter() {
-            map.entry(a.artist.clone()).or_default().push(a.clone());
-        }
-        let mut artists: Vec<_> = map
-            .into_iter()
-            .map(|(name, mut albums)| {
-                albums.sort_by(|a, b| a.year.cmp(&b.year).then_with(|| a.title.cmp(&b.title)));
-                (name, albums)
-            })
-            .collect();
-        artists.sort_by_key(|a| a.0.to_lowercase());
-        s.artists = artists;
+    pub fn track_total(&self) -> usize {
+        let s = self.snapshot();
+        s.filter
+            .as_ref()
+            .map_or(s.track_count, |f| f.track_ids.len())
     }
 
-    fn do_scan(state: &SharedSnapshot, covers: &ArtworkCache) {
-        update(state, |s| s.scanning = true);
-        let folders = state.read().folders.clone();
-
-        let mut album_map: HashMap<String, Vec<Track>> = HashMap::new();
-        let mut cover_map: HashMap<String, Vec<u8>> = HashMap::new();
-
-        let paths = folders.iter().flat_map(|folder| {
-            walkdir::WalkDir::new(folder)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file() && metadata::is_audio(e.path()))
-                .map(walkdir::DirEntry::into_path)
-        });
-        for p in paths {
-            let md = metadata::read(&p);
-            let dir = p
-                .parent()
-                .map(|d| d.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let album_name = if md.album.is_empty() {
-                p.parent()
-                    .and_then(|d| d.file_name())
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Unknown Album")
-                    .to_string()
-            } else {
-                md.album
-            };
-            let key = format!("{dir}\n{album_name}");
-            if !cover_map.contains_key(&key) {
-                if let Some(art) = md.artwork.or_else(|| metadata::folder_artwork(&p)) {
-                    cover_map.insert(key.clone(), art);
+    pub fn track_page(&self, offset: usize, limit: usize) -> Vec<Track> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let s = self.snapshot();
+        let result = match &s.filter {
+            Some(f) => {
+                let end = (offset + limit).min(f.track_ids.len());
+                if offset >= end {
+                    return Vec::new();
                 }
+                self.db
+                    .read(|conn| db::tracks_by_ids(conn, &f.track_ids[offset..end]))
             }
-            let title = if md.title.is_empty() {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Unknown")
-                    .to_string()
-            } else {
-                md.title
-            };
-            let artist = if md.artist.is_empty() {
-                "Unknown Artist".to_string()
-            } else {
-                md.artist
-            };
-            album_map.entry(key.clone()).or_default().push(Track {
-                path: p,
-                title,
-                artist,
-                album: album_name,
-                track_number: md.track_number,
-                year: md.year,
-                duration: md.duration.max(0.0),
-                album_id: key,
-            });
-        }
+            None => self.db.read(|conn| db::tracks_page(conn, offset, limit)),
+        };
+        result.unwrap_or_default()
+    }
 
-        let mut albums: Vec<Album> = Vec::with_capacity(album_map.len());
-        for (id, mut tracks) in album_map {
-            tracks.sort_by(|a, b| {
-                if a.track_number > 0 && b.track_number > 0 && a.track_number != b.track_number {
-                    a.track_number.cmp(&b.track_number)
-                } else {
-                    a.path.cmp(&b.path)
+    /// A single track of the current song view, for menu actions.
+    pub fn track_at(&self, index: usize) -> Option<Track> {
+        self.track_page(index, 1).into_iter().next()
+    }
+
+    /// Every track of the current song view, used to seed playback.
+    pub fn tracks_for_play(&self) -> Vec<Track> {
+        let s = self.snapshot();
+        let result = match &s.filter {
+            Some(f) => self.db.read(|conn| db::tracks_by_ids(conn, &f.track_ids)),
+            None => self.db.read(db::all_tracks),
+        };
+        result.unwrap_or_default()
+    }
+
+    pub fn album_total(&self) -> usize {
+        let s = self.snapshot();
+        s.filter
+            .as_ref()
+            .map_or(s.album_count, |f| f.album_keys.len())
+    }
+
+    pub fn album_page(&self, offset: usize, limit: usize) -> Vec<AlbumSummary> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let s = self.snapshot();
+        let result = match &s.filter {
+            Some(f) => {
+                let end = (offset + limit).min(f.album_keys.len());
+                if offset >= end {
+                    return Vec::new();
                 }
-            });
-            let artist = if tracks.iter().all(|t| t.artist == tracks[0].artist) {
-                tracks[0].artist.clone()
-            } else {
-                "Various Artists".to_string()
-            };
-            let year = tracks.iter().map(|t| t.year).max().unwrap_or(0);
-            let title = tracks[0].album.clone();
-            let track_titles = tracks
-                .iter()
-                .map(|t| t.title.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            albums.push(Album {
-                id,
-                title,
-                artist,
-                year,
-                tracks: tracks.into(),
-                track_titles,
-            });
+                self.db
+                    .read(|conn| db::albums_by_keys(conn, &f.album_keys[offset..end]))
+            }
+            None => self.db.read(|conn| db::albums_page(conn, offset, limit)),
+        };
+        result.unwrap_or_default()
+    }
+
+    pub fn artist_total(&self) -> usize {
+        let s = self.snapshot();
+        match &s.filter {
+            Some(f) => f.artists.len(),
+            None => self.db.read(db::artist_count).unwrap_or(0),
         }
-        albums.sort_by(|a, b| {
-            a.artist
-                .to_lowercase()
-                .cmp(&b.artist.to_lowercase())
-                .then_with(|| a.year.cmp(&b.year))
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-        });
+    }
 
-        covers.replace_all(cover_map);
+    pub fn artist_page(&self, offset: usize, limit: usize) -> Vec<ArtistEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let s = self.snapshot();
+        match &s.filter {
+            Some(f) => {
+                let end = (offset + limit).min(f.artists.len());
+                if offset >= end {
+                    return Vec::new();
+                }
+                f.artists[offset..end].to_vec()
+            }
+            None => self
+                .db
+                .read(|conn| db::artists_page(conn, offset, limit))
+                .unwrap_or_default(),
+        }
+    }
 
-        // Song order follows album order, like the reference player.
-        let all_tracks: Vec<Track> = albums
-            .iter()
-            .flat_map(|a| a.tracks.iter().cloned())
-            .collect();
-        update(state, |s| {
-            s.albums = albums;
-            s.all_tracks = all_tracks.into();
-            s.scanning = false;
-            Self::apply_search(s);
-        });
+    pub fn album_detail(&self, key: &str) -> Option<Album> {
+        self.db
+            .read(|conn| db::album_detail(conn, key))
+            .ok()
+            .flatten()
+    }
 
-        // Save cache for fast startup next time
-        let snapshot = state.read().clone();
-        Self::save_cache(&snapshot);
-        drop(snapshot);
+    pub fn album_tracks(&self, key: &str) -> Vec<Track> {
+        self.db
+            .read(|conn| db::album_tracks(conn, key))
+            .unwrap_or_default()
+    }
+
+    pub fn artist_albums(&self, name: &str) -> Vec<AlbumSummary> {
+        self.db
+            .read(|conn| db::artist_albums(conn, name))
+            .unwrap_or_default()
+    }
+
+    pub fn artist_tracks(&self, name: &str) -> Vec<Track> {
+        self.db
+            .read(|conn| db::artist_tracks(conn, name))
+            .unwrap_or_default()
+    }
+
+    pub fn first_album_key(&self) -> Option<String> {
+        self.db.read(db::first_album_key).ok().flatten()
+    }
+}
+
+#[cfg(test)]
+impl Library {
+    /// Build a library from an existing database without starting the
+    /// background reconciler, for tests.
+    fn open_for_test(db_path: PathBuf, folders: Vec<PathBuf>) -> Result<Self> {
+        let db = Arc::new(Db::open(db_path)?);
+        let covers = ArtworkCache::default();
+        let (rescan_tx, _rx) = mpsc::channel();
+        let state: SharedSnapshot =
+            Arc::new(RwLock::new(Arc::new(Self::load_snapshot(&db, folders)?)));
+        Ok(Self {
+            state,
+            db,
+            covers,
+            watcher: Mutex::new(None),
+            rescan_tx,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+
+    fn insert(
+        conn: &rusqlite::Connection,
+        path: &str,
+        title: &str,
+        artist: &str,
+        album: &str,
+        n: u32,
+    ) {
+        let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let key = index::album_key(dir, album);
+        conn.execute(
+            "INSERT INTO tracks(path, dir, title, artist, album, album_key, track_number, year, \
+             duration, mtime_ns, size) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0.0, 1, 1)",
+            params![path, dir, title, artist, album, key, n],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn paging_and_bm25_read_from_the_database() {
+        let dir = std::env::temp_dir().join(format!("omamusic-lib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("library.db");
+        {
+            let conn = Db::open_writer(&db_path).unwrap();
+            insert(
+                &conn,
+                "/m/1.mp3",
+                "Neon Lights",
+                "Kraftwerk",
+                "Trans Europe",
+                1,
+            );
+            insert(
+                &conn,
+                "/m/2.mp3",
+                "Autobahn",
+                "Kraftwerk",
+                "Trans Europe",
+                2,
+            );
+            insert(&conn, "/m/3.mp3", "Moon River", "Andy", "Some Album", 1);
+            conn.execute_batch(index::REBUILD_ALBUMS).unwrap();
+        }
+        let library = Library::open_for_test(db_path, Vec::new()).unwrap();
+
+        assert_eq!(library.track_total(), 3);
+        assert_eq!(library.album_total(), 2);
+        assert_eq!(library.artist_total(), 2);
+
+        // Album order is by artist, so "Andy" comes first.
+        assert_eq!(library.track_at(0).unwrap().title, "Moon River");
+        assert_eq!(library.track_page(0, 2).len(), 2);
+        assert_eq!(library.track_page(2, 2).len(), 1);
+        assert_eq!(library.album_page(0, 10).len(), 2);
+        assert_eq!(library.artist_page(0, 10)[0].name, "Andy");
+
+        // BM25 filtering narrows all three views.
+        library.set_query("neon".into());
+        assert_eq!(library.track_total(), 1);
+        assert_eq!(library.track_page(0, 10)[0].title, "Neon Lights");
+        assert_eq!(library.album_total(), 1);
+        assert_eq!(library.artist_total(), 1);
+        assert_eq!(library.artist_page(0, 10)[0].name, "Kraftwerk");
+
+        // Album and artist detail pages read their tracks from SQLite.
+        let key = library.album_page(0, 1)[0].id.clone();
+        let album = library.album_detail(&key).unwrap();
+        assert_eq!(album.tracks.len(), 2);
+        assert_eq!(library.album_tracks(&key).len(), 2);
+        assert_eq!(library.artist_albums("Kraftwerk").len(), 1);
+        assert_eq!(library.artist_tracks("Kraftwerk").len(), 2);
+
+        // Clearing the query restores the unfiltered paging.
+        library.set_query(String::new());
+        assert_eq!(library.track_total(), 3);
+        assert_eq!(library.album_total(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
