@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::library::{Library, LibrarySnapshot};
-use crate::models::{Album, PlayerState, Section, Track};
+use crate::models::{Album, AlbumSummary, ArtistEntry, PlayerState, Section, Track};
 use crate::player::Player;
 use crate::{FocusSearch, GoBack};
 use gpui_kit::base::input::InputState;
@@ -45,6 +45,42 @@ pub struct Omamusic {
 enum Page {
     Album(String),
     Artist(String),
+}
+
+/// Where a row's playback list comes from. Rows themselves are paged from
+/// SQLite, so actions resolve the full list lazily instead of holding it.
+#[derive(Clone)]
+enum TrackList {
+    /// Every track in the current Songs view (filtered or not).
+    Songs,
+    Album(String),
+    Artist(String),
+    /// A list already in memory (album detail, play queue).
+    Loaded(Arc<[Track]>),
+}
+
+impl TrackList {
+    fn tracks(&self, library: &Library) -> Vec<Track> {
+        match self {
+            TrackList::Songs => library.tracks_for_play(),
+            TrackList::Album(key) => library.album_tracks(key),
+            TrackList::Artist(name) => library.artist_tracks(name),
+            TrackList::Loaded(tracks) => tracks.to_vec(),
+        }
+    }
+
+    fn get(&self, library: &Library, index: usize) -> Option<Track> {
+        match self {
+            TrackList::Songs => library.track_at(index),
+            TrackList::Album(key) => library.album_tracks(key).get(index).cloned(),
+            TrackList::Artist(name) => library.artist_tracks(name).get(index).cloned(),
+            TrackList::Loaded(tracks) => tracks.get(index).cloned(),
+        }
+    }
+}
+
+fn selection_tracks(library: &Library, list: &TrackList, rows: &[usize]) -> Vec<Track> {
+    rows.iter().filter_map(|&i| list.get(library, i)).collect()
 }
 
 #[derive(Clone, Copy)]
@@ -237,7 +273,7 @@ impl Omamusic {
             Some("queue") => (Section::Queue, Vec::new(), false),
             Some("settings") => (Section::Albums, Vec::new(), true),
             Some("album") => {
-                let first = library.snapshot().albums.first().map(|a| a.id.clone());
+                let first = library.first_album_key();
                 (
                     Section::Albums,
                     first.map(Page::Album).into_iter().collect(),
@@ -280,8 +316,7 @@ impl Omamusic {
         let notify_msg = if self.prev_scanning && !scanning_now {
             Some(format!(
                 "{} albums · {} songs",
-                snap.albums.len(),
-                snap.all_tracks.len()
+                snap.album_count, snap.track_count
             ))
         } else {
             None
@@ -382,7 +417,7 @@ impl Omamusic {
     fn track_action(
         &mut self,
         action: RowAction,
-        list: &[Track],
+        list: &TrackList,
         row: usize,
         queue: bool,
         cx: &mut Context<Self>,
@@ -392,18 +427,26 @@ impl Omamusic {
         } else {
             vec![row]
         };
-        let tracks: Vec<Track> = rows.iter().filter_map(|&i| list.get(i).cloned()).collect();
-        let Some(first) = tracks.first().cloned() else {
-            return;
-        };
+        let tracks = selection_tracks(&self.library, list, &rows);
         match action {
             RowAction::Play if queue => self.player.jump(row),
             RowAction::Play if tracks.len() > 1 => self.player.play(tracks, 0),
-            RowAction::Play => self.player.play(list.to_vec(), row),
+            RowAction::Play => {
+                let all = list.tracks(&self.library);
+                self.player.play(all, row);
+            }
             RowAction::PlayNext => self.player.play_next(tracks),
             RowAction::AddToQueue => self.player.enqueue(tracks),
-            RowAction::GoToAlbum => self.navigate(Page::Album(first.album_id), cx),
-            RowAction::GoToArtist => self.navigate(Page::Artist(first.artist), cx),
+            RowAction::GoToAlbum => {
+                if let Some(track) = list.get(&self.library, row) {
+                    self.navigate(Page::Album(track.album_id), cx);
+                }
+            }
+            RowAction::GoToArtist => {
+                if let Some(track) = list.get(&self.library, row) {
+                    self.navigate(Page::Artist(track.artist), cx);
+                }
+            }
             RowAction::Remove => {
                 self.player.remove(&rows);
                 self.clear_selection();
@@ -446,22 +489,16 @@ impl Omamusic {
         .detach();
     }
 
-    fn tracks_action(&mut self, action: RowAction, tracks: &[Track], cx: &mut Context<Self>) {
+    fn tracks_action(&mut self, action: RowAction, list: &TrackList, cx: &mut Context<Self>) {
+        let tracks = list.tracks(&self.library);
         match action {
-            RowAction::Play => self.player.play(tracks.to_vec(), 0),
-            RowAction::PlayNext => self.player.play_next(tracks.to_vec()),
-            RowAction::AddToQueue => self.player.enqueue(tracks.to_vec()),
-            RowAction::GoToAlbum | RowAction::GoToArtist | RowAction::Remove => {}
-            RowAction::ExportFile => {
-                if tracks.len() == 1 {
-                    let track = tracks[0].clone();
-                    let this = cx.entity().downgrade();
-                    cx.spawn(async move |_, cx| {
-                        let _ = this.update(cx, |this, cx| this.export_track(track, cx));
-                    })
-                    .detach();
-                }
-            }
+            RowAction::Play => self.player.play(tracks, 0),
+            RowAction::PlayNext => self.player.play_next(tracks),
+            RowAction::AddToQueue => self.player.enqueue(tracks),
+            RowAction::GoToAlbum
+            | RowAction::GoToArtist
+            | RowAction::Remove
+            | RowAction::ExportFile => {}
         }
         cx.notify();
     }
@@ -501,7 +538,7 @@ impl Omamusic {
         &self,
         id: &'static str,
         row: usize,
-        list: Arc<[Track]>,
+        list: TrackList,
         queue: bool,
         content: Stateful<Div>,
         cx: &mut Context<Self>,
@@ -761,8 +798,7 @@ impl Render for Omamusic {
                                             .text_center()
                                             .child(format!(
                                                 "{} albums · {} songs",
-                                                snap.albums.len(),
-                                                snap.all_tracks.len()
+                                                snap.album_count, snap.track_count
                                             )),
                                     )
                                     .when(snap.scanning, |d| {
@@ -797,7 +833,7 @@ impl Render for Omamusic {
                                                     })),
                                                 )
                                                 .into_any_element()
-                                        } else if snap.albums.is_empty()
+                                        } else if snap.album_count == 0
                                             && snap.scanning
                                             && self.section != Section::Queue
                                         {
@@ -808,7 +844,7 @@ impl Render for Omamusic {
                                             )
                                             .into_any_element()
                                         } else {
-                                            self.render_content(&snap, window, cx)
+                                            self.render_content(window, cx)
                                         },
                                     ),
                             ),
@@ -860,27 +896,20 @@ impl Render for Omamusic {
 }
 
 impl Omamusic {
-    fn render_content(
-        &mut self,
-        snap: &Arc<LibrarySnapshot>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.pages.last().cloned() {
             Some(Page::Album(id)) => {
-                if let Some(album) = snap.albums.iter().find(|a| a.id == id) {
-                    return self.render_album_detail(album, cx);
+                if let Some(album) = self.library.album_detail(&id) {
+                    return self.render_album_detail(&album, cx);
                 }
             }
-            Some(Page::Artist(name)) => return self.render_artist_albums(&name, snap, window, cx),
+            Some(Page::Artist(name)) => return self.render_artist_albums(&name, window, cx),
             None => {}
         }
         match self.section {
-            Section::Albums => {
-                self.render_album_grid("albums", snap.filtered_albums.clone(), window, cx)
-            }
-            Section::Artists => self.render_artist_list(snap, cx),
-            Section::Songs => self.render_song_list(snap, cx),
+            Section::Albums => self.render_album_grid("albums", window, cx),
+            Section::Artists => self.render_artist_list(cx),
+            Section::Songs => self.render_song_list(cx),
             Section::Queue => self.render_queue(cx),
         }
     }
@@ -888,17 +917,11 @@ impl Omamusic {
     fn render_artist_albums(
         &mut self,
         name: &str,
-        snap: &LibrarySnapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.omarchy().clone();
-        let albums: Arc<[Album]> = snap
-            .albums
-            .iter()
-            .filter(|a| a.artist == name || a.tracks.iter().any(|t| t.artist == name))
-            .cloned()
-            .collect();
+        let albums = self.library.artist_albums(name);
         div()
             .flex_1()
             .min_h_0()
@@ -922,21 +945,64 @@ impl Omamusic {
                             .child(name.to_string()),
                     ),
             )
-            .child(self.render_album_grid("artist-albums", albums, window, cx))
+            .child(self.render_album_list("artist-albums", albums, window, cx))
             .into_any_element()
+    }
+
+    fn grid_columns(window: &Window) -> (usize, gpui_kit::Pixels) {
+        let rem = window.rem_size();
+        let gap = rem * 0.75;
+        let width = window.viewport_size().width - rem * 11. - px(1.) - gap * 2.;
+        let columns = (((width + gap) / (rem * 10. + gap)).floor() as usize).max(1);
+        (columns, gap)
     }
 
     fn render_album_grid(
         &mut self,
         id: &'static str,
-        albums: Arc<[Album]>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rem = window.rem_size();
-        let gap = rem * 0.75;
-        let width = window.viewport_size().width - rem * 11. - px(1.) - gap * 2.;
-        let columns = (((width + gap) / (rem * 10. + gap)).floor() as usize).max(1);
+        let (columns, gap) = Self::grid_columns(window);
+        let total = self.library.album_total();
+        let rows = total.div_ceil(columns);
+        uniform_list(
+            id,
+            rows,
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                range
+                    .map(|row| {
+                        let start = row * columns;
+                        let end = (start + columns).min(total);
+                        let albums = this.library.album_page(start, end - start);
+                        div()
+                            .flex()
+                            .gap(gap)
+                            .px(gap)
+                            .pt(gap)
+                            .children((start..end).map(|idx| {
+                                let album = albums.get(idx - start).cloned().unwrap_or_default();
+                                this.album_card(&album, idx, cx)
+                            }))
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .pb(gap)
+        .into_any_element()
+    }
+
+    fn render_album_list(
+        &mut self,
+        id: &'static str,
+        albums: Vec<AlbumSummary>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (columns, gap) = Self::grid_columns(window);
+        let albums: Arc<[AlbumSummary]> = albums.into();
         let rows = albums.len().div_ceil(columns);
         uniform_list(
             id,
@@ -959,11 +1025,11 @@ impl Omamusic {
         .into_any_element()
     }
 
-    fn album_card(&self, a: &Album, idx: usize, cx: &mut Context<Self>) -> Popover {
+    fn album_card(&self, a: &AlbumSummary, idx: usize, cx: &mut Context<Self>) -> Popover {
         let theme = cx.omarchy().clone();
         let id = a.id.clone();
-        let tracks = a.tracks.clone();
-        let n = a.tracks.len();
+        let menu_id = a.id.clone();
+        let n = a.track_count;
         let count = format!("{n} song{}", if n == 1 { "" } else { "s" });
         let artist = a.artist.clone();
         let card = div()
@@ -1006,26 +1072,24 @@ impl Omamusic {
             ALBUM_ACTIONS,
             move |this, action, cx| match action {
                 RowAction::GoToArtist => this.navigate(Page::Artist(artist.clone()), cx),
-                _ => this.tracks_action(action, &tracks, cx),
+                _ => this.tracks_action(action, &TrackList::Album(menu_id.clone()), cx),
             },
             cx,
         )
     }
 
-    fn render_artist_list(
-        &mut self,
-        snap: &Arc<LibrarySnapshot>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let snap = snap.clone();
+    fn render_artist_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let total = self.library.artist_total();
         uniform_list(
             "artists",
-            snap.artists.len(),
+            total,
             cx.processor(move |this, range: Range<usize>, _, cx| {
+                let start = range.start;
+                let artists = this.library.artist_page(start, range.len());
                 range
                     .map(|idx| {
-                        let (name, albums) = &snap.artists[idx];
-                        this.artist_row(idx, name, albums, cx)
+                        let entry = artists.get(idx - start).cloned().unwrap_or_default();
+                        this.artist_row(idx, &entry, cx)
                     })
                     .collect::<Vec<_>>()
             }),
@@ -1035,25 +1099,17 @@ impl Omamusic {
         .into_any_element()
     }
 
-    fn artist_row(
-        &self,
-        idx: usize,
-        name: &str,
-        albums: &[Album],
-        cx: &mut Context<Self>,
-    ) -> Popover {
+    fn artist_row(&self, idx: usize, entry: &ArtistEntry, cx: &mut Context<Self>) -> Popover {
         let theme = cx.omarchy().clone();
-        let song_count: usize = albums.iter().map(|a| a.tracks.len()).sum();
-        let an = albums.len();
+        let an = entry.album_count;
         let label = format!(
-            "{name} · {an} album{} · {song_count} songs",
-            if an == 1 { "" } else { "s" }
+            "{} · {an} album{} · {} songs",
+            entry.name,
+            if an == 1 { "" } else { "s" },
+            entry.song_count
         );
-        let aname = name.to_string();
-        let tracks: Vec<Track> = albums
-            .iter()
-            .flat_map(|a| a.tracks.iter().cloned())
-            .collect();
+        let aname = entry.name.clone();
+        let name = entry.name.clone();
         let row = div()
             .id(("artist", idx))
             .flex()
@@ -1065,7 +1121,7 @@ impl Omamusic {
             .border_color(theme.border)
             .hover(|s| s.bg(theme.hover_fill()))
             .cursor_pointer()
-            .child(self.cover(albums.first().map(|a| a.id.as_str()), 40., name, cx))
+            .child(self.cover(entry.cover_album_id.as_deref(), 40., &entry.name, cx))
             .on_click(
                 cx.listener(move |this, _, _, cx| this.navigate(Page::Artist(aname.clone()), cx)),
             )
@@ -1082,20 +1138,27 @@ impl Omamusic {
             ("artist-menu", idx),
             row,
             ARTIST_ACTIONS,
-            move |this, action, cx| this.tracks_action(action, &tracks, cx),
+            move |this, action, cx| {
+                this.tracks_action(action, &TrackList::Artist(name.clone()), cx)
+            },
             cx,
         )
         .w_full()
     }
 
-    fn render_song_list(&mut self, snap: &LibrarySnapshot, cx: &mut Context<Self>) -> AnyElement {
-        let tracks = snap.filtered_tracks.clone();
+    fn render_song_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let total = self.library.track_total();
         uniform_list(
             "songs",
-            tracks.len(),
+            total,
             cx.processor(move |this, range: Range<usize>, _, cx| {
+                let start = range.start;
+                let tracks = this.library.track_page(start, range.len());
                 range
-                    .map(|i| this.song_row(i, &tracks, cx))
+                    .map(|i| {
+                        let track = tracks.get(i - start).cloned().unwrap_or_default();
+                        this.song_row(i, &track, cx)
+                    })
                     .collect::<Vec<_>>()
             }),
         )
@@ -1104,9 +1167,8 @@ impl Omamusic {
         .into_any_element()
     }
 
-    fn song_row(&self, i: usize, tracks: &Arc<[Track]>, cx: &mut Context<Self>) -> Popover {
+    fn song_row(&self, i: usize, t: &Track, cx: &mut Context<Self>) -> Popover {
         let theme = cx.omarchy().clone();
-        let t = &tracks[i];
         let bg = if i.is_multiple_of(2) {
             theme.background
         } else {
@@ -1143,7 +1205,7 @@ impl Omamusic {
             .child(cell(10., t.artist.clone()))
             .child(cell(10., t.album.clone()))
             .child(cell(3., format_time(t.duration)));
-        self.track_row("song", i, tracks.clone(), false, row, cx)
+        self.track_row("song", i, TrackList::Songs, false, row, cx)
     }
 
     fn render_album_detail(&mut self, album: &Album, cx: &mut Context<Self>) -> AnyElement {
@@ -1312,7 +1374,7 @@ impl Omamusic {
                                 self.track_row(
                                     "album-track-menu",
                                     i,
-                                    album.tracks.clone(),
+                                    TrackList::Loaded(album.tracks.clone()),
                                     false,
                                     row,
                                     cx,
@@ -1448,7 +1510,14 @@ impl Omamusic {
                     .text_color(theme.secondary)
                     .child(format_time(t.duration)),
             );
-        self.track_row("queue-menu", i, queue.clone(), true, row, cx)
+        self.track_row(
+            "queue-menu",
+            i,
+            TrackList::Loaded(queue.clone()),
+            true,
+            row,
+            cx,
+        )
     }
 
     fn render_settings(

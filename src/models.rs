@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     #[serde(with = "pathbuf_serde")]
     pub path: PathBuf,
@@ -23,7 +23,27 @@ pub struct Album {
     pub year: u32,
     #[serde(with = "arc_vec_serde")]
     pub tracks: Arc<[Track]>,
-    pub track_titles: String,
+}
+
+/// An album without its tracks, for grids and artist pages that only need
+/// cover art, title, artist and a track count.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AlbumSummary {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub year: u32,
+    pub track_count: usize,
+}
+
+/// A row in the Artists view: aggregate counts plus a representative album
+/// for the cover art.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ArtistEntry {
+    pub name: String,
+    pub album_count: usize,
+    pub song_count: usize,
+    pub cover_album_id: Option<String>,
 }
 
 mod pathbuf_serde {

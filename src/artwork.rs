@@ -5,21 +5,28 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 type Key = (String, u32);
+type Provider = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static>;
 
 #[derive(Default)]
 struct Covers {
     raw: HashMap<String, Arc<[u8]>>,
     rendered: HashMap<Key, Arc<Image>>,
     pending: HashSet<Key>,
+    /// Albums the store reported as having no cover, so the store is not
+    /// queried again until the album is invalidated.
+    missing: HashSet<String>,
     generation: u64,
 }
 
-/// Raw covers and rendered thumbnails, invalidated together on library scans.
+/// Raw covers and rendered thumbnails. Raw bytes are loaded lazily from the
+/// store (SQLite) the first time an album cover is requested, so startup does
+/// not have to read every cover.
 #[derive(Clone)]
 pub struct ArtworkCache {
     inner: Arc<Mutex<Covers>>,
     requests: Sender<Key>,
     listeners: Arc<Mutex<Vec<Sender<()>>>>,
+    provider: Arc<Mutex<Option<Provider>>>,
 }
 
 impl Default for ArtworkCache {
@@ -43,6 +50,7 @@ impl Default for ArtworkCache {
             inner,
             requests,
             listeners,
+            provider: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -75,21 +83,83 @@ fn render_into(inner: &Mutex<Covers>, key: Key) {
 }
 
 impl ArtworkCache {
-    pub fn replace_all(&self, map: HashMap<String, Vec<u8>>) {
+    /// Install the store that raw covers are loaded from on demand.
+    pub fn set_provider(&self, provider: Provider) {
+        *self.provider.lock() = Some(provider);
+    }
+
+    /// Forget one album's cover (its file or tags changed).
+    pub fn remove(&self, album_id: &str) {
         let mut covers = self.inner.lock();
-        covers.raw = map.into_iter().map(|(k, v)| (k, v.into())).collect();
-        covers.rendered.clear();
-        covers.pending.clear();
+        covers.raw.remove(album_id);
+        covers.missing.remove(album_id);
+        covers.rendered.retain(|(id, _), _| id != album_id);
+        covers.pending.retain(|(id, _)| id != album_id);
         covers.generation += 1;
     }
 
-    pub fn cached(&self, album_id: &str, size: u32) -> Option<Arc<Image>> {
+    /// Forget every cover (folders or albums changed wholesale).
+    pub fn clear(&self) {
         let mut covers = self.inner.lock();
+        covers.raw.clear();
+        covers.rendered.clear();
+        covers.pending.clear();
+        covers.missing.clear();
+        covers.generation += 1;
+    }
+
+    fn load(&self, album_id: &str) -> Option<Arc<[u8]>> {
+        {
+            let covers = self.inner.lock();
+            if covers.missing.contains(album_id) {
+                return None;
+            }
+            if let Some(raw) = covers.raw.get(album_id) {
+                return Some(raw.clone());
+            }
+        }
+        let provider = self.provider.lock();
+        let raw = provider.as_ref().and_then(|p| p(album_id));
+        drop(provider);
+        let mut covers = self.inner.lock();
+        match raw {
+            Some(raw) => Some(
+                covers
+                    .raw
+                    .entry(album_id.to_string())
+                    .or_insert_with(|| raw.into())
+                    .clone(),
+            ),
+            None => {
+                covers.missing.insert(album_id.to_string());
+                None
+            }
+        }
+    }
+
+    pub fn cached(&self, album_id: &str, size: u32) -> Option<Arc<Image>> {
         let key = (album_id.to_string(), size);
+        {
+            let mut covers = self.inner.lock();
+            if let Some(image) = covers.rendered.get(&key) {
+                return Some(image.clone());
+            }
+            if covers.missing.contains(album_id) {
+                return None;
+            }
+            if covers.raw.contains_key(album_id) {
+                if covers.pending.insert(key.clone()) {
+                    let _ = self.requests.try_send(key);
+                }
+                return None;
+            }
+        }
+        self.load(album_id)?;
+        let mut covers = self.inner.lock();
         if let Some(image) = covers.rendered.get(&key) {
             return Some(image.clone());
         }
-        if covers.raw.contains_key(album_id) && covers.pending.insert(key.clone()) {
+        if covers.pending.insert(key.clone()) {
             let _ = self.requests.try_send(key);
         }
         None
@@ -97,13 +167,21 @@ impl ArtworkCache {
 
     pub fn thumbnail(&self, album_id: &str, size: u32) -> Option<Arc<Image>> {
         let key = (album_id.to_string(), size);
-        let (raw, generation) = {
+        let raw = {
             let covers = self.inner.lock();
             if let Some(image) = covers.rendered.get(&key) {
                 return Some(image.clone());
             }
-            (covers.raw.get(album_id)?.clone(), covers.generation)
+            if covers.missing.contains(album_id) {
+                return None;
+            }
+            covers.raw.get(album_id).cloned()
         };
+        let raw = match raw {
+            Some(raw) => raw,
+            None => self.load(album_id)?,
+        };
+        let generation = self.inner.lock().generation;
         let image = render(&raw, size)?;
         let mut covers = self.inner.lock();
         if covers.generation == generation {
