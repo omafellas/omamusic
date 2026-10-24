@@ -168,12 +168,28 @@ impl Library {
         self.state.read().version
     }
 
+    pub fn query(&self) -> String {
+        self.state.read().query.clone()
+    }
+
     pub fn covers(&self) -> &ArtworkCache {
         &self.covers
     }
 
     pub fn request_rescan(&self) {
         let _ = self.rescan_tx.send(());
+    }
+
+    #[cfg(test)]
+    /// A library with no folders, watcher, or scanner thread; for view tests.
+    pub fn empty() -> Self {
+        let (rescan_tx, _rx) = mpsc::channel::<()>();
+        Self {
+            state: Arc::new(RwLock::new(Arc::new(LibrarySnapshot::default()))),
+            covers: ArtworkCache::default(),
+            watcher: Mutex::new(None),
+            rescan_tx,
+        }
     }
 
     pub fn set_query(&self, q: String) {

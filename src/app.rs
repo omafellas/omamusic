@@ -8,8 +8,9 @@ use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     div, px, rems, uniform_list, AnyElement, App, AppContext, ClickEvent, Context, Div, ElementId,
-    Entity, ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection,
-    ParentElement, PathPromptOptions, Render, Stateful, StatefulInteractiveElement, Styled, Window,
+    Entity, EntityInputHandler, Focusable, ImageSource, InteractiveElement, IntoElement,
+    MouseButton, NavigationDirection, ParentElement, PathPromptOptions, Render, Stateful,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, menu, panel,
@@ -36,6 +37,8 @@ pub struct Omamusic {
     new_folder: Entity<InputState>,
     rescan_notify: Option<(String, f32)>,
     prev_scanning: bool,
+    /// Keeps bare character keystrokes reaching the text fields; see `new`.
+    _typing_guard: gpui_kit::Subscription,
 }
 
 #[derive(Clone, PartialEq)]
@@ -162,18 +165,38 @@ impl Omamusic {
     ) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
         let new_folder = cx.new(|cx| InputState::new(window, cx).placeholder("Enter folder path"));
-        cx.observe(&query, |this, state, cx| {
-            let text = state.read(cx).text().to_string();
-            this.library.set_query(text.clone());
-            // Search always filters all songs, switch to Songs section
-            if !text.trim().is_empty() {
-                this.set_section(Section::Songs, cx);
+
+        // On Linux the platform only hands a printable character to the focused field once the
+        // keystroke survives key-binding dispatch, and `prefer_character_input` is never set there.
+        // A bare space otherwise matches the global `TogglePlay` binding and is consumed before it
+        // can be typed. Feed such keystrokes straight to whichever of our fields has focus — the
+        // same `replace_text_in_range` call the platform would have made — and stop dispatch so the
+        // binding stays out of the way while typing.
+        let search = query.clone();
+        let folder = new_folder.clone();
+        let search_focus = query.read(cx).focus_handle(cx);
+        let folder_focus = new_folder.read(cx).focus_handle(cx);
+        let _typing_guard = cx.intercept_keystrokes(move |event, window, cx| {
+            let keystroke = &event.keystroke;
+            let modifiers = &keystroke.modifiers;
+            if modifiers.control || modifiers.alt || modifiers.platform {
+                return;
             }
-            this.pages.clear();
-            this.clear_selection();
-            cx.notify();
-        })
-        .detach();
+            let Some(text) = keystroke.key_char.clone() else {
+                return;
+            };
+            let field = if search_focus.is_focused(window) {
+                &search
+            } else if folder_focus.is_focused(window) {
+                &folder
+            } else {
+                return;
+            };
+            cx.stop_propagation();
+            field.update(cx, |input, cx| {
+                input.replace_text_in_range(None, &text, window, cx);
+            });
+        });
 
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -238,6 +261,7 @@ impl Omamusic {
             new_folder,
             rescan_notify: None,
             prev_scanning: false,
+            _typing_guard,
         }
     }
 
@@ -515,6 +539,25 @@ impl Omamusic {
         .w_full()
     }
 
+    /// Push the search field's text into the library. Done during render rather
+    /// by observing `InputEvent`s: a programmatic focus or clear emits those
+    /// events while this view's update is active, and gpui forbids re-entering
+    /// an entity update.
+    fn apply_query(&mut self, cx: &mut Context<Self>) {
+        let text = self.query.read(cx).text().to_string();
+        if text == self.library.query() {
+            return;
+        }
+        self.library.set_query(text.clone());
+        self.pages.clear();
+        self.clear_selection();
+        // Search always filters all songs, switch to Songs section.
+        if !text.trim().is_empty() && self.section != Section::Songs {
+            self.section = Section::Songs;
+        }
+        cx.notify();
+    }
+
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.query.update(cx, |q, cx| {
             q.set_value("", window, cx);
@@ -602,6 +645,7 @@ fn sidebar_btn(
 
 impl Render for Omamusic {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_query(cx);
         let snap = self.library.snapshot();
         let theme = cx.omarchy().clone();
         let nav = [
@@ -1541,5 +1585,143 @@ impl Omamusic {
                         ),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TogglePlay;
+    use gpui_kit::{KeyBinding, Keystroke, TestAppContext, VisualTestContext};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn setup<'a>(
+        cx: &'a mut TestAppContext,
+        toggles: &Rc<Cell<usize>>,
+    ) -> (Entity<Omamusic>, &'a mut VisualTestContext) {
+        cx.update(|cx| {
+            gpui_omarchy::init(cx);
+            cx.bind_keys([KeyBinding::new("space", TogglePlay, None)]);
+            let toggles = toggles.clone();
+            cx.on_action(move |_: &TogglePlay, cx| {
+                toggles.set(toggles.get() + 1);
+                cx.refresh_windows();
+            });
+        });
+        cx.add_window_view(|window, cx| {
+            Omamusic::new(
+                Arc::new(Library::empty()),
+                Arc::new(Player::new_test()),
+                window,
+                cx,
+            )
+        })
+    }
+
+    fn focus_search(view: &Entity<Omamusic>, cx: &mut VisualTestContext) {
+        view.update_in(cx, |view, window, cx| {
+            view.query.update(cx, |query, cx| query.focus(window, cx));
+        });
+    }
+
+    fn blur_focus(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.disable_focus(cx));
+    }
+
+    fn type_stroke(cx: &mut VisualTestContext, stroke: Keystroke) {
+        cx.update(|window, cx| {
+            window.dispatch_keystroke(stroke, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// Field text and the query currently applied to the library, after letting
+    /// the render-time sync run.
+    fn search_state(view: &Entity<Omamusic>, cx: &mut VisualTestContext) -> (String, String) {
+        view.update(cx, |view, cx| {
+            view.apply_query(cx);
+            (view.query.read(cx).text().to_string(), view.library.query())
+        })
+    }
+
+    fn space() -> Keystroke {
+        Keystroke::parse("space").unwrap()
+    }
+
+    fn character(ch: char) -> Keystroke {
+        let mut stroke = space();
+        if ch != ' ' {
+            stroke.key = ch.to_string();
+        }
+        stroke.key_char = Some(ch.to_string());
+        stroke
+    }
+
+    #[gpui_kit::test]
+    async fn space_typed_into_the_search_field_is_not_play_pause(cx: &mut TestAppContext) {
+        let toggles = Rc::new(Cell::new(0));
+        let (view, cx) = setup(cx, &toggles);
+        focus_search(&view, cx);
+        type_stroke(cx, space());
+        let (text, applied) = search_state(&view, cx);
+        assert_eq!(text, " ", "space should be typed into the field");
+        assert_eq!(applied, " ", "the field's content reaches the search");
+        assert_eq!(toggles.get(), 0, "typing a space must not toggle playback");
+    }
+
+    #[gpui_kit::test]
+    async fn search_accepts_spaces_and_unicode(cx: &mut TestAppContext) {
+        let toggles = Rc::new(Cell::new(0));
+        let (view, cx) = setup(cx, &toggles);
+        focus_search(&view, cx);
+        for ch in "moon 藍".chars() {
+            type_stroke(cx, character(ch));
+        }
+        let (text, applied) = search_state(&view, cx);
+        assert_eq!(text, "moon 藍");
+        assert_eq!(applied, "moon 藍");
+        assert_eq!(toggles.get(), 0);
+    }
+
+    #[gpui_kit::test]
+    async fn space_with_no_field_focused_still_toggles_playback(cx: &mut TestAppContext) {
+        let toggles = Rc::new(Cell::new(0));
+        let (view, cx) = setup(cx, &toggles);
+        // Focus then blur the search field so the window has focus history but no field.
+        focus_search(&view, cx);
+        blur_focus(cx);
+        type_stroke(cx, space());
+        let (text, _) = search_state(&view, cx);
+        assert_eq!(text, "");
+        assert_eq!(
+            toggles.get(),
+            1,
+            "bare space outside a field still toggles playback"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn tab_click_clears_the_search(cx: &mut TestAppContext) {
+        let toggles = Rc::new(Cell::new(0));
+        let (view, cx) = setup(cx, &toggles);
+        focus_search(&view, cx);
+        type_stroke(cx, character('m'));
+        let (text, applied) = search_state(&view, cx);
+        assert_eq!((text.as_str(), applied.as_str()), ("m", "m"));
+        // The nav buttons are plain divs (not registered for observation), so
+        // run the click handler's exact body: clearing the field from inside the
+        // view's own update — the nesting that used to panic with the old
+        // change observer.
+        view.update_in(cx, |view, window, cx| {
+            view.query
+                .update(cx, |query, cx| query.set_value("", window, cx));
+            view.set_section(Section::Albums, cx);
+        });
+        cx.run_until_parked();
+        let (text, applied) = search_state(&view, cx);
+        assert_eq!(text, "", "clicking a tab clears the search field");
+        assert_eq!(applied, "", "and the library filter");
+        assert_eq!(view.read_with(cx, |view, _| view.section), Section::Albums);
     }
 }

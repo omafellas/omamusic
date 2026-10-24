@@ -26,6 +26,9 @@ async-channel = "2"
 futures-lite = "2"
 resvg = "0.46"
 
+[dev-dependencies]
+gpui-kit = { version = "=0.7.1", default-features = false, features = ["test-support"] }
+
 [profile.release]
 lto = "thin"
 opt-level = "z"

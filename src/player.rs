@@ -628,7 +628,7 @@ impl Drop for Player {
 
 #[cfg(test)]
 impl Player {
-    fn new_test() -> Self {
+    pub(crate) fn new_test() -> Self {
         let mut player = Self::create(2, 48_000, 1.0);
         player.test_running.store(true, Ordering::Relaxed);
         let shared = player.shared.clone();
