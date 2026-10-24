@@ -91,7 +91,11 @@ pub fn reconcile(conn: &mut Connection, folders: &[PathBuf]) -> Result<ScanStats
         if !folder.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(folder).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(folder)
+            .into_iter()
+            .filter_entry(|entry| !metadata::is_macos_junk(entry.path()))
+            .filter_map(|e| e.ok())
+        {
             let is_file = entry.file_type().is_file();
             let path = entry.into_path();
             if !is_file && !path.is_file() {
@@ -443,5 +447,26 @@ mod tests {
             db::artwork(&conn, &key).unwrap(),
             Some(b"image-bytes".to_vec())
         );
+    }
+
+    #[test]
+    fn macos_archive_junk_is_not_indexed() {
+        let temp = TempDir::new();
+        std::fs::create_dir_all(temp.dir().join("Album")).unwrap();
+        std::fs::create_dir_all(temp.dir().join("__MACOSX/Album")).unwrap();
+        write(&temp.dir().join("Album/song.mp3"), b"a");
+        write(&temp.dir().join("Album/._song.mp3"), b"appledouble");
+        write(
+            &temp.dir().join("__MACOSX/Album/._song.mp3"),
+            b"appledouble",
+        );
+        write(&temp.dir().join("__MACOSX/Album/song.mp3"), b"appledouble");
+
+        let mut conn = memory();
+        let stats = reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        assert_eq!(stats.added, 1);
+        let tracks = db::all_tracks(&conn).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title, "song");
     }
 }

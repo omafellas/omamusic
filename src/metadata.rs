@@ -18,7 +18,29 @@ pub struct AudioMetadata {
     pub artwork: Option<Vec<u8>>,
 }
 
+/// macOS leaves AppleDouble metadata files (`._*`) and `__MACOSX` folders
+/// behind when a zip is extracted. They often reuse audio extensions, so they
+/// must be rejected explicitly instead of being indexed as songs.
+pub fn is_macos_junk(path: &Path) -> bool {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("._"))
+    {
+        return true;
+    }
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("__MACOSX"))
+    })
+}
+
 pub fn is_audio(path: &Path) -> bool {
+    if is_macos_junk(path) {
+        return false;
+    }
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
@@ -571,4 +593,26 @@ fn flac_picture(block: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(block[idx..idx + data_len].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_extensions_are_recognized() {
+        assert!(is_audio(Path::new("/m/song.mp3")));
+        assert!(is_audio(Path::new("/m/song.FLAC")));
+        assert!(!is_audio(Path::new("/m/cover.jpg")));
+    }
+
+    #[test]
+    fn macos_appledouble_files_are_not_audio() {
+        assert!(!is_audio(Path::new("/m/._song.mp3")));
+        assert!(!is_audio(Path::new("/m/__MACOSX/Album/._song.mp3")));
+        assert!(!is_audio(Path::new("/m/__MACOSX/Album/song.mp3")));
+        assert!(!is_audio(Path::new("/m/__macosx/Album/song.mp3")));
+        // A normal hidden file is still a song.
+        assert!(is_audio(Path::new("/m/.hidden-song.mp3")));
+    }
 }
