@@ -206,6 +206,7 @@ impl Library {
         let (rescan_tx, _rx) = mpsc::channel::<()>();
         Self {
             state: Arc::new(RwLock::new(Arc::new(LibrarySnapshot::default()))),
+            db: Arc::new(Db::in_memory().expect("in-memory library database")),
             covers: ArtworkCache::default(),
             watcher: Mutex::new(None),
             rescan_tx,

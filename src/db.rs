@@ -150,6 +150,18 @@ impl Db {
         })
     }
 
+    /// An empty, in-memory database for view tests.
+    #[cfg(test)]
+    pub fn in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        configure(&conn)?;
+        ensure_schema(&conn)?;
+        Ok(Self {
+            path: PathBuf::new(),
+            reader: Mutex::new(conn),
+        })
+    }
+
     /// Open the connection used by the background indexer.
     pub fn open_writer(path: &Path) -> Result<Connection> {
         let conn = Connection::open(path)?;
