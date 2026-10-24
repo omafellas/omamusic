@@ -12,6 +12,7 @@ pub struct AudioMetadata {
     pub title: String,
     pub artist: String,
     pub album: String,
+    pub genre: String,
     pub track_number: u32,
     pub year: u32,
     pub duration: f64,
@@ -80,6 +81,234 @@ fn parse_track(text: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// ID3v1 genre names, including the Winamp extensions. ID3v2 `TCON` frames can
+/// reference these by number, for example `(17)` or `(17)Rock`.
+const ID3_GENRES: [&str; 192] = [
+    "Blues",
+    "Classic Rock",
+    "Country",
+    "Dance",
+    "Disco",
+    "Funk",
+    "Grunge",
+    "Hip-Hop",
+    "Jazz",
+    "Metal",
+    "New Age",
+    "Oldies",
+    "Other",
+    "Pop",
+    "R&B",
+    "Rap",
+    "Reggae",
+    "Rock",
+    "Techno",
+    "Industrial",
+    "Alternative",
+    "Ska",
+    "Death Metal",
+    "Pranks",
+    "Soundtrack",
+    "Euro-Techno",
+    "Ambient",
+    "Trip-Hop",
+    "Vocal",
+    "Jazz+Funk",
+    "Fusion",
+    "Trance",
+    "Classical",
+    "Instrumental",
+    "Acid",
+    "House",
+    "Game",
+    "Sound Clip",
+    "Gospel",
+    "Noise",
+    "AlternRock",
+    "Bass",
+    "Soul",
+    "Punk",
+    "Space",
+    "Meditative",
+    "Instrumental Pop",
+    "Instrumental Rock",
+    "Ethnic",
+    "Gothic",
+    "Darkwave",
+    "Techno-Industrial",
+    "Electronic",
+    "Pop-Folk",
+    "Eurodance",
+    "Dream",
+    "Southern Rock",
+    "Comedy",
+    "Cult",
+    "Gangsta",
+    "Top 40",
+    "Christian Rap",
+    "Pop/Funk",
+    "Jungle",
+    "Native American",
+    "Cabaret",
+    "New Wave",
+    "Psychedelic",
+    "Rave",
+    "Showtunes",
+    "Trailer",
+    "Lo-Fi",
+    "Tribal",
+    "Acid Punk",
+    "Acid Jazz",
+    "Polka",
+    "Retro",
+    "Musical",
+    "Rock & Roll",
+    "Hard Rock",
+    "Folk",
+    "Folk-Rock",
+    "National Folk",
+    "Swing",
+    "Fast Fusion",
+    "Bebob",
+    "Latin",
+    "Revival",
+    "Celtic",
+    "Bluegrass",
+    "Avantgarde",
+    "Gothic Rock",
+    "Progressive Rock",
+    "Psychedelic Rock",
+    "Symphonic Rock",
+    "Slow Rock",
+    "Big Band",
+    "Chorus",
+    "Easy Listening",
+    "Acoustic",
+    "Humour",
+    "Speech",
+    "Chanson",
+    "Opera",
+    "Chamber Music",
+    "Sonata",
+    "Symphony",
+    "Booty Bass",
+    "Primus",
+    "Porn Groove",
+    "Satire",
+    "Slow Jam",
+    "Club",
+    "Tango",
+    "Samba",
+    "Folklore",
+    "Ballad",
+    "Power Ballad",
+    "Rhythmic Soul",
+    "Freestyle",
+    "Duet",
+    "Punk Rock",
+    "Drum Solo",
+    "A Cappella",
+    "Euro-House",
+    "Dance Hall",
+    "Goa",
+    "Drum & Bass",
+    "Club-House",
+    "Hardcore Techno",
+    "Terror",
+    "Indie",
+    "BritPop",
+    "Afro-Punk",
+    "Polsk Punk",
+    "Beat",
+    "Christian Gangsta Rap",
+    "Heavy Metal",
+    "Black Metal",
+    "Crossover",
+    "Contemporary Christian",
+    "Christian Rock",
+    "Merengue",
+    "Salsa",
+    "Thrash Metal",
+    "Anime",
+    "JPop",
+    "Synthpop",
+    "Abstract",
+    "Art Rock",
+    "Baroque",
+    "Bhangra",
+    "Big Beat",
+    "Breakbeat",
+    "Chillout",
+    "Downtempo",
+    "Dub",
+    "EBM",
+    "Eclectic",
+    "Electro",
+    "Electroclash",
+    "Emo",
+    "Experimental",
+    "Garage",
+    "Global",
+    "IDM",
+    "Illbient",
+    "Industro-Goth",
+    "Jam Band",
+    "Krautrock",
+    "Leftfield",
+    "Lounge",
+    "Math Rock",
+    "New Romantic",
+    "Nu-Breakz",
+    "Post-Punk",
+    "Post-Rock",
+    "Psytrance",
+    "Shoegaze",
+    "Space Rock",
+    "Trop Rock",
+    "World Music",
+    "Neoclassical",
+    "Audiobook",
+    "Audio Theatre",
+    "Neue Deutsche Welle",
+    "Podcast",
+    "Indie Rock",
+    "G-Funk",
+    "Dubstep",
+    "Garage Rock",
+    "Psybient",
+];
+
+/// Normalise a genre tag. Handles plain text (`Black Metal`), ID3 numeric
+/// references (`(22)`, `(22)Death Metal`) and multiple values, joining them
+/// with `, `.
+fn parse_genre(text: &str) -> String {
+    let text = text.replace(")(", ")/(");
+    let mut genres: Vec<String> = Vec::new();
+    for part in text.split(['/', '\0']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let genre = match part.strip_prefix('(').and_then(|rest| rest.split_once(')')) {
+            Some((_, tail)) if !tail.trim().is_empty() => tail.trim().to_string(),
+            Some((number, _)) => number
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| ID3_GENRES.get(index))
+                .map_or_else(|| part.to_string(), |genre| (*genre).to_string()),
+            None => part.to_string(),
+        };
+        if !genres
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&genre))
+        {
+            genres.push(genre);
+        }
+    }
+    genres.join(", ")
+}
+
 fn be_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes(bytes[..4].try_into().unwrap())
 }
@@ -139,6 +368,7 @@ fn read_id3(path: &Path) -> Result<AudioMetadata> {
             b"TIT2" => meta.title = id3_text(&data),
             b"TPE1" => meta.artist = id3_text(&data),
             b"TALB" => meta.album = id3_text(&data),
+            b"TCON" => meta.genre = parse_genre(&id3_text(&data)),
             b"TRCK" => meta.track_number = parse_track(&id3_text(&data)),
             b"TYER" | b"TDRC" => meta.year = parse_year(&id3_text(&data)),
             b"TDOR" | b"TORY" if meta.year == 0 => meta.year = parse_year(&id3_text(&data)),
@@ -343,6 +573,13 @@ fn read_mp4(path: &Path) -> Result<AudioMetadata> {
                 b"\xa9ART" => meta.artist = mp4_text(&buf),
                 b"\xa9alb" => meta.album = mp4_text(&buf),
                 b"\xa9day" => meta.year = parse_year(&mp4_text(&buf)),
+                b"\xa9gen" => meta.genre = parse_genre(&mp4_text(&buf)),
+                b"gnre" if buf.len() >= 2 => {
+                    let index = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                    if let Some(genre) = index.checked_sub(1).and_then(|i| ID3_GENRES.get(i)) {
+                        meta.genre = (*genre).to_string();
+                    }
+                }
                 b"trkn" if buf.len() >= 4 => {
                     meta.track_number = u16::from_be_bytes([buf[2], buf[3]]) as u32
                 }
@@ -460,6 +697,7 @@ fn vorbis_comments(data: &[u8], meta: &mut AudioMetadata) {
             "TITLE" => meta.title = value.to_string(),
             "ARTIST" => meta.artist = value.to_string(),
             "ALBUM" => meta.album = value.to_string(),
+            "GENRE" => meta.genre = parse_genre(value),
             "TRACKNUMBER" => meta.track_number = parse_track(value),
             "DATE" | "YEAR" => meta.year = parse_year(value),
             _ => {}
@@ -614,5 +852,18 @@ mod tests {
         assert!(!is_audio(Path::new("/m/__macosx/Album/song.mp3")));
         // A normal hidden file is still a song.
         assert!(is_audio(Path::new("/m/.hidden-song.mp3")));
+    }
+
+    #[test]
+    fn genre_tags_are_normalized() {
+        assert_eq!(parse_genre("Black Metal"), "Black Metal");
+        assert_eq!(parse_genre("  "), "");
+        assert_eq!(parse_genre("(17)"), "Rock");
+        assert_eq!(parse_genre("(17)Rock"), "Rock");
+        assert_eq!(parse_genre("(22)"), "Death Metal");
+        assert_eq!(parse_genre("(17)(22)"), "Rock, Death Metal");
+        assert_eq!(parse_genre("Rock/Pop"), "Rock, Pop");
+        assert_eq!(parse_genre("Rock\0Pop"), "Rock, Pop");
+        assert_eq!(parse_genre("Rock/Rock"), "Rock");
     }
 }

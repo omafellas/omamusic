@@ -19,14 +19,15 @@ pub fn album_key(dir: &str, album: &str) -> String {
 /// concatenated so album search can match on song names.
 pub(crate) const REBUILD_ALBUMS: &str = r#"
 DELETE FROM albums;
-INSERT INTO albums(key, title, artist, year, dir, track_count, track_titles)
+INSERT INTO albums(key, title, artist, year, dir, track_count, track_titles, genres)
 SELECT album_key,
        MAX(album),
        CASE WHEN COUNT(DISTINCT artist) = 1 THEN MAX(artist) ELSE 'Various Artists' END,
        MAX(year),
        MAX(dir),
        COUNT(*),
-       GROUP_CONCAT(title, ' ')
+       GROUP_CONCAT(title, ' '),
+       COALESCE(GROUP_CONCAT(DISTINCT NULLIF(genre, '')), '')
 FROM tracks
 GROUP BY album_key;
 "#;
@@ -146,12 +147,14 @@ pub fn reconcile(conn: &mut Connection, folders: &[PathBuf]) -> Result<ScanStats
                 md.artist
             };
             tx.execute(
-                "INSERT INTO tracks(path, dir, title, artist, album, album_key, track_number, year, \
-                 duration, mtime_ns, size) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                "INSERT INTO tracks(path, dir, title, artist, album, album_key, genre, track_number, \
+                 year, duration, mtime_ns, size) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT(path) DO UPDATE SET dir = excluded.dir, title = excluded.title, \
                  artist = excluded.artist, album = excluded.album, album_key = excluded.album_key, \
-                 track_number = excluded.track_number, year = excluded.year, \
-                 duration = excluded.duration, mtime_ns = excluded.mtime_ns, size = excluded.size",
+                 genre = excluded.genre, track_number = excluded.track_number, \
+                 year = excluded.year, duration = excluded.duration, \
+                 mtime_ns = excluded.mtime_ns, size = excluded.size",
                 params![
                     path_str,
                     dir,
@@ -159,6 +162,7 @@ pub fn reconcile(conn: &mut Connection, folders: &[PathBuf]) -> Result<ScanStats
                     artist,
                     album_name,
                     key,
+                    md.genre,
                     md.track_number as i64,
                     md.year as i64,
                     md.duration.max(0.0),

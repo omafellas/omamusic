@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Bump when the schema changes. Older databases are discarded and rebuilt.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tracks (
@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS tracks (
     artist       TEXT NOT NULL,
     album        TEXT NOT NULL,
     album_key    TEXT NOT NULL,
+    genre        TEXT NOT NULL DEFAULT '',
     track_number INTEGER NOT NULL DEFAULT 0,
     year         INTEGER NOT NULL DEFAULT 0,
     duration     REAL NOT NULL DEFAULT 0,
@@ -42,7 +43,8 @@ CREATE TABLE IF NOT EXISTS albums (
     year         INTEGER NOT NULL DEFAULT 0,
     dir          TEXT NOT NULL,
     track_count  INTEGER NOT NULL DEFAULT 0,
-    track_titles TEXT NOT NULL DEFAULT ''
+    track_titles TEXT NOT NULL DEFAULT '',
+    genres       TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS artwork (
@@ -53,44 +55,44 @@ CREATE TABLE IF NOT EXISTS artwork (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
-    title, artist, album,
+    title, artist, album, genre,
     content='tracks', content_rowid='id',
     tokenize='unicode61 remove_diacritics 2'
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(
-    title, artist, track_titles,
+    title, artist, track_titles, genres,
     content='albums', content_rowid='id',
     tokenize='unicode61 remove_diacritics 2'
 );
 
 CREATE TRIGGER IF NOT EXISTS tracks_ai AFTER INSERT ON tracks BEGIN
-    INSERT INTO tracks_fts(rowid, title, artist, album)
-    VALUES (new.id, new.title, new.artist, new.album);
+    INSERT INTO tracks_fts(rowid, title, artist, album, genre)
+    VALUES (new.id, new.title, new.artist, new.album, new.genre);
 END;
 CREATE TRIGGER IF NOT EXISTS tracks_ad AFTER DELETE ON tracks BEGIN
-    INSERT INTO tracks_fts(tracks_fts, rowid, title, artist, album)
-    VALUES ('delete', old.id, old.title, old.artist, old.album);
+    INSERT INTO tracks_fts(tracks_fts, rowid, title, artist, album, genre)
+    VALUES ('delete', old.id, old.title, old.artist, old.album, old.genre);
 END;
 CREATE TRIGGER IF NOT EXISTS tracks_au AFTER UPDATE ON tracks BEGIN
-    INSERT INTO tracks_fts(tracks_fts, rowid, title, artist, album)
-    VALUES ('delete', old.id, old.title, old.artist, old.album);
-    INSERT INTO tracks_fts(rowid, title, artist, album)
-    VALUES (new.id, new.title, new.artist, new.album);
+    INSERT INTO tracks_fts(tracks_fts, rowid, title, artist, album, genre)
+    VALUES ('delete', old.id, old.title, old.artist, old.album, old.genre);
+    INSERT INTO tracks_fts(rowid, title, artist, album, genre)
+    VALUES (new.id, new.title, new.artist, new.album, new.genre);
 END;
 
 CREATE TRIGGER IF NOT EXISTS albums_ai AFTER INSERT ON albums BEGIN
-    INSERT INTO albums_fts(rowid, title, artist, track_titles)
-    VALUES (new.id, new.title, new.artist, new.track_titles);
+    INSERT INTO albums_fts(rowid, title, artist, track_titles, genres)
+    VALUES (new.id, new.title, new.artist, new.track_titles, new.genres);
 END;
 CREATE TRIGGER IF NOT EXISTS albums_ad AFTER DELETE ON albums BEGIN
-    INSERT INTO albums_fts(albums_fts, rowid, title, artist, track_titles)
-    VALUES ('delete', old.id, old.title, old.artist, old.track_titles);
+    INSERT INTO albums_fts(albums_fts, rowid, title, artist, track_titles, genres)
+    VALUES ('delete', old.id, old.title, old.artist, old.track_titles, old.genres);
 END;
 CREATE TRIGGER IF NOT EXISTS albums_au AFTER UPDATE ON albums BEGIN
-    INSERT INTO albums_fts(albums_fts, rowid, title, artist, track_titles)
-    VALUES ('delete', old.id, old.title, old.artist, old.track_titles);
-    INSERT INTO albums_fts(rowid, title, artist, track_titles)
-    VALUES (new.id, new.title, new.artist, new.track_titles);
+    INSERT INTO albums_fts(albums_fts, rowid, title, artist, track_titles, genres)
+    VALUES ('delete', old.id, old.title, old.artist, old.track_titles, old.genres);
+    INSERT INTO albums_fts(rowid, title, artist, track_titles, genres)
+    VALUES (new.id, new.title, new.artist, new.track_titles, new.genres);
 END;
 "#;
 
@@ -409,7 +411,7 @@ pub fn artist_tracks(conn: &Connection, name: &str) -> Result<Vec<Track>> {
 pub fn search_tracks(conn: &Connection, query: &str, limit: usize) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare(
         "SELECT t.id FROM tracks_fts JOIN tracks t ON t.id = tracks_fts.rowid \
-         WHERE tracks_fts MATCH ?1 ORDER BY bm25(tracks_fts, 5.0, 3.0, 1.0) LIMIT ?2",
+         WHERE tracks_fts MATCH ?1 ORDER BY bm25(tracks_fts, 5.0, 3.0, 1.0, 2.0) LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![query, limit as i64], |row| row.get::<_, i64>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -419,7 +421,7 @@ pub fn search_tracks(conn: &Connection, query: &str, limit: usize) -> Result<Vec
 pub fn search_albums(conn: &Connection, query: &str, limit: usize) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT a.key FROM albums_fts JOIN albums a ON a.id = albums_fts.rowid \
-         WHERE albums_fts MATCH ?1 ORDER BY bm25(albums_fts, 5.0, 3.0, 1.0) LIMIT ?2",
+         WHERE albums_fts MATCH ?1 ORDER BY bm25(albums_fts, 5.0, 3.0, 1.0, 2.0) LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![query, limit as i64], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -597,6 +599,28 @@ mod tests {
         assert_eq!(search_tracks(&conn, "\"neo\"*", 10).unwrap().len(), 1);
         // Prefix, not infix: "eon" is not the start of "neon".
         assert!(search_tracks(&conn, "\"eon\"*", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn genre_is_searchable_for_tracks_and_albums() {
+        let conn = memory();
+        insert_track(
+            &conn,
+            "/m/1.mp3",
+            "Blazing Corpse",
+            "Exhumed",
+            "Gore Metal",
+            1,
+        );
+        conn.execute(
+            "UPDATE tracks SET genre = 'Death Metal' WHERE path = '/m/1.mp3'",
+            [],
+        )
+        .unwrap();
+        rebuild_albums(&conn);
+        assert_eq!(search_tracks(&conn, "\"death\"*", 10).unwrap().len(), 1);
+        assert_eq!(search_albums(&conn, "\"death\"*", 10).unwrap().len(), 1);
+        assert!(search_tracks(&conn, "\"black\"*", 10).unwrap().is_empty());
     }
 
     #[test]
