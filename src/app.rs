@@ -7,10 +7,10 @@ use gpui_kit::base::input::InputState;
 use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, px, rems, uniform_list, AnyElement, App, AppContext, ClickEvent, Context, Div, ElementId,
-    Entity, EntityInputHandler, Focusable, ImageSource, InteractiveElement, IntoElement,
-    MouseButton, NavigationDirection, ParentElement, PathPromptOptions, Render, Stateful,
-    StatefulInteractiveElement, Styled, Window,
+    div, px, rems, uniform_list, Animation, AnimationExt as _, AnyElement, App, AppContext,
+    ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler, Focusable, ImageSource,
+    InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement,
+    PathPromptOptions, Render, Stateful, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, menu, panel,
@@ -37,6 +37,12 @@ pub struct Omamusic {
     new_folder: Entity<InputState>,
     rescan_notify: Option<(String, f32)>,
     prev_scanning: bool,
+    /// Latest text typed into the search field, applied after the debounce.
+    pending_query: String,
+    /// The in-flight debounce task; replacing it cancels the previous one.
+    search_task: Option<gpui_kit::Task<()>>,
+    /// True while a debounced search is waiting to run (shows the spinner).
+    searching: bool,
     /// Keeps bare character keystrokes reaching the text fields; see `new`.
     _typing_guard: gpui_kit::Subscription,
 }
@@ -115,6 +121,10 @@ const ALBUM_ACTIONS: &[RowAction] = &[
     RowAction::GoToArtist,
 ];
 const ARTIST_ACTIONS: &[RowAction] = &[RowAction::Play, RowAction::PlayNext, RowAction::AddToQueue];
+
+/// Wait this long after the last keystroke before running the search, so a
+/// burst of typing results in a single BM25 query.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 
 impl RowAction {
     fn group(self) -> u8 {
@@ -234,6 +244,10 @@ impl Omamusic {
             });
         });
 
+        // Debounce the search so a burst of keystrokes runs a single query.
+        cx.observe(&query, |this, _, cx| this.schedule_search(cx))
+            .detach();
+
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
@@ -297,6 +311,9 @@ impl Omamusic {
             new_folder,
             rescan_notify: None,
             prev_scanning: false,
+            pending_query: String::new(),
+            search_task: None,
+            searching: false,
             _typing_guard,
         }
     }
@@ -576,23 +593,49 @@ impl Omamusic {
         .w_full()
     }
 
-    /// Push the search field's text into the library. Done during render rather
-    /// by observing `InputEvent`s: a programmatic focus or clear emits those
-    /// events while this view's update is active, and gpui forbids re-entering
-    /// an entity update.
-    fn apply_query(&mut self, cx: &mut Context<Self>) {
-        let text = self.query.read(cx).text().to_string();
-        if text == self.library.query() {
-            return;
-        }
-        self.library.set_query(text.clone());
-        self.pages.clear();
-        self.clear_selection();
-        // Search always filters all songs, switch to Songs section.
-        if !text.trim().is_empty() && self.section != Section::Songs {
-            self.section = Section::Songs;
+    /// Apply `text` to the library. Shared by the immediate path used in tests
+    /// and the debounced path used by the view.
+    fn apply_text(&mut self, text: String, cx: &mut Context<Self>) {
+        if text != self.library.query() {
+            self.library.set_query(text.clone());
+            self.pages.clear();
+            self.clear_selection();
+            // Search always filters all songs, switch to Songs section.
+            if !text.trim().is_empty() && self.section != Section::Songs {
+                self.section = Section::Songs;
+            }
         }
         cx.notify();
+    }
+
+    /// Push the field's current text into the library immediately. Used by the
+    /// view tests; the running view debounces through [`Self::schedule_search`].
+    #[cfg(test)]
+    fn apply_query(&mut self, cx: &mut Context<Self>) {
+        let text = self.query.read(cx).text().to_string();
+        self.apply_text(text, cx);
+    }
+
+    /// Schedule a search after the debounce interval. Replacing the stored task
+    /// cancels the previous one, so only the last keystroke is searched.
+    fn schedule_search(&mut self, cx: &mut Context<Self>) {
+        let text = self.query.read(cx).text().to_string();
+        if text == self.pending_query {
+            return;
+        }
+        self.pending_query = text;
+        self.searching = true;
+        cx.notify();
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| this.apply_pending_query(cx));
+        }));
+    }
+
+    fn apply_pending_query(&mut self, cx: &mut Context<Self>) {
+        let text = self.pending_query.clone();
+        self.searching = false;
+        self.apply_text(text, cx);
     }
 
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -682,7 +725,6 @@ fn sidebar_btn(
 
 impl Render for Omamusic {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.apply_query(cx);
         let snap = self.library.snapshot();
         let theme = cx.omarchy().clone();
         let nav = [
@@ -725,6 +767,18 @@ impl Render for Omamusic {
                                 window,
                                 cx,
                             )))
+                            .when(self.searching, |d| {
+                                d.child(
+                                    icon(IconName::Loader)
+                                        .size(rems(0.875))
+                                        .text_color(theme.secondary)
+                                        .with_animation(
+                                            "search-spinner",
+                                            Animation::new(Duration::from_millis(700)).repeat(),
+                                            |this, delta| this.opacity(0.4 + 0.6 * delta),
+                                        ),
+                                )
+                            })
                             .child(with_tooltip(
                                 icon_button(
                                     "rescan",
@@ -1792,5 +1846,32 @@ mod tests {
         assert_eq!(text, "", "clicking a tab clears the search field");
         assert_eq!(applied, "", "and the library filter");
         assert_eq!(view.read_with(cx, |view, _| view.section), Section::Albums);
+    }
+
+    #[gpui_kit::test]
+    async fn search_is_debounced_until_typing_pauses(cx: &mut TestAppContext) {
+        let toggles = Rc::new(Cell::new(0));
+        let (view, cx) = setup(cx, &toggles);
+        focus_search(&view, cx);
+
+        type_stroke(cx, character('m'));
+        type_stroke(cx, character('o'));
+
+        // Inside the debounce window: the field has both characters, but the
+        // library has not been queried yet and the spinner is showing.
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.query.read(cx).text(), "mo");
+            assert_eq!(view.library.query(), "");
+            assert!(view.searching);
+        });
+
+        cx.executor()
+            .advance_clock(SEARCH_DEBOUNCE + Duration::from_millis(10));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.library.query(), "mo");
+            assert!(!view.searching);
+        });
     }
 }
