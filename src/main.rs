@@ -36,9 +36,27 @@ actions!(
         Rescan,
         FocusSearch,
         GoBack,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
         Quit
     ]
 );
+
+fn key_bindings() -> Vec<gpui_kit::KeyBinding> {
+    vec![
+        gpui_kit::KeyBinding::new("space", TogglePlay, None),
+        gpui_kit::KeyBinding::new("right", NextTrack, None),
+        gpui_kit::KeyBinding::new("left", PrevTrack, None),
+        gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
+        gpui_kit::KeyBinding::new("ctrl-p", FocusSearch, None),
+        gpui_kit::KeyBinding::new("alt-left", GoBack, None),
+        gpui_kit::KeyBinding::new("ctrl-=", IncreaseFontSize, None),
+        gpui_kit::KeyBinding::new("ctrl--", DecreaseFontSize, None),
+        gpui_kit::KeyBinding::new("ctrl-0", ResetFontSize, None),
+        gpui_kit::KeyBinding::new("ctrl-q", Quit, None),
+    ]
+}
 
 fn main() {
     if std::env::args().any(|a| a == "--dump-library") {
@@ -54,15 +72,7 @@ fn main() {
             gpui_omarchy::init(cx);
             cx.set_quit_mode(QuitMode::Explicit);
 
-            cx.bind_keys([
-                gpui_kit::KeyBinding::new("space", TogglePlay, None),
-                gpui_kit::KeyBinding::new("right", NextTrack, None),
-                gpui_kit::KeyBinding::new("left", PrevTrack, None),
-                gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
-                gpui_kit::KeyBinding::new("ctrl-p", FocusSearch, None),
-                gpui_kit::KeyBinding::new("alt-left", GoBack, None),
-                gpui_kit::KeyBinding::new("ctrl-q", Quit, None),
-            ]);
+            cx.bind_keys(key_bindings());
 
             let library = Arc::new(Library::new().expect("library"));
             let config = AppConfig::load();
@@ -249,5 +259,17 @@ fn dump_library() {
             tracks,
             lib.artist_total()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_bindings_parse() {
+        // `KeyBinding::new` panics on an invalid keystroke, so building the
+        // real list validates every shortcut, including ctrl-= / ctrl--.
+        assert_eq!(key_bindings().len(), 10);
     }
 }

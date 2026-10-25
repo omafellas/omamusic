@@ -26,7 +26,7 @@ Run `omamusic`, open Settings, and add a music folder. Configuration is stored a
 - Background incremental rescan on filesystem changes: only new or changed files are re-read, and folders added in Settings are picked up.
 - Omarchy theme following through `gpui-omarchy`.
 
-Space toggles playback, Left/Right changes tracks, and Ctrl+R rescans the library. A folder picker uses `zenity` or `kdialog` if available.
+Space toggles playback, Left/Right changes tracks, and Ctrl+R rescans the library. Ctrl+= / Ctrl+- adjust the text size (Ctrl+0 resets it); the setting is also in Settings and persists across restarts. A folder picker uses `zenity` or `kdialog` if available.
 
 ## Architecture
 

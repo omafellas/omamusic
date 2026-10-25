@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::library::{Library, LibrarySnapshot};
 use crate::models::{Album, AlbumSummary, ArtistEntry, PlayerState, Section, Track};
 use crate::player::Player;
-use crate::{FocusSearch, GoBack};
+use crate::{DecreaseFontSize, FocusSearch, GoBack, IncreaseFontSize, ResetFontSize};
 use gpui_kit::base::input::InputState;
 use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
@@ -121,6 +121,25 @@ const ALBUM_ACTIONS: &[RowAction] = &[
     RowAction::GoToArtist,
 ];
 const ARTIST_ACTIONS: &[RowAction] = &[RowAction::Play, RowAction::PlayNext, RowAction::AddToQueue];
+
+/// Default rem size in pixels; the UI scale multiplies it.
+const BASE_REM_SIZE: f32 = 16.0;
+/// UI scale step per Ctrl+= / Ctrl+- press.
+const UI_SCALE_STEP: f64 = 0.1;
+/// Allowed UI scale range.
+const UI_SCALE_MIN: f64 = 0.75;
+const UI_SCALE_MAX: f64 = 2.0;
+
+/// Window rem size for a UI scale factor.
+fn rem_for_scale(scale: f64) -> gpui_kit::Pixels {
+    px((BASE_REM_SIZE as f64 * scale) as f32)
+}
+
+/// Step the UI scale up or down, rounded to one decimal and clamped.
+fn stepped_scale(current: f64, steps: i32) -> f64 {
+    (((current * 10.0).round() + steps as f64 * UI_SCALE_STEP * 10.0) / 10.0)
+        .clamp(UI_SCALE_MIN, UI_SCALE_MAX)
+}
 
 /// Wait this long after the last keystroke before running the search, so a
 /// burst of typing results in a single BM25 query.
@@ -645,6 +664,62 @@ impl Omamusic {
         });
     }
 
+    /// Persist a new UI scale and repaint. The window rem size itself is
+    /// applied in [`Self::render`] so every frame follows the setting.
+    fn set_scale(&mut self, scale: f64, cx: &mut Context<Self>) {
+        let scale = scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+        if scale == self.prefs.ui_scale {
+            return;
+        }
+        self.prefs.ui_scale = scale;
+        AppConfig::update(|c| c.ui_scale = scale);
+        cx.notify();
+    }
+
+    fn bump_scale(&mut self, steps: i32, cx: &mut Context<Self>) {
+        self.set_scale(stepped_scale(self.prefs.ui_scale, steps), cx);
+    }
+
+    fn text_size_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.omarchy().clone();
+        let pct = format!("{}%", (self.prefs.ui_scale * 100.0).round() as i32);
+        div()
+            .flex()
+            .items_center()
+            .gap(rems(0.5))
+            .py(rems(0.3125))
+            .px(rems(0.3125))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(rems(0.75))
+                    .text_color(theme.foreground)
+                    .child("Text size"),
+            )
+            .child(
+                button("font-smaller", "−", ButtonVariant::Secondary, cx)
+                    .on_click(cx.listener(|this, _, _, cx| this.bump_scale(-1, cx))),
+            )
+            .child(with_tooltip(
+                button("font-reset", pct, ButtonVariant::Secondary, cx)
+                    .on_click(cx.listener(|this, _, _, cx| this.set_scale(1.0, cx))),
+                "Reset to 100% (Ctrl+0)",
+            ))
+            .child(
+                button("font-larger", "+", ButtonVariant::Secondary, cx)
+                    .on_click(cx.listener(|this, _, _, cx| this.bump_scale(1, cx))),
+            )
+    }
+
+    /// Sync the window rem size with the saved UI scale. Called at the top of
+    /// every render; a no-op once they agree.
+    fn apply_scale(&self, window: &mut Window) {
+        let rem = rem_for_scale(self.prefs.ui_scale);
+        if window.rem_size() != rem {
+            window.set_rem_size(rem);
+        }
+    }
+
     fn pref_switch(
         &self,
         id: &'static str,
@@ -725,6 +800,7 @@ fn sidebar_btn(
 
 impl Render for Omamusic {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_scale(window);
         let snap = self.library.snapshot();
         let theme = cx.omarchy().clone();
         let nav = [
@@ -739,6 +815,9 @@ impl Render for Omamusic {
                 cx.listener(|this, _: &FocusSearch, window, cx| this.focus_search(window, cx)),
             )
             .on_action(cx.listener(|this, _: &GoBack, _, cx| this.back(cx)))
+            .on_action(cx.listener(|this, _: &IncreaseFontSize, _, cx| this.bump_scale(1, cx)))
+            .on_action(cx.listener(|this, _: &DecreaseFontSize, _, cx| this.bump_scale(-1, cx)))
+            .on_action(cx.listener(|this, _: &ResetFontSize, _, cx| this.set_scale(1.0, cx)))
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(|this, _, _, cx| this.back(cx)),
@@ -1648,7 +1727,8 @@ impl Omamusic {
                                 self.prefs.start_hidden,
                                 |c, on| c.start_hidden = on,
                                 cx,
-                            )),
+                            ))
+                            .child(self.text_size_row(cx)),
                     )
                     .child(separator(cx))
                     .child(div().flex().flex_col().gap(rems(0.5)).children(
@@ -1872,5 +1952,38 @@ mod tests {
             assert_eq!(view.library.query(), "mo");
             assert!(!view.searching);
         });
+    }
+
+    #[test]
+    fn ui_scale_steps_round_and_clamp() {
+        assert_eq!(stepped_scale(1.0, 1), 1.1);
+        assert_eq!(stepped_scale(1.0, -1), 0.9);
+        assert_eq!(stepped_scale(1.0, 0), 1.0);
+        // No float drift from repeated steps: 1.1 + 0.1 is exactly 1.2.
+        assert_eq!(stepped_scale(stepped_scale(1.0, 1), 1), 1.2);
+        assert_eq!(stepped_scale(2.0, 1), UI_SCALE_MAX);
+        assert_eq!(stepped_scale(0.75, -5), UI_SCALE_MIN);
+        assert_eq!(rem_for_scale(1.0), px(16.0));
+        assert_eq!(rem_for_scale(1.5), px(24.0));
+    }
+
+    #[gpui_kit::test]
+    async fn text_size_action_rescales_the_window(cx: &mut TestAppContext) {
+        let toggles = Rc::new(Cell::new(0));
+        let (view, cx) = setup(cx, &toggles);
+        cx.run_until_parked();
+        let before = view.update_in(cx, |_, window, _| window.rem_size());
+        assert_eq!(before, px(16.0));
+
+        // Assign the preference directly: going through `set_scale` would
+        // write the real config file from the test.
+        view.update_in(cx, |view, _, cx| {
+            view.prefs.ui_scale = 1.5;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let after = view.update_in(cx, |_, window, _| window.rem_size());
+        assert_eq!(after, px(24.0));
     }
 }
