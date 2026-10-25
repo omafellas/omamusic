@@ -27,8 +27,12 @@ async-channel = "2"
 futures-lite = "2"
 resvg = "0.46"
 
+[features]
+test-support = []
+
 [dev-dependencies]
 gpui-kit = { version = "=0.7.1", default-features = false, features = ["test-support"] }
+omamusic = { path = ".", features = ["test-support"] }
 
 [profile.release]
 lto = "thin"
@@ -36,3 +40,8 @@ opt-level = "z"
 strip = true
 codegen-units = 1
 panic = "abort"
+
+[[test]]
+name = "rendering"
+path = "tests/rendering.rs"
+harness = false

@@ -1,62 +1,7 @@
-mod app;
-mod artwork;
-mod config;
-mod db;
-mod desktop;
-mod index;
-mod library;
-mod metadata;
-mod models;
-mod mpris;
-mod player;
-mod player_bar;
-mod search;
-mod tray;
-
-use app::Omamusic;
-use desktop::Command;
-use gpui_kit::{
-    actions, div, px, size, App, AppContext, Bounds, Context, Entity, IntoElement, ParentElement,
-    QuitMode, Render, StyleRefinement, Styled, Window, WindowBounds, WindowOptions,
-};
-use gpui_omarchy::{separator, ActiveTheme};
-use player_bar::PlayerBar;
+use gpui_kit::{px, size, App, AppContext, Bounds, QuitMode, WindowBounds, WindowOptions};
+use omamusic::desktop::{self, Command};
+use omamusic::{AppConfig, Library, Player, Root};
 use std::sync::Arc;
-
-use crate::config::AppConfig;
-use crate::library::Library;
-use crate::player::Player;
-
-actions!(
-    omamusic,
-    [
-        TogglePlay,
-        NextTrack,
-        PrevTrack,
-        Rescan,
-        FocusSearch,
-        GoBack,
-        IncreaseFontSize,
-        DecreaseFontSize,
-        ResetFontSize,
-        Quit
-    ]
-);
-
-fn key_bindings() -> Vec<gpui_kit::KeyBinding> {
-    vec![
-        gpui_kit::KeyBinding::new("space", TogglePlay, None),
-        gpui_kit::KeyBinding::new("right", NextTrack, None),
-        gpui_kit::KeyBinding::new("left", PrevTrack, None),
-        gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
-        gpui_kit::KeyBinding::new("ctrl-p", FocusSearch, None),
-        gpui_kit::KeyBinding::new("alt-left", GoBack, None),
-        gpui_kit::KeyBinding::new("ctrl-=", IncreaseFontSize, None),
-        gpui_kit::KeyBinding::new("ctrl--", DecreaseFontSize, None),
-        gpui_kit::KeyBinding::new("ctrl-0", ResetFontSize, None),
-        gpui_kit::KeyBinding::new("ctrl-q", Quit, None),
-    ]
-}
 
 fn main() {
     if std::env::args().any(|a| a == "--dump-library") {
@@ -72,8 +17,6 @@ fn main() {
             gpui_omarchy::init(cx);
             cx.set_quit_mode(QuitMode::Explicit);
 
-            cx.bind_keys(key_bindings());
-
             let library = Arc::new(Library::new().expect("library"));
             let config = AppConfig::load();
             let player = Arc::new(Player::new(config.volume).expect("player"));
@@ -81,36 +24,7 @@ fn main() {
             let (commands, received) = async_channel::unbounded();
             let has_tray = desktop::start(player.clone(), library.clone(), commands);
 
-            cx.on_action(|_: &Quit, cx| cx.quit());
-
-            cx.on_action({
-                let player = player.clone();
-                move |_: &TogglePlay, cx| {
-                    player.toggle();
-                    cx.refresh_windows();
-                }
-            });
-            cx.on_action({
-                let player = player.clone();
-                move |_: &NextTrack, cx| {
-                    player.next();
-                    cx.refresh_windows();
-                }
-            });
-            cx.on_action({
-                let player = player.clone();
-                move |_: &PrevTrack, cx| {
-                    player.previous();
-                    cx.refresh_windows();
-                }
-            });
-            cx.on_action({
-                let library = library.clone();
-                move |_: &Rescan, cx| {
-                    library.request_rescan();
-                    cx.refresh_windows();
-                }
-            });
+            omamusic::init_actions(&library, &player, cx);
 
             cx.on_window_closed(move |cx, _| {
                 if !cx.windows().is_empty() {
@@ -173,39 +87,10 @@ fn show_window(library: &Arc<Library>, player: &Arc<Player>, cx: &mut App) {
             ))),
             ..Default::default()
         },
-        |window, cx| {
-            cx.new(|cx| {
-                let main = cx.new(|cx| Omamusic::new(library.clone(), player.clone(), window, cx));
-                let bar =
-                    cx.new(|cx| PlayerBar::new(library, player, main.downgrade(), window, cx));
-                Root { main, bar }
-            })
-        },
+        |window, cx| cx.new(|cx| Root::new(library, player, window, cx)),
     );
     if let Err(err) = opened {
         eprintln!("open window: {err:#}");
-    }
-}
-
-struct Root {
-    main: Entity<Omamusic>,
-    bar: Entity<PlayerBar>,
-}
-
-impl Render for Root {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(cx.omarchy().background)
-            .child(
-                self.main
-                    .clone()
-                    .cached(StyleRefinement::default().flex_1().min_h_0().w_full()),
-            )
-            .child(separator(cx))
-            .child(self.bar.clone())
     }
 }
 
@@ -259,17 +144,5 @@ fn dump_library() {
             tracks,
             lib.artist_total()
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn key_bindings_parse() {
-        // `KeyBinding::new` panics on an invalid keystroke, so building the
-        // real list validates every shortcut, including ctrl-= / ctrl--.
-        assert_eq!(key_bindings().len(), 10);
     }
 }

@@ -14,7 +14,7 @@ The installed player needs no separate media player, codec package, or GStreamer
 
 Building from source on Linux requires the ALSA development headers for CPAL (`alsa-lib` on Arch/Omarchy or `libasound2-dev` on Ubuntu), in addition to GPUI's normal graphics build requirements. These are build requirements, not playback plugins or companion programs.
 
-Run `omamusic`, open Settings, and add a music folder. Configuration is stored at `~/.config/omamusic/config.json`.
+Run `omamusic`, open Settings, and add a music folder. Configuration is stored at `~/.config/omamusic/config.json`. Set `OMAMUSIC_CONFIG_DIR` to use a different config directory.
 
 ## Features
 

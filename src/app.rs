@@ -6,10 +6,11 @@ use crate::{DecreaseFontSize, FocusSearch, GoBack, IncreaseFontSize, ResetFontSi
 use gpui_kit::base::input::InputState;
 use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::TestSupportExt;
 use gpui_kit::{
     div, px, rems, uniform_list, Animation, AnimationExt as _, AnyElement, App, AppContext,
-    ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler, Focusable, ImageSource,
-    InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement,
+    ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler, FocusHandle, Focusable,
+    ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement,
     PathPromptOptions, Render, Stateful, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_omarchy::{
@@ -45,6 +46,12 @@ pub struct Omamusic {
     searching: bool,
     /// Keeps bare character keystrokes reaching the text fields; see `new`.
     _typing_guard: gpui_kit::Subscription,
+    /// Focus for the view itself. Actions dispatch along the focus path, so the
+    /// root element holds focus whenever no text field does; otherwise the
+    /// window shortcuts (Ctrl+=, Ctrl+P, Alt+Left) have nothing to reach.
+    focus_handle: FocusHandle,
+    /// Refocus the root when one of our handles loses focus to nothing.
+    _focus_guards: Vec<gpui_kit::Subscription>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -230,6 +237,20 @@ impl Omamusic {
     ) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
         let new_folder = cx.new(|cx| InputState::new(window, cx).placeholder("Enter folder path"));
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle, cx);
+        let _focus_guards = [
+            &focus_handle,
+            &query.read(cx).focus_handle(cx),
+            &new_folder.read(cx).focus_handle(cx),
+        ]
+        .into_iter()
+        .map(|handle| {
+            cx.on_blur(handle, window, |this, window, cx| {
+                this.reclaim_focus(window, cx)
+            })
+        })
+        .collect();
 
         // On Linux the platform only hands a printable character to the focused field once the
         // keystroke survives key-binding dispatch, and `prefer_character_input` is never set there.
@@ -334,6 +355,8 @@ impl Omamusic {
             search_task: None,
             searching: false,
             _typing_guard,
+            focus_handle,
+            _focus_guards,
         }
     }
 
@@ -680,6 +703,23 @@ impl Omamusic {
         self.set_scale(stepped_scale(self.prefs.ui_scale, steps), cx);
     }
 
+    /// Current UI scale factor; 1.0 is the default text size.
+    pub fn ui_scale(&self) -> f64 {
+        self.prefs.ui_scale
+    }
+
+    /// Text currently in the search field.
+    pub fn search_text(&self, cx: &App) -> String {
+        self.query.read(cx).text().to_string()
+    }
+
+    /// Take focus back when nothing in the window has it, so shortcuts keep working.
+    fn reclaim_focus(&self, window: &mut Window, cx: &mut App) {
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
     fn text_size_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.omarchy().clone();
         let pct = format!("{}%", (self.prefs.ui_scale * 100.0).round() as i32);
@@ -777,6 +817,7 @@ fn sidebar_btn(
     let t = cx.omarchy().clone();
     div()
         .id(id)
+        .test_support()
         .flex()
         .items_center()
         .gap(rems(0.5))
@@ -801,6 +842,7 @@ fn sidebar_btn(
 impl Render for Omamusic {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_scale(window);
+        self.reclaim_focus(window, cx);
         let snap = self.library.snapshot();
         let theme = cx.omarchy().clone();
         let nav = [
@@ -811,6 +853,7 @@ impl Render for Omamusic {
         ];
 
         focus_scope("omamusic")
+            .track_focus(&self.focus_handle)
             .on_action(
                 cx.listener(|this, _: &FocusSearch, window, cx| this.focus_search(window, cx)),
             )
@@ -1794,7 +1837,7 @@ impl Omamusic {
 mod tests {
     use super::*;
     use crate::TogglePlay;
-    use gpui_kit::{KeyBinding, Keystroke, TestAppContext, VisualTestContext};
+    use gpui_kit::{Keystroke, TestAppContext, VisualTestContext};
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -1804,7 +1847,7 @@ mod tests {
     ) -> (Entity<Omamusic>, &'a mut VisualTestContext) {
         cx.update(|cx| {
             gpui_omarchy::init(cx);
-            cx.bind_keys([KeyBinding::new("space", TogglePlay, None)]);
+            cx.bind_keys(crate::key_bindings());
             let toggles = toggles.clone();
             cx.on_action(move |_: &TogglePlay, cx| {
                 toggles.set(toggles.get() + 1);
@@ -1965,25 +2008,5 @@ mod tests {
         assert_eq!(stepped_scale(0.75, -5), UI_SCALE_MIN);
         assert_eq!(rem_for_scale(1.0), px(16.0));
         assert_eq!(rem_for_scale(1.5), px(24.0));
-    }
-
-    #[gpui_kit::test]
-    async fn text_size_action_rescales_the_window(cx: &mut TestAppContext) {
-        let toggles = Rc::new(Cell::new(0));
-        let (view, cx) = setup(cx, &toggles);
-        cx.run_until_parked();
-        let before = view.update_in(cx, |_, window, _| window.rem_size());
-        assert_eq!(before, px(16.0));
-
-        // Assign the preference directly: going through `set_scale` would
-        // write the real config file from the test.
-        view.update_in(cx, |view, _, cx| {
-            view.prefs.ui_scale = 1.5;
-            cx.notify();
-        });
-        cx.run_until_parked();
-
-        let after = view.update_in(cx, |_, window, _| window.rem_size());
-        assert_eq!(after, px(24.0));
     }
 }

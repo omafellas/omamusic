@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufReader;
 use std::num::NonZero;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -77,9 +77,9 @@ pub struct Player {
     commands: Sender<Command>,
     worker: Option<JoinHandle<()>>,
     _stream: Option<Mutex<cpal::Stream>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_driver: Option<JoinHandle<()>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_running: Arc<AtomicBool>,
 }
 
@@ -397,9 +397,9 @@ impl Player {
             commands,
             worker: Some(worker),
             _stream: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_driver: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -616,7 +616,7 @@ impl Drop for Player {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.test_running.store(false, Ordering::Relaxed);
             if let Some(driver) = self.test_driver.take() {
@@ -626,9 +626,9 @@ impl Drop for Player {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Player {
-    pub(crate) fn new_test() -> Self {
+    pub fn new_test() -> Self {
         let mut player = Self::create(2, 48_000, 1.0);
         player.test_running.store(true, Ordering::Relaxed);
         let shared = player.shared.clone();
