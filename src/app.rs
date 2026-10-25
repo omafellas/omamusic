@@ -761,24 +761,23 @@ impl Render for Omamusic {
                             .border_b_1()
                             .border_color(theme.border)
                             .bg(theme.background)
-                            .child(div().flex_1().min_w_0().max_w(rems(28.)).child(input(
-                                "search",
-                                &self.query,
-                                window,
-                                cx,
-                            )))
-                            .when(self.searching, |d| {
-                                d.child(
-                                    icon(IconName::Loader)
-                                        .size(rems(0.875))
-                                        .text_color(theme.secondary)
-                                        .with_animation(
-                                            "search-spinner",
-                                            Animation::new(Duration::from_millis(700)).repeat(),
-                                            |this, delta| this.opacity(0.4 + 0.6 * delta),
-                                        ),
-                                )
-                            })
+                            .child(div().flex_1().min_w_0().max_w(rems(28.)).child({
+                                let field = input("search", &self.query, window, cx);
+                                if self.searching {
+                                    field.suffix(
+                                        icon(IconName::Loader)
+                                            .size(rems(0.875))
+                                            .text_color(theme.secondary)
+                                            .with_animation(
+                                                "search-spinner",
+                                                Animation::new(Duration::from_millis(700)).repeat(),
+                                                |this, delta| this.opacity(0.4 + 0.6 * delta),
+                                            ),
+                                    )
+                                } else {
+                                    field
+                                }
+                            }))
                             .child(with_tooltip(
                                 icon_button(
                                     "rescan",
