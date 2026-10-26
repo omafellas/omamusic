@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bands" x1="0" y1="145" x2="0" y2="305" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#daecc6"/>
+      <stop offset="0.26" stop-color="#daecc6"/>
+      <stop offset="0.26" stop-color="#bbdd97"/>
+      <stop offset="0.37" stop-color="#bbdd97"/>
+      <stop offset="0.37" stop-color="#9ece6a"/>
+      <stop offset="0.58" stop-color="#9ece6a"/>
+      <stop offset="0.58" stop-color="#678549"/>
+      <stop offset="0.74" stop-color="#678549"/>
+      <stop offset="0.74" stop-color="#39482e"/>
+      <stop offset="1" stop-color="#39482e"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="96" fill="#16161e"/>
+  <rect width="510" height="510" rx="94" fill="none" stroke="#2a2a3a" stroke-width="3"/>
+  <!-- Omarchy "oma" mark: o-disc flowing into a right-pointing chevron -->
+  <g fill="url(#bands)" transform="translate(10.4 36.25) scale(0.55)">
+    <path d="M283 285.21A149 149 0 1 0 283 514.79Z"/>
+    <path d="M283 262H536V326L462 400L536 474V536H283V514.79A149 149 0 0 0 283 285.21Z"/>
+    <path d="M536 326L610.5 251.5L759 400L610.5 548.5L536 474Z"/>
+  </g>
+  <!-- play mark punched through the o -->
+  <path d="M86 220v72l60-36z" fill="#16161e"/>
+</svg>

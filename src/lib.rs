@@ -48,7 +48,7 @@ pub fn key_bindings() -> Vec<gpui_kit::KeyBinding> {
         gpui_kit::KeyBinding::new("right", NextTrack, None),
         gpui_kit::KeyBinding::new("left", PrevTrack, None),
         gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
-        gpui_kit::KeyBinding::new("ctrl-p", FocusSearch, None),
+        gpui_kit::KeyBinding::new("ctrl-f", FocusSearch, None),
         gpui_kit::KeyBinding::new("alt-left", GoBack, None),
         gpui_kit::KeyBinding::new("ctrl-=", IncreaseFontSize, None),
         gpui_kit::KeyBinding::new("ctrl--", DecreaseFontSize, None),

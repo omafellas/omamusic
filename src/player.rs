@@ -10,7 +10,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::num::NonZero;
 #[cfg(any(test, feature = "test-support"))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -25,6 +26,8 @@ struct Playback {
     index: usize,
     state: PlayerState,
     volume: f64,
+    /// Volume to restore when unmuting; kept updated by every audible change.
+    last_volume: f64,
     shuffle: bool,
     repeat: RepeatMode,
     duration: f64,
@@ -50,6 +53,9 @@ struct Shared {
     playback: Mutex<Playback>,
     audio: Mutex<AudioBuffer>,
     listeners: Mutex<Vec<async_channel::Sender<()>>>,
+    /// Loudness meter (f32 bits, 0.0..=1.0) of the most recent output block,
+    /// written by the audio callback and read by the visual effects.
+    level: AtomicU32,
     channels: usize,
     sample_rate: u32,
 }
@@ -157,12 +163,23 @@ fn stop(playback: &mut Playback) {
     playback.duration = 0.0;
 }
 
+/// Peak meter for the visual effects: instant attack, smooth decay, so the
+/// bars follow transients closely and sink back gently between them.
+fn envelope(prev: f32, peak: f32) -> f32 {
+    if peak > prev {
+        peak
+    } else {
+        (prev * 0.92).max(peak)
+    }
+}
+
 fn fill_output<T: cpal::SizedSample + cpal::FromSample<f32>>(data: &mut [T], shared: &Shared) {
     let (playing, volume) = {
         let state = shared.playback.lock();
         (state.state == PlayerState::Playing, state.volume as f32)
     };
     let mut audio = shared.audio.lock();
+    let mut peak = 0f32;
     for sample in data {
         let value = match playing.then(|| audio.samples.pop_front()).flatten() {
             Some(value) => {
@@ -171,8 +188,14 @@ fn fill_output<T: cpal::SizedSample + cpal::FromSample<f32>>(data: &mut [T], sha
             }
             None => 0.0,
         };
-        *sample = T::from_sample(value.clamp(-1.0, 1.0));
+        let value = value.clamp(-1.0, 1.0);
+        peak = peak.max(value.abs());
+        *sample = T::from_sample(value);
     }
+    let prev = f32::from_bits(shared.level.load(Ordering::Relaxed));
+    shared
+        .level
+        .store(envelope(prev, peak).to_bits(), Ordering::Relaxed);
 }
 
 fn build_output<T: cpal::SizedSample + cpal::FromSample<f32>>(
@@ -382,10 +405,16 @@ impl Player {
         let shared = Arc::new(Shared {
             playback: Mutex::new(Playback {
                 volume: volume.clamp(0.0, 1.0),
+                last_volume: if volume > 0.0 {
+                    volume.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                },
                 ..Default::default()
             }),
             audio: Mutex::new(AudioBuffer::default()),
             listeners: Mutex::new(Vec::new()),
+            level: AtomicU32::new(0),
             channels: channels as usize,
             sample_rate,
         });
@@ -554,11 +583,49 @@ impl Player {
     }
 
     pub fn set_volume(&self, volume: f64) {
-        self.shared.playback.lock().volume = volume.clamp(0.0, 1.0);
+        let volume = volume.clamp(0.0, 1.0);
+        {
+            let mut playback = self.shared.playback.lock();
+            if volume > 0.0 {
+                playback.last_volume = volume;
+            }
+            playback.volume = volume;
+        }
+        self.shared.changed();
     }
 
     pub fn volume(&self) -> f64 {
         self.shared.playback.lock().volume
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.volume() <= 0.0
+    }
+
+    /// Output loudness in 0.0..=1.0 for the visual effects.
+    pub fn level(&self) -> f32 {
+        f32::from_bits(self.shared.level.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+    }
+
+    /// Silence playback or restore the previous volume. Returns the muted state.
+    pub fn toggle_mute(&self) -> bool {
+        let muted = {
+            let mut playback = self.shared.playback.lock();
+            if playback.volume > 0.0 {
+                playback.last_volume = playback.volume;
+                playback.volume = 0.0;
+                true
+            } else {
+                playback.volume = if playback.last_volume > 0.0 {
+                    playback.last_volume
+                } else {
+                    1.0
+                };
+                false
+            }
+        };
+        self.shared.changed();
+        muted
     }
     pub fn set_shuffle(&self, enabled: bool) {
         let mut p = self.shared.playback.lock();
@@ -724,7 +791,7 @@ mod tests {
         condition()
     }
 
-    fn write_silent_wav(path: &std::path::Path) {
+    fn write_wav(path: &std::path::Path, sample: impl Fn(usize) -> i16) {
         let samples = 44_100u32;
         let mut wav = Vec::with_capacity(44 + samples as usize * 2);
         wav.extend_from_slice(b"RIFF");
@@ -739,8 +806,73 @@ mod tests {
         wav.extend_from_slice(&16u16.to_le_bytes());
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&(samples * 2).to_le_bytes());
-        wav.resize(44 + samples as usize * 2, 0);
+        for i in 0..samples as usize {
+            wav.extend_from_slice(&sample(i).to_le_bytes());
+        }
         std::fs::write(path, wav).unwrap();
+    }
+
+    fn write_silent_wav(path: &std::path::Path) {
+        write_wav(path, |_| 0);
+    }
+
+    #[test]
+    fn envelope_attacks_on_peaks_and_decays_in_silence() {
+        assert_eq!(envelope(0.0, 0.0), 0.0);
+        assert_eq!(
+            envelope(0.3, 0.9),
+            0.9,
+            "transients are picked up instantly"
+        );
+        let decayed = envelope(0.9, 0.0);
+        assert!(decayed < 0.9 && decayed > 0.8, "gentle decay: {decayed}");
+        assert!(
+            envelope(decayed, 0.0) < decayed,
+            "decay continues towards silence"
+        );
+    }
+
+    #[test]
+    fn level_meter_follows_output_amplitude() {
+        let base = std::env::temp_dir().join(format!("omamusic-level-{}", std::process::id()));
+        let silent = base.join("silent.wav");
+        let loud = base.join("loud.wav");
+        std::fs::create_dir_all(&base).unwrap();
+        write_wav(&silent, |_| 0);
+        write_wav(&loud, |i| if i % 2 == 0 { 12_000 } else { -12_000 });
+
+        let player = Player::new_test();
+        assert_eq!(player.level(), 0.0, "fresh player reads silent");
+
+        player.play(vec![track(silent.clone())], 0);
+        assert!(
+            wait_for(|| player.position() > 0.05),
+            "silent WAV did not start"
+        );
+        assert!(
+            player.level() < 0.01,
+            "silence must not register as loud: {}",
+            player.level()
+        );
+
+        player.play(vec![track(loud.clone())], 0);
+        assert!(
+            wait_for(|| player.level() > 0.1),
+            "square wave did not raise the level (got {})",
+            player.level()
+        );
+        assert!(player.level() <= 1.0);
+
+        // Muting silences the meter too, since it measures the real output.
+        player.toggle_mute();
+        assert!(
+            wait_for(|| player.level() < 0.02),
+            "muted output did not sink (got {})",
+            player.level()
+        );
+
+        drop(player);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
@@ -818,5 +950,39 @@ mod tests {
         );
         drop(player);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn toggle_mute_silences_and_restores_the_previous_volume() {
+        let player = Player::new_test();
+        player.set_volume(0.4);
+        assert!(player.toggle_mute(), "clicking while audible mutes");
+        assert!(player.is_muted());
+        assert_eq!(player.volume(), 0.0);
+        assert!(!player.toggle_mute(), "clicking while muted restores");
+        assert_eq!(player.volume(), 0.4);
+
+        // Dragging the slider to zero reads as muted; clicking the icon then
+        // restores the last audible volume instead of staying silent.
+        player.set_volume(0.0);
+        assert!(player.is_muted());
+        player.toggle_mute();
+        assert_eq!(player.volume(), 0.4);
+        assert!(!player.is_muted());
+        player.set_volume(0.25);
+        player.toggle_mute();
+        player.toggle_mute();
+        assert_eq!(player.volume(), 0.25);
+        drop(player);
+    }
+
+    #[test]
+    fn muting_at_startup_restores_a_usable_volume() {
+        let player = Player::create(2, 48_000, 0.0);
+        player.toggle_mute();
+        assert_eq!(player.volume(), 1.0);
+        player.toggle_mute();
+        assert_eq!(player.volume(), 0.0);
+        drop(player);
     }
 }

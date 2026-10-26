@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Omamusic
+GenericName=Music Player
+Comment=Minimalist local music player for Omarchy
+Exec=omamusic
+Icon=io.github.omafellas.omamusic
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Music;Player;
+Keywords=music;player;library;local;
+StartupWMClass=omamusic

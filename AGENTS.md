@@ -1,5 +1,10 @@
 # AGENTS.md
 
+## Iterating
+
+- Do not run the full suite (`cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`) while a task is in progress. Run them once, at the end, before finishing.
+- During iteration, keep feedback fast: `cargo check` or a single targeted test (`cargo test <name>`), and prefer the edit tool's exact-match feedback over recompiling for every small change.
+
 ## Tests
 
 Smoke tests first. Every user-visible change needs a UI smoke test in `tests/ui.rs`.
@@ -20,7 +25,7 @@ Rules for smoke tests:
 - Set up through `omamusic::init_actions`, which installs the real key map and
   the app-wide action handlers. Never bind a hand-made subset.
 - Cover both focus states for a shortcut: nothing focused, and the search field
-  focused (`press("ctrl-p")` then `input`).
+  focused (`press("ctrl-f")` then `input`).
 - Call `AppConfig::use_dir` with a fresh temp dir first (see `isolated_config_dir`).
   Tests must never read or write `~/.config/omamusic`.
 - Use `Player::new_test()` and `Library::empty()`. No audio device, desktop
@@ -59,6 +64,8 @@ Linux is the only supported target. CI (`.github/workflows/ci.yml`) runs on Ubun
 Manual QA against a throwaway config: `OMAMUSIC_CONFIG_DIR=/tmp/omamusic-qa cargo run`.
 
 ## Before committing
+
+Run the full suite once, at the end of the task (see [Iterating](#iterating)):
 
 ```sh
 cargo fmt --check

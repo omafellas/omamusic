@@ -108,7 +108,7 @@ async fn ctrl_plus_minus_and_zero_change_text_size_with_nothing_focused(cx: &mut
 #[gpui_kit::test]
 async fn text_size_shortcuts_work_while_typing_in_search(cx: &mut TestAppContext) {
     let mut app = open(cx);
-    app.press("ctrl-p");
+    app.press("ctrl-f");
     app.cx.update(|window, cx| window.input("ab", cx));
     app.cx.run_until_parked();
     assert_eq!(app.search_text(), "ab", "Ctrl+P focused the search field");
@@ -130,7 +130,7 @@ async fn text_size_shortcuts_work_while_typing_in_search(cx: &mut TestAppContext
 #[gpui_kit::test]
 async fn shortcuts_recover_after_focus_is_cleared(cx: &mut TestAppContext) {
     let mut app = open(cx);
-    app.press("ctrl-p");
+    app.press("ctrl-f");
     app.cx.update(|window, cx| window.blur(cx));
     app.cx.run_until_parked();
     app.press("ctrl-=");
