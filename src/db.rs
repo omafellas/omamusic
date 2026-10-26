@@ -151,7 +151,7 @@ impl Db {
     }
 
     /// An empty, in-memory database for view tests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         configure(&conn)?;

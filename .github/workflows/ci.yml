@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Linux dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -40,7 +40,7 @@ jobs:
             libasound2-dev libpulse-dev libdbus-1-dev \
             libfontconfig-dev libfreetype-dev libssl-dev libzstd-dev \
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libx11-xcb-dev libxcb1-dev libvulkan-dev
+            libx11-xcb-dev libxcb1-dev libvulkan-dev mesa-vulkan-drivers
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -56,3 +56,5 @@ jobs:
 
       - name: Test
         run: cargo test
+        env:
+          RENDERING_REQUIRED: "1"

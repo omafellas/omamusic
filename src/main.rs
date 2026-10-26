@@ -1,44 +1,7 @@
-mod app;
-mod artwork;
-mod config;
-mod db;
-mod desktop;
-mod index;
-mod library;
-mod metadata;
-mod models;
-mod mpris;
-mod player;
-mod player_bar;
-mod search;
-mod tray;
-
-use app::Omamusic;
-use desktop::Command;
-use gpui_kit::{
-    actions, div, px, size, App, AppContext, Bounds, Context, Entity, IntoElement, ParentElement,
-    QuitMode, Render, StyleRefinement, Styled, Window, WindowBounds, WindowOptions,
-};
-use gpui_omarchy::{separator, ActiveTheme};
-use player_bar::PlayerBar;
+use gpui_kit::{px, size, App, AppContext, Bounds, QuitMode, WindowBounds, WindowOptions};
+use omamusic::desktop::{self, Command};
+use omamusic::{AppConfig, Library, Player, Root};
 use std::sync::Arc;
-
-use crate::config::AppConfig;
-use crate::library::Library;
-use crate::player::Player;
-
-actions!(
-    omamusic,
-    [
-        TogglePlay,
-        NextTrack,
-        PrevTrack,
-        Rescan,
-        FocusSearch,
-        GoBack,
-        Quit
-    ]
-);
 
 fn main() {
     if std::env::args().any(|a| a == "--dump-library") {
@@ -54,16 +17,6 @@ fn main() {
             gpui_omarchy::init(cx);
             cx.set_quit_mode(QuitMode::Explicit);
 
-            cx.bind_keys([
-                gpui_kit::KeyBinding::new("space", TogglePlay, None),
-                gpui_kit::KeyBinding::new("right", NextTrack, None),
-                gpui_kit::KeyBinding::new("left", PrevTrack, None),
-                gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
-                gpui_kit::KeyBinding::new("ctrl-f", FocusSearch, None),
-                gpui_kit::KeyBinding::new("alt-left", GoBack, None),
-                gpui_kit::KeyBinding::new("ctrl-q", Quit, None),
-            ]);
-
             let library = Arc::new(Library::new().expect("library"));
             let config = AppConfig::load();
             let player = Arc::new(Player::new(config.volume).expect("player"));
@@ -71,41 +24,7 @@ fn main() {
             let (commands, received) = async_channel::unbounded();
             let has_tray = desktop::start(player.clone(), library.clone(), commands);
 
-            cx.on_action(|_: &Quit, cx| cx.quit());
-
-            // Ctrl+F must work from a cold window: nothing inside Omamusic is on the
-            // keystroke dispatch path until the first click focuses an element, so
-            // focus is forwarded at the application level as well as from the view.
-            bind_focus_search(cx);
-
-            cx.on_action({
-                let player = player.clone();
-                move |_: &TogglePlay, cx| {
-                    player.toggle();
-                    cx.refresh_windows();
-                }
-            });
-            cx.on_action({
-                let player = player.clone();
-                move |_: &NextTrack, cx| {
-                    player.next();
-                    cx.refresh_windows();
-                }
-            });
-            cx.on_action({
-                let player = player.clone();
-                move |_: &PrevTrack, cx| {
-                    player.previous();
-                    cx.refresh_windows();
-                }
-            });
-            cx.on_action({
-                let library = library.clone();
-                move |_: &Rescan, cx| {
-                    library.request_rescan();
-                    cx.refresh_windows();
-                }
-            });
+            omamusic::init_actions(&library, &player, cx);
 
             cx.on_window_closed(move |cx, _| {
                 if !cx.windows().is_empty() {
@@ -151,34 +70,6 @@ fn main() {
         });
 }
 
-/// Forwards `FocusSearch` from any window to its `Omamusic` view. Keystrokes
-/// only reach element handlers below the window root once something has been
-/// clicked, so this application-level path makes Ctrl+F work from a cold
-/// window too.
-/// Forwards `FocusSearch` to every window's search field. Keystrokes reach
-/// element handlers below the window root only once something inside has been
-/// focused, so for a cold window this application-level path catches the
-/// action. The update is deferred because during dispatch the window is
-/// checked out of the app and cannot be re-entered.
-fn bind_focus_search(cx: &mut App) {
-    cx.on_action(move |_: &FocusSearch, cx| {
-        let windows = cx.windows();
-        cx.defer(move |cx| {
-            for window in windows {
-                let _ = window.update(cx, |view, window, cx| {
-                    let Ok(root) = view.downcast::<Root>() else {
-                        return;
-                    };
-                    root.update(cx, |root, cx| {
-                        root.main
-                            .update(cx, |main, cx| main.focus_search(window, cx));
-                    });
-                });
-            }
-        });
-    });
-}
-
 fn show_window(library: &Arc<Library>, player: &Arc<Player>, cx: &mut App) {
     if let Some(window) = cx.windows().first() {
         let _ = window.update(cx, |_, window, _| window.activate_window());
@@ -196,39 +87,10 @@ fn show_window(library: &Arc<Library>, player: &Arc<Player>, cx: &mut App) {
             ))),
             ..Default::default()
         },
-        |window, cx| {
-            cx.new(|cx| {
-                let main = cx.new(|cx| Omamusic::new(library.clone(), player.clone(), window, cx));
-                let bar =
-                    cx.new(|cx| PlayerBar::new(library, player, main.downgrade(), window, cx));
-                Root { main, bar }
-            })
-        },
+        |window, cx| cx.new(|cx| Root::new(library, player, window, cx)),
     );
     if let Err(err) = opened {
         eprintln!("open window: {err:#}");
-    }
-}
-
-struct Root {
-    main: Entity<Omamusic>,
-    bar: Entity<PlayerBar>,
-}
-
-impl Render for Root {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(cx.omarchy().background)
-            .child(
-                self.main
-                    .clone()
-                    .cached(StyleRefinement::default().flex_1().min_h_0().w_full()),
-            )
-            .child(separator(cx))
-            .child(self.bar.clone())
     }
 }
 
@@ -282,44 +144,5 @@ fn dump_library() {
             tracks,
             lib.artist_total()
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gpui_kit::{Focusable, Keystroke, TestAppContext};
-
-    /// Ctrl+F focuses the search field through the real window tree (Root above
-    /// Omamusic) while nothing has been clicked yet — the case that made the
-    /// keystroke never reach the field when only the view handled it.
-    #[gpui_kit::test]
-    async fn ctrl_f_finds_search_from_a_cold_window(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_omarchy::init(cx);
-            cx.bind_keys([gpui_kit::KeyBinding::new("ctrl-f", FocusSearch, None)]);
-            bind_focus_search(cx);
-        });
-        let (root, view) = cx.add_window_view(|window, cx| {
-            let library = Arc::new(Library::empty());
-            let player = Arc::new(Player::new_test());
-            let main = cx.new(|cx| Omamusic::new(library.clone(), player.clone(), window, cx));
-            let bar = cx.new(|cx| PlayerBar::new(library, player, main.downgrade(), window, cx));
-            Root { main, bar }
-        });
-
-        view.update(|window, cx| {
-            window.dispatch_keystroke(Keystroke::parse("ctrl-f").unwrap(), cx)
-        });
-        view.run_until_parked();
-
-        root.update_in(view, |root, window, cx| {
-            root.main.update(cx, |main, cx| {
-                assert!(
-                    main.query().read(cx).focus_handle(cx).is_focused(window),
-                    "Ctrl+F reaches the search field before any click"
-                );
-            });
-        });
     }
 }

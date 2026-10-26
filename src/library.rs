@@ -200,7 +200,7 @@ impl Library {
         let _ = self.rescan_tx.send(());
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     /// A library with no folders, watcher, or scanner thread; for view tests.
     pub fn empty() -> Self {
         let (rescan_tx, _rx) = mpsc::channel::<()>();

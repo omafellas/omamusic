@@ -14,7 +14,7 @@ The installed player needs no separate media player, codec package, or GStreamer
 
 Building from source on Linux requires the ALSA development headers for CPAL (`alsa-lib` on Arch/Omarchy or `libasound2-dev` on Ubuntu), in addition to GPUI's normal graphics build requirements. These are build requirements, not playback plugins or companion programs.
 
-Run `omamusic`: on first launch it picks up `~/Music` automatically, no setup needed. Settings can add, browse or remove folders. Configuration is stored at `~/.config/omamusic/config.json`.
+Run `omamusic`: on first launch it picks up `~/Music` automatically, no setup needed. Settings can add, browse or remove folders. Configuration is stored at `~/.config/omamusic/config.json`. Set `OMAMUSIC_CONFIG_DIR` to use a different config directory.
 
 ## Features
 
@@ -27,7 +27,7 @@ Run `omamusic`: on first launch it picks up `~/Music` automatically, no setup ne
 - Music-reactive visualizer strip along the bottom edge that follows the live Omarchy theme (toggle in Settings).
 - Omarchy theme following through `gpui-omarchy`.
 
-Space toggles playback, Left/Right changes tracks, Ctrl+F jumps to the search field, and Ctrl+R rescans the library. A folder picker uses `zenity` or `kdialog` if available.
+Space toggles playback, Left/Right changes tracks, Ctrl+F jumps to the search field, and Ctrl+R rescans the library. Ctrl+= / Ctrl+- adjust the text size (Ctrl+0 resets it); the setting is also in Settings and persists across restarts. A folder picker uses `zenity` or `kdialog` if available.
 
 ## Flatpak
 
