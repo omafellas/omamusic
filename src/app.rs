@@ -10,7 +10,8 @@ use gpui_kit::{
     div, px, rems, uniform_list, Animation, AnimationExt as _, AnyElement, App, AppContext,
     ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler, Focusable, ImageSource,
     InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement,
-    PathPromptOptions, Render, Stateful, StatefulInteractiveElement, Styled, Window,
+    PathPromptOptions, Render, Stateful, StatefulInteractiveElement, StyleRefinement, Styled,
+    Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, menu, panel,
@@ -36,7 +37,11 @@ pub struct Omamusic {
     prefs: AppConfig,
     new_folder: Entity<InputState>,
     rescan_notify: Option<(String, f32)>,
+    /// Bumped for every toast; makes an older fade task ignore a replaced toast.
+    notify_seq: u64,
     prev_scanning: bool,
+    /// Music-reactive bottom strip; see `Visualizer`.
+    visualizer: Entity<Visualizer>,
     /// Latest text typed into the search field, applied after the debounce.
     pending_query: String,
     /// The in-flight debounce task; replacing it cancels the previous one.
@@ -126,6 +131,28 @@ const ARTIST_ACTIONS: &[RowAction] = &[RowAction::Play, RowAction::PlayNext, Row
 /// burst of typing results in a single BM25 query.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 
+/// The scan-completion toast stays fully visible this long, then fades over
+/// `NOTIFY_FADE` (one step every `NOTIFY_FADE_STEP`), gone after 3s total.
+const NOTIFY_HOLD: Duration = Duration::from_millis(2600);
+const NOTIFY_FADE: Duration = Duration::from_millis(400);
+const NOTIFY_FADE_STEP: Duration = Duration::from_millis(50);
+
+/// Number of equalizer bars in the "Visual Effects" background animation.
+const VISUALIZER_BARS: usize = 40;
+
+/// Song-list layout priority: the title flexes at this rate while the artist
+/// column flexes at 1 and caps at `SECONDARY_MAX_W` rems, so a narrow window
+/// crops the artist rather than the song name.
+const TITLE_GROW: f32 = 3.;
+const SECONDARY_MAX_W: f32 = 10.;
+
+/// Fraction of the song row's flexible space the title claims when
+/// `secondary` columns compete for it at grow factor 1.
+#[cfg(test)]
+fn title_flex_share(secondary: usize) -> f32 {
+    TITLE_GROW / (TITLE_GROW + secondary as f32)
+}
+
 impl RowAction {
     fn group(self) -> u8 {
         match self {
@@ -202,6 +229,90 @@ pub fn format_time(secs: f64) -> String {
     }
 }
 
+/// The library size line shown in the sidebar and the scan-completion toast,
+/// with the song count leading so it reads well at small widths.
+fn library_counts_text(albums: usize, tracks: usize) -> String {
+    format!("{} songs · {} albums", tracks, albums)
+}
+
+/// Equalizer bar shape over one animation cycle, 0.0..=1.0. The two mixed
+/// sine waves use whole cycles per animation loop, so repeating never jumps.
+fn visualizer_shape(bar: usize, delta: f32) -> f32 {
+    let tau = std::f32::consts::TAU;
+    let fast = (delta * tau * (1 + (bar % 4)) as f32 + bar as f32 * 0.7).sin() * 0.5 + 0.5;
+    let slow = (delta * tau * (2 + (bar % 3)) as f32 + bar as f32 * 1.3).sin() * 0.5 + 0.5;
+    ((0.6 * fast + 0.4 * slow) * (0.55 + 0.45 * (bar % 5) as f32 / 4.)).clamp(0.0, 1.0)
+}
+
+/// Bar height in rems for a loudness level. Silence keeps a thin baseline;
+/// bars grow vertically as the music gets louder.
+fn visualizer_height(level: f32, delta: f32, bar: usize) -> f32 {
+    0.12 + level * visualizer_shape(bar, delta) * 2.4
+}
+
+/// Low alpha so the strip never blocks the text behind it.
+fn visualizer_opacity(level: f32, delta: f32, bar: usize) -> f32 {
+    0.08 + 0.34 * level * visualizer_shape(bar, delta)
+}
+
+/// Music-reactive strip of bars pinned to the bottom of the main area, just
+/// above the player bar. Only rendered while "Visual Effects" is enabled;
+/// heights follow the audio level meter of the current output.
+struct Visualizer {
+    player: Arc<Player>,
+}
+
+impl Visualizer {
+    fn new(player: Arc<Player>, cx: &mut Context<Self>) -> Self {
+        // Repaint often enough to follow the meter while playing, and idle
+        // otherwise so a paused track costs nothing.
+        cx.spawn(async move |this, cx| loop {
+            let delay = this
+                .update(cx, |this, _| {
+                    if this.player.state() == PlayerState::Playing {
+                        Duration::from_millis(120)
+                    } else {
+                        Duration::from_millis(500)
+                    }
+                })
+                .unwrap_or(Duration::from_millis(500));
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+        Self { player }
+    }
+}
+
+impl Render for Visualizer {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.omarchy().clone();
+        let level = self.player.level();
+        div()
+            .size_full()
+            .flex()
+            .items_end()
+            .gap(px(3.))
+            .px(rems(1.5))
+            .children((0..VISUALIZER_BARS).map(|bar| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h(rems(visualizer_height(level, 0.0, bar)))
+                    .rounded_t(px(2.))
+                    .with_animation(
+                        ElementId::Name(format!("visualizer-bar-{bar}").into()),
+                        Animation::new(Duration::from_millis(900 + (bar % 5) as u64 * 210))
+                            .repeat(),
+                        move |el, delta| {
+                            el.h(rems(visualizer_height(level, delta, bar)))
+                                .bg(theme.accent.opacity(visualizer_opacity(level, delta, bar)))
+                        },
+                    )
+            }))
+    }
+}
+
 impl Omamusic {
     pub fn new(
         library: Arc<Library>,
@@ -209,7 +320,7 @@ impl Omamusic {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search… (Ctrl+F)"));
         let new_folder = cx.new(|cx| InputState::new(window, cx).placeholder("Enter folder path"));
 
         // On Linux the platform only hands a printable character to the focused field once the
@@ -280,6 +391,8 @@ impl Omamusic {
         })
         .detach();
 
+        let visualizer = cx.new(|cx| Visualizer::new(player.clone(), cx));
+
         let view = std::env::var("OMADRIVE_VIEW").ok();
         let (section, pages, show_settings) = match view.as_deref() {
             Some("artists") => (Section::Artists, Vec::new(), false),
@@ -310,7 +423,9 @@ impl Omamusic {
             prefs: AppConfig::load(),
             new_folder,
             rescan_notify: None,
+            notify_seq: 0,
             prev_scanning: false,
+            visualizer,
             pending_query: String::new(),
             search_task: None,
             searching: false,
@@ -331,10 +446,7 @@ impl Omamusic {
         let snap = self.library.snapshot();
         let scanning_now = snap.scanning;
         let notify_msg = if self.prev_scanning && !scanning_now {
-            Some(format!(
-                "{} albums · {} songs",
-                snap.album_count, snap.track_count
-            ))
+            Some(library_counts_text(snap.album_count, snap.track_count))
         } else {
             None
         };
@@ -349,25 +461,31 @@ impl Omamusic {
     }
 
     fn show_notify(&mut self, msg: String, cx: &mut Context<Self>) {
+        self.notify_seq += 1;
+        let seq = self.notify_seq;
         self.rescan_notify = Some((msg, 1.0));
         cx.notify();
-        // Schedule fade-out after 2s (over 300ms) and then remove
+        // Hold at full opacity, then fade out step by step: gpui repaints
+        // `opacity` immediately, so the steps themselves are the animation.
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(2000))
-                .await;
+            cx.background_executor().timer(NOTIFY_HOLD).await;
+            let steps = (NOTIFY_FADE.as_millis() / NOTIFY_FADE_STEP.as_millis()).max(1);
+            for step in 1..=steps {
+                let _ = this.update(cx, |this, cx| {
+                    if this.notify_seq == seq {
+                        if let Some(entry) = this.rescan_notify.as_mut() {
+                            entry.1 = 1. - step as f32 / steps as f32;
+                        }
+                        cx.notify();
+                    }
+                });
+                cx.background_executor().timer(NOTIFY_FADE_STEP).await;
+            }
             let _ = this.update(cx, |this, cx| {
-                if let Some(entry) = this.rescan_notify.as_mut() {
-                    entry.1 = 0.0;
+                if this.notify_seq == seq {
+                    this.rescan_notify = None;
+                    cx.notify();
                 }
-                cx.notify();
-            });
-            cx.background_executor()
-                .timer(Duration::from_millis(400))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.rescan_notify = None;
-                cx.notify();
             });
         })
         .detach();
@@ -638,11 +756,16 @@ impl Omamusic {
         self.apply_text(text, cx);
     }
 
-    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.query.update(cx, |q, cx| {
             q.set_value("", window, cx);
             q.focus(window, cx);
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query(&self) -> &Entity<InputState> {
+        &self.query
     }
 
     fn pref_switch(
@@ -748,125 +871,128 @@ impl Render for Omamusic {
             .child(
                 div()
                     .flex()
-                    .flex_col()
                     .size_full()
                     .min_w(px(480.))
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .gap(rems(0.5))
-                            .px(rems(0.75))
-                            .py(rems(0.5))
-                            .border_b_1()
+                            .flex_col()
+                            .gap_1()
+                            .p(rems(0.5))
+                            .w(rems(11.))
+                            .min_w(rems(8.))
+                            .flex_shrink_0()
+                            .border_r_1()
                             .border_color(theme.border)
                             .bg(theme.background)
-                            .child(div().flex_1().min_w_0().max_w(rems(28.)).child({
-                                let field = input("search", &self.query, window, cx);
-                                if self.searching {
-                                    field.suffix(
-                                        icon(IconName::Loader)
-                                            .size(rems(0.875))
-                                            .text_color(theme.secondary)
-                                            .with_animation(
-                                                "search-spinner",
-                                                Animation::new(Duration::from_millis(700)).repeat(),
-                                                |this, delta| this.opacity(0.4 + 0.6 * delta),
-                                            ),
-                                    )
-                                } else {
-                                    field
-                                }
+                            .children(nav.map(|(id, label, icon_name, section)| {
+                                sidebar_btn(
+                                    id,
+                                    label,
+                                    icon_name,
+                                    self.section == section,
+                                    cx,
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.query.update(cx, |q, cx| {
+                                            q.set_value("", window, cx);
+                                        });
+                                        this.set_section(section, cx)
+                                    }),
+                                )
                             }))
-                            .child(with_tooltip(
-                                icon_button(
-                                    "rescan",
-                                    IconName::RefreshCw,
-                                    "Rescan library",
-                                    ButtonVariant::Secondary,
-                                    cx,
+                            .child(separator(cx))
+                            .child(
+                                div()
+                                    .mt(rems(0.5))
+                                    .text_size(rems(0.6875))
+                                    .text_color(theme.secondary)
+                                    .text_center()
+                                    .child(library_counts_text(snap.album_count, snap.track_count)),
+                            )
+                            .when(snap.scanning, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(rems(0.6875))
+                                        .text_color(theme.secondary)
+                                        .child("Scanning…"),
                                 )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.library.request_rescan();
-                                        cx.notify();
-                                    },
-                                )),
-                                "Rescan library (Ctrl+R)",
-                            ))
-                            .child(with_tooltip(
-                                icon_button(
-                                    "settings",
-                                    IconName::Settings,
-                                    "Settings",
-                                    ButtonVariant::Secondary,
-                                    cx,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.show_settings = !this.show_settings;
-                                        cx.notify();
-                                    },
-                                )),
-                                "Settings",
-                            )),
+                            }),
                     )
                     .child(
                         div()
                             .flex()
+                            .flex_col()
                             .flex_1()
-                            .min_h_0()
+                            .min_w_0()
                             .child(
                                 div()
                                     .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .p(rems(0.5))
-                                    .w(rems(11.))
-                                    .min_w(rems(8.))
-                                    .flex_shrink_0()
-                                    .border_r_1()
+                                    .items_center()
+                                    .gap(rems(0.5))
+                                    .py(rems(0.5))
+                                    .border_b_1()
                                     .border_color(theme.border)
                                     .bg(theme.background)
-                                    .children(nav.map(|(id, label, icon_name, section)| {
-                                        sidebar_btn(
-                                            id,
-                                            label,
-                                            icon_name,
-                                            self.section == section,
-                                            cx,
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.query.update(cx, |q, cx| {
-                                                    q.set_value("", window, cx);
-                                                });
-                                                this.set_section(section, cx)
-                                            }),
-                                        )
+                                    .pl(rems(0.75))
+                                    .pr(px(0.))
+                                    .child(div().flex_1().min_w_0().max_w(rems(28.)).child({
+                                        let field = input("search", &self.query, window, cx);
+                                        if self.searching {
+                                            field.suffix(
+                                                icon(IconName::Loader)
+                                                    .size(rems(0.875))
+                                                    .text_color(theme.secondary)
+                                                    .with_animation(
+                                                        "search-spinner",
+                                                        Animation::new(Duration::from_millis(700))
+                                                            .repeat(),
+                                                        |this, delta| {
+                                                            this.opacity(0.4 + 0.6 * delta)
+                                                        },
+                                                    ),
+                                            )
+                                        } else {
+                                            field
+                                        }
                                     }))
-                                    .child(separator(cx))
-                                    .child(
-                                        div()
-                                            .text_size(rems(0.6875))
-                                            .text_color(theme.secondary)
-                                            .text_center()
-                                            .child(format!(
-                                                "{} albums · {} songs",
-                                                snap.album_count, snap.track_count
-                                            )),
-                                    )
-                                    .when(snap.scanning, |d| {
-                                        d.child(
-                                            div()
-                                                .text_size(rems(0.6875))
-                                                .text_color(theme.secondary)
-                                                .child("Scanning…"),
+                                    .child(with_tooltip(
+                                        icon_button(
+                                            "rescan",
+                                            IconName::RefreshCw,
+                                            "Rescan library",
+                                            ButtonVariant::Secondary,
+                                            cx,
                                         )
-                                    }),
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.library.request_rescan();
+                                                cx.notify();
+                                            }),
+                                        ),
+                                        "Rescan library (Ctrl+R)",
+                                    ))
+                                    .child(with_tooltip(
+                                        icon_button(
+                                            "settings",
+                                            IconName::Settings,
+                                            "Settings",
+                                            ButtonVariant::Secondary,
+                                            cx,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.show_settings = !this.show_settings;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                        "Settings",
+                                    )),
                             )
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
+                                    .min_h_0()
                                     .flex()
                                     .flex_col()
                                     .bg(theme.background)
@@ -943,7 +1069,22 @@ impl Render for Omamusic {
                                         ),
                                 ),
                         )
-                    }),
+                    })
+                    .when(
+                        self.prefs.visual_effects && self.player.state() == PlayerState::Playing,
+                        |d| {
+                            d.child(
+                                self.visualizer.clone().cached(
+                                    StyleRefinement::default()
+                                        .absolute()
+                                        .bottom_0()
+                                        .left_0()
+                                        .right_0()
+                                        .h(rems(3.5)),
+                                ),
+                            )
+                        },
+                    ),
             )
     }
 }
@@ -1227,9 +1368,23 @@ impl Omamusic {
         } else {
             theme.hover_fill()
         };
+        // Column layout priority: the title dominates and keeps its share on
+        // narrow screens, while the artist column grows from nothing and caps,
+        // so it truncates before the song name does.
         let cell = |width: f32, text: String| {
             div()
                 .w(rems(width))
+                .flex_shrink_0()
+                .text_size(rems(0.6875))
+                .text_color(theme.secondary)
+                .truncate()
+                .child(text)
+        };
+        let side_cell = |text: String| {
+            div()
+                .flex_1()
+                .max_w(rems(SECONDARY_MAX_W))
+                .min_w_0()
                 .text_size(rems(0.6875))
                 .text_color(theme.secondary)
                 .truncate()
@@ -1249,14 +1404,14 @@ impl Omamusic {
             .child(
                 div()
                     .flex_1()
+                    .flex_grow(TITLE_GROW)
                     .min_w_0()
                     .text_size(rems(0.75))
                     .text_color(theme.foreground)
                     .truncate()
                     .child(t.title.clone()),
             )
-            .child(cell(10., t.artist.clone()))
-            .child(cell(10., t.album.clone()))
+            .child(side_cell(t.artist.clone()))
             .child(cell(3., format_time(t.duration)));
         self.track_row("song", i, TrackList::Songs, false, row, cx)
     }
@@ -1588,39 +1743,30 @@ impl Omamusic {
             .flex()
             .items_center()
             .justify_center()
+            .p(rems(1.))
             .child(
                 panel("Settings", cx)
+                    .id("settings-panel")
                     .w(rems(32.))
-                    .max_h(rems(40.))
+                    .max_h_full()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .gap(rems(0.5))
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(rems(0.875))
-                                    .font_weight(gpui_kit::FontWeight::BOLD)
-                                    .child("Settings"),
+                        div().flex().items_center().justify_end().child(
+                            icon_button(
+                                "close-settings-x",
+                                IconName::Close,
+                                "Close settings",
+                                ButtonVariant::Secondary,
+                                cx,
                             )
-                            .child(
-                                icon_button(
-                                    "close-settings-x",
-                                    IconName::Close,
-                                    "Close settings",
-                                    ButtonVariant::Secondary,
-                                    cx,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.show_settings = false;
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_settings = false;
+                                cx.notify();
+                            })),
+                        ),
                     )
                     .child(separator(cx))
                     .child(
@@ -1647,6 +1793,13 @@ impl Omamusic {
                                 "Start hidden in tray",
                                 self.prefs.start_hidden,
                                 |c, on| c.start_hidden = on,
+                                cx,
+                            ))
+                            .child(self.pref_switch(
+                                "pref-visual-effects",
+                                "Visual Effects",
+                                self.prefs.visual_effects,
+                                |c, on| c.visual_effects = on,
                                 cx,
                             )),
                     )
@@ -1713,7 +1866,7 @@ impl Omamusic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TogglePlay;
+    use crate::{FocusSearch, TogglePlay};
     use gpui_kit::{KeyBinding, Keystroke, TestAppContext, VisualTestContext};
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1724,7 +1877,10 @@ mod tests {
     ) -> (Entity<Omamusic>, &'a mut VisualTestContext) {
         cx.update(|cx| {
             gpui_omarchy::init(cx);
-            cx.bind_keys([KeyBinding::new("space", TogglePlay, None)]);
+            cx.bind_keys([
+                KeyBinding::new("space", TogglePlay, None),
+                KeyBinding::new("ctrl-f", FocusSearch, None),
+            ]);
             let toggles = toggles.clone();
             cx.on_action(move |_: &TogglePlay, cx| {
                 toggles.set(toggles.get() + 1);
@@ -1872,5 +2028,127 @@ mod tests {
             assert_eq!(view.library.query(), "mo");
             assert!(!view.searching);
         });
+    }
+
+    #[gpui_kit::test]
+    async fn ctrl_f_clears_and_focuses_the_search_field(cx: &mut TestAppContext) {
+        let toggles = Rc::new(Cell::new(0));
+        let (view, cx) = setup(cx, &toggles);
+        focus_search(&view, cx);
+        type_stroke(cx, character('m'));
+        assert_eq!(search_state(&view, cx).0, "m");
+
+        type_stroke(cx, Keystroke::parse("ctrl-f").unwrap());
+
+        let (text, applied) = search_state(&view, cx);
+        assert_eq!(text, "", "Ctrl+F clears the field as it focuses it");
+        assert_eq!(applied, "", "and the library filter with it");
+        view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.query.read(cx).focus_handle(cx).is_focused(window),
+                "Ctrl+F moves the caret into the search field"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn the_scan_toast_holds_then_fades_out_by_three_seconds(cx: &mut TestAppContext) {
+        let toggles = Rc::new(Cell::new(0));
+        let (view, cx) = setup(cx, &toggles);
+        view.update(cx, |view, cx| {
+            view.show_notify("5 songs · 2 albums".into(), cx)
+        });
+        view.read_with(cx, |view, _| {
+            let (msg, opacity) = view.rescan_notify.clone().unwrap();
+            assert_eq!(msg, "5 songs · 2 albums");
+            assert_eq!(opacity, 1.0, "freshly shown toast is solid");
+        });
+
+        cx.executor().advance_clock(NOTIFY_HOLD);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let (_, opacity) = view.rescan_notify.clone().unwrap();
+            assert!(
+                opacity < 1.0 && opacity > 0.0,
+                "after the hold the toast fades gradually, got {opacity}"
+            );
+        });
+
+        cx.executor()
+            .advance_clock(NOTIFY_FADE + NOTIFY_FADE_STEP * 2);
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |view, _| view.rescan_notify.is_none()),
+            "the toast is gone within three seconds"
+        );
+        assert!(
+            NOTIFY_HOLD + NOTIFY_FADE <= Duration::from_millis(3000),
+            "total lifetime must fit the promised 3s"
+        );
+    }
+
+    #[test]
+    fn visualizer_shape_stays_in_range_and_loops_seamlessly() {
+        for bar in 0..VISUALIZER_BARS {
+            for step in 0..=20 {
+                let delta = step as f32 / 20.;
+                let shape = visualizer_shape(bar, delta);
+                assert!((0.0..=1.0).contains(&shape), "bar {bar} @ {delta}: {shape}");
+            }
+            assert!(
+                (visualizer_shape(bar, 0.) - visualizer_shape(bar, 1.)).abs() < 1e-5,
+                "bar {bar} jumps when its animation repeats"
+            );
+        }
+    }
+
+    #[test]
+    fn visualizer_bars_rise_with_the_level_and_collapse_without_it() {
+        for bar in 0..VISUALIZER_BARS {
+            assert_eq!(
+                visualizer_height(0.0, 0.5, bar),
+                0.12,
+                "silence leaves only the thin baseline"
+            );
+            assert!(
+                visualizer_height(1.0, 0.5, bar) >= visualizer_height(0.3, 0.5, bar),
+                "louder must not shrink bar {bar}"
+            );
+            assert!(
+                visualizer_height(1.0, 0.5, bar) <= 2.6,
+                "bar {bar} may not overrun its strip"
+            );
+            assert!(visualizer_opacity(1.0, 0.5, bar) <= 0.5, "stay see-through");
+        }
+        let loud = (0..VISUALIZER_BARS)
+            .map(|b| visualizer_height(1.0, 0.4, b))
+            .sum::<f32>();
+        let quiet = (0..VISUALIZER_BARS)
+            .map(|b| visualizer_height(0.2, 0.4, b))
+            .sum::<f32>();
+        assert!(loud > quiet, "the strip as a whole reacts to the level");
+    }
+
+    #[test]
+    fn the_count_line_leads_with_songs_then_albums() {
+        assert_eq!(library_counts_text(1, 2), "2 songs · 1 albums");
+        assert_eq!(library_counts_text(12, 340), "340 songs · 12 albums");
+    }
+
+    #[test]
+    fn dropping_the_source_column_gives_the_title_room() {
+        // Three competing columns (title + artist + source) squeezed the title
+        // on small screens; with the source column gone the title claims the
+        // clear majority of the flexible width.
+        let before = title_flex_share(2);
+        let after = title_flex_share(1);
+        assert!(
+            after > before,
+            "fewer secondary columns grow the title's share"
+        );
+        assert!(
+            after > 0.7,
+            "the title keeps the bulk of the flexible space"
+        );
     }
 }

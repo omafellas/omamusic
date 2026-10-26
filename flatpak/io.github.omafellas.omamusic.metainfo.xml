@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.omafellas.omamusic</id>
+  <name>Omamusic</name>
+  <summary>Minimalist local music player for Omarchy</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.omafellas">
+    <name>omafellas</name>
+  </developer>
+  <url type="homepage">https://github.com/omafellas/omamusic</url>
+  <url type="bugtracker">https://github.com/omafellas/omamusic/issues</url>
+  <launchable type="desktop-id">io.github.omafellas.omamusic.desktop</launchable>
+  <description>
+    <p>Local music only: no network, no accounts, no codecs to install.</p>
+    <p>A SQLite-backed library with album, artist and song views, BM25
+       full-text search, cover art, shuffle and repeat, MPRIS media
+       integration, and a system tray icon — rendered in GPUI and following
+       the live Omarchy theme.</p>
+  </description>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-25"/>
+  </releases>
+</component>

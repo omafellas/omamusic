@@ -4,3 +4,6 @@
 *.rs.orig
 .vscode/
 .idea/
+# flatpak build artifacts
+/flatpak/.build/
+*.flatpak

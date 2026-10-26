@@ -53,11 +53,15 @@ impl PlayerBar {
                 .default_value(0.)
         });
 
-        cx.subscribe(&volume, |this, _, event: &SliderEvent, _| match event {
-            SliderEvent::Change(value) => this.player.set_volume(value.end() as f64),
+        cx.subscribe(&volume, |this, _, event: &SliderEvent, cx| match event {
+            SliderEvent::Change(value) => {
+                this.player.set_volume(value.end() as f64);
+                cx.notify();
+            }
             SliderEvent::Release(_) => {
                 let volume = this.player.volume();
                 AppConfig::update(|c| c.volume = volume);
+                cx.notify();
             }
         })
         .detach();
@@ -224,6 +228,7 @@ impl Render for PlayerBar {
             .unwrap_or_default();
         let shuffle = self.player.shuffle();
         let repeat = self.player.repeat();
+        let muted = self.player.is_muted();
         let toggled = |on: bool| {
             if on {
                 ButtonVariant::Primary
@@ -244,132 +249,139 @@ impl Render for PlayerBar {
             .bg(theme.background)
             .child(
                 div()
-                    .id("now-playing")
                     .flex()
                     .items_center()
                     .gap(rems(0.75))
-                    .when(has_track, |d| d.cursor_pointer())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(track) = this.player.current() {
-                            let _ = this
-                                .main
-                                .update(cx, |main, cx| main.show_album(track.album_id, cx));
-                        }
-                    }))
-                    .child(cover(
-                        &self.library,
-                        current.map(|t| t.album_id.as_str()),
-                        40.,
-                        current.map_or("♪", |t| t.title.as_str()),
-                        cx,
-                    ))
+                    .child(
+                        div()
+                            .id("now-playing")
+                            .flex()
+                            .items_center()
+                            .gap(rems(0.75))
+                            .when(has_track, |d| d.cursor_pointer())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(track) = this.player.current() {
+                                    let _ = this
+                                        .main
+                                        .update(cx, |main, cx| main.show_album(track.album_id, cx));
+                                }
+                            }))
+                            .child(cover(
+                                &self.library,
+                                current.map(|t| t.album_id.as_str()),
+                                40.,
+                                current.map_or("♪", |t| t.title.as_str()),
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .w(rems(10.))
+                                    .min_w(rems(4.))
+                                    .child(
+                                        div()
+                                            .text_size(rems(0.75))
+                                            .text_color(theme.foreground)
+                                            .truncate()
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(rems(0.6875))
+                                            .text_color(theme.secondary)
+                                            .truncate()
+                                            .child(sub),
+                                    ),
+                            ),
+                    )
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .w(rems(10.))
-                            .min_w(rems(4.))
-                            .child(
-                                div()
-                                    .text_size(rems(0.75))
-                                    .text_color(theme.foreground)
-                                    .truncate()
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .truncate()
-                                    .child(sub),
-                            ),
+                            .items_center()
+                            .gap(rems(0.375))
+                            .child(with_tooltip(
+                                Self::control_button(
+                                    "shuffle",
+                                    IconName::Shuffle,
+                                    "Shuffle",
+                                    toggled(shuffle),
+                                    !has_track,
+                                    |p| p.set_shuffle(!p.shuffle()),
+                                    cx,
+                                ),
+                                "Shuffle",
+                            ))
+                            .child(with_tooltip(
+                                Self::control_button(
+                                    "prev",
+                                    IconName::SkipBack,
+                                    "Previous",
+                                    ButtonVariant::Secondary,
+                                    !has_track,
+                                    Player::previous,
+                                    cx,
+                                ),
+                                "Previous",
+                            ))
+                            .child(with_tooltip(
+                                Self::control_button(
+                                    "play",
+                                    if playing {
+                                        IconName::Pause
+                                    } else {
+                                        IconName::Play
+                                    },
+                                    if playing { "Pause" } else { "Play" },
+                                    ButtonVariant::Primary,
+                                    !has_track,
+                                    Player::toggle,
+                                    cx,
+                                ),
+                                "Play/Pause (Space)",
+                            ))
+                            .child(with_tooltip(
+                                Self::control_button(
+                                    "next",
+                                    IconName::SkipForward,
+                                    "Next",
+                                    ButtonVariant::Secondary,
+                                    !has_track,
+                                    Player::next,
+                                    cx,
+                                ),
+                                "Next",
+                            ))
+                            .child(with_tooltip(
+                                Self::control_button(
+                                    "repeat",
+                                    if repeat == RepeatMode::One {
+                                        IconName::Repeat1
+                                    } else {
+                                        IconName::Repeat
+                                    },
+                                    "Repeat",
+                                    toggled(repeat != RepeatMode::Off),
+                                    !has_track,
+                                    |p| p.set_repeat(p.repeat().next()),
+                                    cx,
+                                ),
+                                "Repeat",
+                            )),
                     ),
             )
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .gap(rems(0.375))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "shuffle",
-                            IconName::Shuffle,
-                            "Shuffle",
-                            toggled(shuffle),
-                            !has_track,
-                            |p| p.set_shuffle(!p.shuffle()),
-                            cx,
-                        ),
-                        "Shuffle",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "prev",
-                            IconName::SkipBack,
-                            "Previous",
-                            ButtonVariant::Secondary,
-                            !has_track,
-                            Player::previous,
-                            cx,
-                        ),
-                        "Previous",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "play",
-                            if playing {
-                                IconName::Pause
-                            } else {
-                                IconName::Play
-                            },
-                            if playing { "Pause" } else { "Play" },
-                            ButtonVariant::Primary,
-                            !has_track,
-                            Player::toggle,
-                            cx,
-                        ),
-                        "Play/Pause (Space)",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "next",
-                            IconName::SkipForward,
-                            "Next",
-                            ButtonVariant::Secondary,
-                            !has_track,
-                            Player::next,
-                            cx,
-                        ),
-                        "Next",
-                    ))
-                    .child(with_tooltip(
-                        Self::control_button(
-                            "repeat",
-                            if repeat == RepeatMode::One {
-                                IconName::Repeat1
-                            } else {
-                                IconName::Repeat
-                            },
-                            "Repeat",
-                            toggled(repeat != RepeatMode::Off),
-                            !has_track,
-                            |p| p.set_repeat(p.repeat().next()),
-                            cx,
-                        ),
-                        "Repeat",
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
                     .flex_1()
-                    .min_w(rems(14.))
+                    .min_w(rems(16.))
                     .items_center()
                     .gap(rems(0.375))
                     .child(
                         div()
                             .min_w(rems(3.5))
                             .max_w(rems(7.))
+                            .text_right()
                             .text_size(rems(0.625))
                             .text_color(theme.secondary)
                             .child(format_time(pos)),
@@ -386,18 +398,41 @@ impl Render for PlayerBar {
                             .text_size(rems(0.625))
                             .text_color(theme.secondary)
                             .child(format_time(dur)),
+                    )
+                    .child(with_tooltip(
+                        div()
+                            .id("mute")
+                            .flex_shrink_0()
+                            .cursor_pointer()
+                            .child(
+                                icon(if muted {
+                                    IconName::VolumeX
+                                } else {
+                                    IconName::Volume2
+                                })
+                                .size(rems(0.875))
+                                .text_color(if muted {
+                                    theme.danger
+                                } else {
+                                    theme.foreground
+                                }),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.player.toggle_mute();
+                                let value = this.player.volume() as f32;
+                                this.volume
+                                    .update(cx, |s, cx| s.set_value(value, window, cx));
+                                cx.notify();
+                            })),
+                        if muted { "Unmute" } else { "Mute" },
+                    ))
+                    .child(
+                        div()
+                            .w(rems(5.))
+                            .min_w(rems(3.))
+                            .flex_shrink_0()
+                            .child(slider(&self.volume, false, window, cx)),
                     ),
-            )
-            .child(
-                icon(IconName::Volume2)
-                    .size(rems(0.875))
-                    .text_color(theme.foreground),
-            )
-            .child(
-                div()
-                    .w(rems(5.))
-                    .min_w(rems(3.))
-                    .child(slider(&self.volume, false, window, cx)),
             )
     }
 }

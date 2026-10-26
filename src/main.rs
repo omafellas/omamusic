@@ -59,7 +59,7 @@ fn main() {
                 gpui_kit::KeyBinding::new("right", NextTrack, None),
                 gpui_kit::KeyBinding::new("left", PrevTrack, None),
                 gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
-                gpui_kit::KeyBinding::new("ctrl-p", FocusSearch, None),
+                gpui_kit::KeyBinding::new("ctrl-f", FocusSearch, None),
                 gpui_kit::KeyBinding::new("alt-left", GoBack, None),
                 gpui_kit::KeyBinding::new("ctrl-q", Quit, None),
             ]);
@@ -72,6 +72,11 @@ fn main() {
             let has_tray = desktop::start(player.clone(), library.clone(), commands);
 
             cx.on_action(|_: &Quit, cx| cx.quit());
+
+            // Ctrl+F must work from a cold window: nothing inside Omamusic is on the
+            // keystroke dispatch path until the first click focuses an element, so
+            // focus is forwarded at the application level as well as from the view.
+            bind_focus_search(cx);
 
             cx.on_action({
                 let player = player.clone();
@@ -144,6 +149,34 @@ fn main() {
             }
             cx.activate(true);
         });
+}
+
+/// Forwards `FocusSearch` from any window to its `Omamusic` view. Keystrokes
+/// only reach element handlers below the window root once something has been
+/// clicked, so this application-level path makes Ctrl+F work from a cold
+/// window too.
+/// Forwards `FocusSearch` to every window's search field. Keystrokes reach
+/// element handlers below the window root only once something inside has been
+/// focused, so for a cold window this application-level path catches the
+/// action. The update is deferred because during dispatch the window is
+/// checked out of the app and cannot be re-entered.
+fn bind_focus_search(cx: &mut App) {
+    cx.on_action(move |_: &FocusSearch, cx| {
+        let windows = cx.windows();
+        cx.defer(move |cx| {
+            for window in windows {
+                let _ = window.update(cx, |view, window, cx| {
+                    let Ok(root) = view.downcast::<Root>() else {
+                        return;
+                    };
+                    root.update(cx, |root, cx| {
+                        root.main
+                            .update(cx, |main, cx| main.focus_search(window, cx));
+                    });
+                });
+            }
+        });
+    });
 }
 
 fn show_window(library: &Arc<Library>, player: &Arc<Player>, cx: &mut App) {
@@ -249,5 +282,44 @@ fn dump_library() {
             tracks,
             lib.artist_total()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::{Focusable, Keystroke, TestAppContext};
+
+    /// Ctrl+F focuses the search field through the real window tree (Root above
+    /// Omamusic) while nothing has been clicked yet — the case that made the
+    /// keystroke never reach the field when only the view handled it.
+    #[gpui_kit::test]
+    async fn ctrl_f_finds_search_from_a_cold_window(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_omarchy::init(cx);
+            cx.bind_keys([gpui_kit::KeyBinding::new("ctrl-f", FocusSearch, None)]);
+            bind_focus_search(cx);
+        });
+        let (root, view) = cx.add_window_view(|window, cx| {
+            let library = Arc::new(Library::empty());
+            let player = Arc::new(Player::new_test());
+            let main = cx.new(|cx| Omamusic::new(library.clone(), player.clone(), window, cx));
+            let bar = cx.new(|cx| PlayerBar::new(library, player, main.downgrade(), window, cx));
+            Root { main, bar }
+        });
+
+        view.update(|window, cx| {
+            window.dispatch_keystroke(Keystroke::parse("ctrl-f").unwrap(), cx)
+        });
+        view.run_until_parked();
+
+        root.update_in(view, |root, window, cx| {
+            root.main.update(cx, |main, cx| {
+                assert!(
+                    main.query().read(cx).focus_handle(cx).is_focused(window),
+                    "Ctrl+F reaches the search field before any click"
+                );
+            });
+        });
     }
 }

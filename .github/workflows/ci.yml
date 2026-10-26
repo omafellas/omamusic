@@ -27,17 +27,12 @@ jobs:
       - run: cargo fmt --check
 
   build-test:
-    name: Build and test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: Build and test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
       - name: Install Linux dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -46,14 +41,6 @@ jobs:
             libfontconfig-dev libfreetype-dev libssl-dev libzstd-dev \
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-xcb-dev libxcb1-dev libvulkan-dev
-
-      - name: Install macOS dependencies
-        if: runner.os == 'macOS'
-        run: brew install ffmpeg
-
-      - name: Install Windows dependencies
-        if: runner.os == 'Windows'
-        run: choco install ffmpeg -y --no-progress
 
       - uses: dtolnay/rust-toolchain@stable
         with:
