@@ -76,6 +76,25 @@ MPRIS media controls and the system tray icon are integrated through the session
 
 ## Development
 
+The toolchain is managed with [mise](https://mise.jdx.dev). It installs Rust (with `clippy`, `rustfmt` and `rust-analyzer`), the `mbx` cargo wrapper, [hk](https://hk.jdx.dev) and `pkl`:
+
+```sh
+mise trust
+mise install
+hk install
+```
+
+`hk install` sets up the pre-commit hook, which runs `cargo fmt` and `cargo clippy`. Run the same checks over the whole repo with:
+
+```sh
+mise run check
+mise run fix
+```
+
+Machine-specific settings, such as `CARGO_BUILD_JOBS`, go in the git-ignored `mise.local.toml`.
+
+The full suite also runs directly through cargo:
+
 ```sh
 cargo fmt --check
 cargo check --offline
