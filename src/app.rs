@@ -647,19 +647,11 @@ impl Omamusic {
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("track");
         let download_dir =
             dirs::download_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
-        let _default_path = download_dir.join(file_name);
-        let picked = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Export File".into()),
-        });
+        let picked = cx.prompt_for_new_path(&download_dir, Some(file_name));
         cx.spawn(async move |_, _cx| {
-            if let Ok(Ok(Some(mut paths))) = picked.await {
-                if let Some(dest) = paths.pop() {
-                    if let Err(e) = std::fs::copy(&path, &dest) {
-                        eprintln!("export file: {e}");
-                    }
+            if let Ok(Ok(Some(dest))) = picked.await {
+                if let Err(e) = std::fs::copy(&path, &dest) {
+                    eprintln!("export file: {e}");
                 }
             }
         })
