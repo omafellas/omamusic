@@ -1,0 +1,17 @@
+wrappers = { cargo = { command = "mbx", env = { MBX_CARGO_SHIM_MODE = "1" } } }
+[settings]
+activate_aggressive = true
+
+[tools]
+rust = { version = "stable", components = "clippy,rustfmt,rust-analyzer" }
+mr-boxington = "latest"
+hk = "latest"
+pkl = "latest"
+
+[tasks.check]
+description = "Run every hk linter over the whole repo"
+run = "hk check --all --slow"
+
+[tasks.fix]
+description = "Run every hk linter with autofix over the whole repo"
+run = "hk fix --all --slow"

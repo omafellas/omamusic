@@ -7,3 +7,6 @@
 # flatpak build artifacts
 /flatpak/.build/
 *.flatpak
+
+# local mise overrides
+/mise.local.toml

@@ -1,0 +1,30 @@
+amends "package://github.com/jdx/hk/releases/download/v2.8.0/hk@2.8.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v2.8.0/hk@2.8.0#/Builtins.pkl"
+
+local linters = new Mapping<String, Step> {
+    ["cargo-fmt"] = Builtins.cargo_fmt
+    ["cargo-clippy"] = (Builtins.cargo_clippy) {
+        check = "cargo clippy --all-targets -- -D warnings"
+    }
+    ["pkl"] {
+        glob = "*.pkl"
+        check = "pkl eval {{files}} >/dev/null"
+    }
+}
+
+fail_fast = false
+
+hooks {
+    ["pre-commit"] {
+        fix = true
+        stash = "git"
+        steps = linters
+    }
+    ["fix"] {
+        fix = true
+        steps = linters
+    }
+    ["check"] {
+        steps = linters
+    }
+}
