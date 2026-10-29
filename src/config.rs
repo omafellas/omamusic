@@ -29,6 +29,8 @@ pub struct AppConfig {
     pub album_sort: AlbumSort,
     pub album_view: AlbumView,
     pub song_sort: SongSort,
+    /// The sidebar shows only its icons.
+    pub sidebar_collapsed: bool,
 }
 
 impl Default for AppConfig {
@@ -47,6 +49,7 @@ impl Default for AppConfig {
             album_sort: AlbumSort::default(),
             album_view: AlbumView::default(),
             song_sort: SongSort::default(),
+            sidebar_collapsed: false,
         }
     }
 }

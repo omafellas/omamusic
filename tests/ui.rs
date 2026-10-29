@@ -1152,3 +1152,36 @@ async fn a_narrow_toolbar_never_overlaps_its_title_and_controls(cx: &mut TestApp
         "the title keeps some room: {title:?}"
     );
 }
+
+#[gpui_kit::test]
+async fn the_sidebar_collapses_to_icons_and_remembers_it(cx: &mut TestAppContext) {
+    let library = library_of(&[release("k", "Estranhos no Ninho", "Exxótica", 2002)]);
+    let mut app = open_with(cx, library);
+    let rem = app.rem();
+    let wide = app.bounds("nav-albums");
+    assert!(wide.size.width > rem * 8., "labels show: {wide:?}");
+
+    app.click("sidebar-toggle");
+    app.cx.executor().advance_clock(Duration::from_millis(400));
+    app.cx.run_until_parked();
+    let narrow = app.bounds("nav-albums");
+    assert!(
+        narrow.size.width < rem * 3.,
+        "only the icon is left: {narrow:?}"
+    );
+    assert_eq!(app.label("nav-albums").as_deref(), Some("Albums"));
+    assert_eq!(app.saved("sidebar_collapsed"), true);
+
+    app.click("nav-albums");
+    assert_eq!(
+        app.label("view-title").as_deref(),
+        Some("Albums"),
+        "an icon still navigates"
+    );
+
+    app.click("sidebar-toggle");
+    app.cx.executor().advance_clock(Duration::from_millis(400));
+    app.cx.run_until_parked();
+    assert!(app.bounds("nav-albums").size.width > rem * 8.);
+    assert_eq!(app.saved("sidebar_collapsed"), false);
+}

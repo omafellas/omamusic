@@ -206,6 +206,7 @@ const ALBUM_MORE_ACTIONS: &[RowAction] = &[
     RowAction::AddToPlaylistMenu,
 ];
 const SIDEBAR_REMS: f32 = 13.75;
+const SIDEBAR_COMPACT_REMS: f32 = 3.25;
 const QUEUE_REMS: f32 = 17.5;
 const SONG_COLUMNS: [(SongColumn, &str); 5] = [
     (SongColumn::Title, "Title"),
@@ -790,6 +791,7 @@ impl Omamusic {
                 .map(|p| p.name.clone())
                 .unwrap_or_default(),
         };
+        self.set_sidebar_collapsed(false, cx);
         self.playlist_edit = Some(edit);
         self.playlist_name.update(cx, |field, cx| {
             field.set_value(name, window, cx);
@@ -1558,13 +1560,15 @@ fn sidebar_btn(
     label: &str,
     icon_name: IconName,
     selected: bool,
+    compact: bool,
     cx: &App,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> AnyElement {
     let t = cx.omarchy().clone();
-    div()
+    let row = div()
         .id(id)
         .test_support()
+        .aria_label(label.to_string())
         .flex()
         .items_center()
         .gap(rems(0.5))
@@ -1582,8 +1586,15 @@ fn sidebar_btn(
         })
         .hover(|s| s.bg(t.hover_fill()))
         .child(icon(icon_name).size(rems(0.875)).flex_none())
-        .child(div().min_w_0().truncate().child(label.to_string()))
-        .on_click(on_click)
+        .when(!compact, |d| {
+            d.child(div().min_w_0().truncate().child(label.to_string()))
+        })
+        .on_click(on_click);
+    if compact {
+        with_tooltip(row.justify_center().px_0(), label.to_string()).into_any_element()
+    } else {
+        row.into_any_element()
+    }
 }
 
 impl Render for Omamusic {
@@ -1746,14 +1757,26 @@ impl Omamusic {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.omarchy().clone();
+        let compact = self.prefs.sidebar_collapsed;
+        let width = transition(
+            "sidebar-width",
+            self.sidebar_rems(),
+            Transition::new(PANEL_ENTER),
+            window,
+            cx,
+        );
         let heading = |label: &'static str| {
-            div()
-                .flex_1()
-                .px(rems(0.625))
-                .text_size(rems(0.625))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.secondary)
-                .child(label)
+            if compact {
+                div().w(rems(1.25)).h(px(1.)).bg(theme.border)
+            } else {
+                div()
+                    .flex_1()
+                    .px(rems(0.625))
+                    .text_size(rems(0.625))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.secondary)
+                    .child(label)
+            }
         };
         let library_nav = [
             (
@@ -1776,6 +1799,7 @@ impl Omamusic {
                     label,
                     icon_name,
                     self.section == section,
+                    compact,
                     cx,
                     cx.listener(move |this, _, window, cx| {
                         this.clear_search(window, cx);
@@ -1797,6 +1821,7 @@ impl Omamusic {
                 &playlist.name,
                 IconName::ListMusic,
                 self.section == Section::Playlist(id),
+                compact,
                 cx,
                 cx.listener(move |this, _, window, cx| {
                     this.clear_search(window, cx);
@@ -1833,7 +1858,7 @@ impl Omamusic {
         }
         if self.playlist_edit == Some(PlaylistEdit::New) {
             playlist_items.push(self.playlist_name_field(window, cx));
-        } else if playlist_items.is_empty() {
+        } else if playlist_items.is_empty() && !compact {
             playlist_items.push(
                 div()
                     .px(rems(0.625))
@@ -1852,9 +1877,9 @@ impl Omamusic {
         div()
             .flex()
             .flex_col()
-            .w(rems(SIDEBAR_REMS))
-            .min_w(rems(8.))
+            .w(rems(width))
             .flex_shrink_0()
+            .overflow_hidden()
             .border_r_1()
             .border_color(theme.border)
             .bg(theme.background)
@@ -1868,19 +1893,22 @@ impl Omamusic {
                     .flex_col()
                     .gap_1()
                     .p(rems(0.5))
-                    .child(
-                        div()
-                            .flex()
-                            .pt(rems(0.25))
-                            .pb(rems(0.25))
-                            .child(heading("LIBRARY")),
-                    )
+                    .when(!compact, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .pt(rems(0.25))
+                                .pb(rems(0.25))
+                                .child(heading("LIBRARY")),
+                        )
+                    })
                     .children(library_items)
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .pt(rems(0.75))
+                            .when(compact, |d| d.flex_col().gap(rems(0.5)))
                             .child(heading("PLAYLISTS"))
                             .child(with_tooltip(
                                 icon_button(
@@ -1900,27 +1928,50 @@ impl Omamusic {
                     )
                     .children(playlist_items),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(rems(0.125))
-                    .px(rems(0.875))
-                    .py(rems(0.625))
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .text_size(rems(0.6875))
-                    .text_color(theme.secondary)
-                    .child(library_counts_text(snap.album_count, snap.track_count))
-                    .child(
-                        div()
-                            .id("library-status")
-                            .test_support()
-                            .aria_label(status)
-                            .child(status),
-                    ),
-            )
+            .when(!compact, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(rems(0.125))
+                        .px(rems(0.875))
+                        .py(rems(0.625))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .text_size(rems(0.6875))
+                        .text_color(theme.secondary)
+                        .child(library_counts_text(snap.album_count, snap.track_count))
+                        .child(
+                            div()
+                                .id("library-status")
+                                .test_support()
+                                .aria_label(status)
+                                .child(status),
+                        ),
+                )
+            })
             .into_any_element()
+    }
+
+    fn sidebar_rems(&self) -> f32 {
+        if self.prefs.sidebar_collapsed {
+            SIDEBAR_COMPACT_REMS
+        } else {
+            SIDEBAR_REMS
+        }
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.set_sidebar_collapsed(!self.prefs.sidebar_collapsed, cx);
+    }
+
+    fn set_sidebar_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        if self.prefs.sidebar_collapsed == collapsed {
+            return;
+        }
+        self.prefs.sidebar_collapsed = collapsed;
+        AppConfig::update(|c| c.sidebar_collapsed = collapsed);
+        cx.notify();
     }
 
     fn playlist_name_field(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2031,6 +2082,28 @@ impl Omamusic {
                     .flex()
                     .flex_none()
                     .gap(rems(0.125))
+                    .child({
+                        let label = if self.prefs.sidebar_collapsed {
+                            "Show Sidebar"
+                        } else {
+                            "Hide Sidebar"
+                        };
+                        with_tooltip(
+                            icon_button(
+                                "sidebar-toggle",
+                                if self.prefs.sidebar_collapsed {
+                                    IconName::PanelLeftOpen
+                                } else {
+                                    IconName::PanelLeftClose
+                                },
+                                label,
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                            label,
+                        )
+                    })
                     .child(with_tooltip(
                         icon_button(
                             "nav-back",
@@ -3003,7 +3076,8 @@ impl Omamusic {
         } else {
             px(0.)
         };
-        let width = window.viewport_size().width - rem * SIDEBAR_REMS - px(1.) - queue - gap * 2.;
+        let width =
+            window.viewport_size().width - rem * self.sidebar_rems() - px(1.) - queue - gap * 2.;
         let card = rem * ALBUM_CARD_REMS;
         let columns = (((width + gap) / (card + gap)).floor() as usize).max(1);
         (columns, gap, card / px(1.))

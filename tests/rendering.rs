@@ -768,6 +768,31 @@ mod pixels {
         );
     }
 
+    fn collapsed_sidebar_paints_its_icons() {
+        let mut scene = Scene::open();
+        let wide = scene.bounds("nav-artists");
+        scene.act(|window, cx| window.click("sidebar-toggle", cx));
+        let capture = scene.capture();
+        let row = scene.bounds("nav-artists");
+        assert!(
+            row.size.width < wide.size.width / 3.,
+            "the row narrows to its icon: {wide:?} -> {row:?}"
+        );
+        assert!(
+            capture.ink_in(row) > 0,
+            "the collapsed row must still paint its icon at {row:?}"
+        );
+        let label = Bounds::new(
+            gpui_kit::point(row.right() + px(8.), row.top()),
+            size(px(80.), row.size.height),
+        );
+        let content = capture.color_at(label.center());
+        assert!(
+            close(content, capture.background()),
+            "no label is painted beside the icon: {content:?}"
+        );
+    }
+
     fn up_next_panel_slides_in() {
         let mut scene = Scene::open();
         scene.allow_motion();
@@ -798,7 +823,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 16] = [
+        let tests: [(&str, fn()); 17] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -839,6 +864,10 @@ mod pixels {
                 the_playing_song_row_is_filled,
             ),
             ("up_next_panel_slides_in", up_next_panel_slides_in),
+            (
+                "collapsed_sidebar_paints_its_icons",
+                collapsed_sidebar_paints_its_icons,
+            ),
             (
                 "the_playing_album_tile_wears_a_badge",
                 the_playing_album_tile_wears_a_badge,
