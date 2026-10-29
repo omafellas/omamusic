@@ -5,7 +5,7 @@
 //! `tracks` is the source of truth; `albums` is a materialized roll-up used for
 //! album-level search; the two FTS5 tables back BM25 search.
 
-use crate::models::{Album, AlbumSummary, ArtistEntry, Track};
+use crate::models::{Album, AlbumSort, AlbumSummary, ArtistEntry, Track};
 use anyhow::Result;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Bump when the schema changes. Older databases are discarded and rebuilt.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tracks (
@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS albums (
     track_titles TEXT NOT NULL DEFAULT '',
     genres       TEXT NOT NULL DEFAULT '',
     tags_missing     INTEGER NOT NULL DEFAULT 0,
-    mb_release_group TEXT NOT NULL DEFAULT ''
+    mb_release_group TEXT NOT NULL DEFAULT '',
+    added_ns     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS artwork (
@@ -131,6 +132,19 @@ const TRACK_ORDER: &str = "(t.track_number = 0), t.track_number, t.path";
 
 /// Album ordering used everywhere the album list is shown.
 const ALBUM_ORDER: &str = "a.artist COLLATE NOCASE, a.year, a.title COLLATE NOCASE";
+
+fn album_order(sort: AlbumSort) -> &'static str {
+    match sort {
+        AlbumSort::Artist => ALBUM_ORDER,
+        AlbumSort::Title => "a.title COLLATE NOCASE, a.artist COLLATE NOCASE, a.year",
+        AlbumSort::Year => {
+            "(a.year = 0), a.year DESC, a.artist COLLATE NOCASE, a.title COLLATE NOCASE"
+        }
+        AlbumSort::RecentlyAdded => {
+            "a.added_ns DESC, a.artist COLLATE NOCASE, a.title COLLATE NOCASE"
+        }
+    }
+}
 
 const ALBUM_COLS: &str = "a.key, a.title, a.artist, a.year, a.track_count, \
      EXISTS(SELECT 1 FROM lookup l WHERE l.album_key = a.key \
@@ -327,10 +341,16 @@ pub fn tracks_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<Track>> {
     Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
 }
 
-pub fn albums_page(conn: &Connection, offset: usize, limit: usize) -> Result<Vec<AlbumSummary>> {
+pub fn albums_page(
+    conn: &Connection,
+    offset: usize,
+    limit: usize,
+    sort: AlbumSort,
+) -> Result<Vec<AlbumSummary>> {
     let sql = format!(
         "SELECT {ALBUM_COLS} FROM albums a \
-         ORDER BY {ALBUM_ORDER} LIMIT ?1 OFFSET ?2"
+         ORDER BY {} LIMIT ?1 OFFSET ?2",
+        album_order(sort)
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![limit as i64, offset as i64], album_summary_from_row)?;
@@ -389,7 +409,7 @@ pub fn artists_page(conn: &Connection, offset: usize, limit: usize) -> Result<Ve
 pub fn album_detail(conn: &Connection, key: &str) -> Result<Option<Album>> {
     let album = conn
         .query_row(
-            &format!("SELECT {ALBUM_COLS} FROM albums a WHERE a.key = ?1"),
+            &format!("SELECT {ALBUM_COLS}, a.genres FROM albums a WHERE a.key = ?1"),
             params![key],
             |row| {
                 Ok(Album {
@@ -399,6 +419,13 @@ pub fn album_detail(conn: &Connection, key: &str) -> Result<Option<Album>> {
                     year: row.get::<_, i64>("year")?.max(0) as u32,
                     tracks: Vec::new().into(),
                     unmatched: row.get::<_, i64>("unmatched")? != 0,
+                    genre: row
+                        .get::<_, String>("genres")?
+                        .split(',')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
                 })
             },
         )
@@ -674,20 +701,22 @@ mod tests {
         let conn = memory();
         insert_track(&conn, "/m/a/1.mp3", "One", "Band", "Record", 1);
         rebuild_albums(&conn);
-        let key = albums_page(&conn, 0, 1).unwrap()[0].id.clone();
-        assert!(!albums_page(&conn, 0, 1).unwrap()[0].unmatched);
+        let key = albums_page(&conn, 0, 1, AlbumSort::Artist).unwrap()[0]
+            .id
+            .clone();
+        assert!(!albums_page(&conn, 0, 1, AlbumSort::Artist).unwrap()[0].unmatched);
 
         record_lookup(&conn, &lookup(&key, LookupStatus::Unmatched, 100)).unwrap();
         let unmatched = unmatched_albums(&conn).unwrap();
         assert_eq!(unmatched.len(), 1);
         assert!(unmatched[0].unmatched);
-        assert!(albums_page(&conn, 0, 1).unwrap()[0].unmatched);
+        assert!(albums_page(&conn, 0, 1, AlbumSort::Artist).unwrap()[0].unmatched);
         assert!(albums_by_keys(&conn, std::slice::from_ref(&key)).unwrap()[0].unmatched);
         assert!(artist_albums(&conn, "Band").unwrap()[0].unmatched);
 
         record_lookup(&conn, &lookup(&key, LookupStatus::Matched, 200)).unwrap();
         assert!(unmatched_albums(&conn).unwrap().is_empty());
-        assert!(!albums_page(&conn, 0, 1).unwrap()[0].unmatched);
+        assert!(!albums_page(&conn, 0, 1, AlbumSort::Artist).unwrap()[0].unmatched);
         assert_eq!(clear_unmatched(&conn).unwrap(), 0);
 
         record_lookup(&conn, &lookup(&key, LookupStatus::Unmatched, 300)).unwrap();
@@ -700,7 +729,9 @@ mod tests {
         let conn = memory();
         insert_track(&conn, "/m/a/1.mp3", "One", "Band", "Record", 1);
         rebuild_albums(&conn);
-        let key = albums_page(&conn, 0, 1).unwrap()[0].id.clone();
+        let key = albums_page(&conn, 0, 1, AlbumSort::Artist).unwrap()[0]
+            .id
+            .clone();
         let now = 10_000_000;
         let month = 2_592_000;
 
@@ -711,7 +742,7 @@ mod tests {
             1,
             "errors are shown too"
         );
-        assert!(albums_page(&conn, 0, 1).unwrap()[0].unmatched);
+        assert!(albums_page(&conn, 0, 1, AlbumSort::Artist).unwrap()[0].unmatched);
 
         record_lookup(
             &conn,
@@ -736,7 +767,9 @@ mod tests {
         let conn = memory();
         insert_track(&conn, "/m/a/1.mp3", "One", "Band", "Record", 1);
         rebuild_albums(&conn);
-        let key = albums_page(&conn, 0, 1).unwrap()[0].id.clone();
+        let key = albums_page(&conn, 0, 1, AlbumSort::Artist).unwrap()[0]
+            .id
+            .clone();
         assert_eq!(artwork(&conn, &key).unwrap(), None);
         set_artwork(&conn, &key, b"img").unwrap();
         assert_eq!(artwork(&conn, &key).unwrap(), Some(b"img".to_vec()));
@@ -979,7 +1012,7 @@ mod tests {
         insert_track(&conn, "/m/2.mp3", "Two", "B", "Mixed", 2);
         insert_track(&conn, "/m/3.mp3", "Three", "C", "Solid", 1);
         rebuild_albums(&conn);
-        let albums = albums_page(&conn, 0, 10).unwrap();
+        let albums = albums_page(&conn, 0, 10, AlbumSort::Artist).unwrap();
         let mixed = albums.iter().find(|a| a.title == "Mixed").unwrap();
         assert_eq!(mixed.artist, "Various Artists");
         assert_eq!(mixed.track_count, 2);
@@ -1000,6 +1033,47 @@ mod tests {
             .map(|t| t.title)
             .collect();
         assert_eq!(titles, ["A1", "B1", "B2"]);
+    }
+
+    #[test]
+    fn albums_page_follows_the_chosen_sort() {
+        let conn = memory();
+        insert_track(&conn, "/m/a/1.mp3", "One", "Zeta", "Beta", 1);
+        insert_track(&conn, "/m/b/1.mp3", "One", "Alpha", "Gamma", 1);
+        insert_track(&conn, "/m/c/1.mp3", "One", "Mid", "Alef", 1);
+        conn.execute_batch(
+            "UPDATE tracks SET year = 1999, mtime_ns = 30 WHERE album = 'Beta';
+             UPDATE tracks SET year = 2010, mtime_ns = 10 WHERE album = 'Gamma';
+             UPDATE tracks SET year = 0, mtime_ns = 20 WHERE album = 'Alef';",
+        )
+        .unwrap();
+        rebuild_albums(&conn);
+        let titles = |sort| -> Vec<String> {
+            albums_page(&conn, 0, 10, sort)
+                .unwrap()
+                .into_iter()
+                .map(|a| a.title)
+                .collect()
+        };
+        assert_eq!(titles(AlbumSort::Artist), ["Gamma", "Alef", "Beta"]);
+        assert_eq!(titles(AlbumSort::Title), ["Alef", "Beta", "Gamma"]);
+        assert_eq!(titles(AlbumSort::Year), ["Gamma", "Beta", "Alef"]);
+        assert_eq!(titles(AlbumSort::RecentlyAdded), ["Beta", "Alef", "Gamma"]);
+    }
+
+    #[test]
+    fn album_detail_carries_the_first_genre() {
+        let conn = memory();
+        insert_track(&conn, "/m/1.mp3", "One", "A", "Disc", 1);
+        insert_track(&conn, "/m/2.mp3", "Two", "A", "Disc", 2);
+        conn.execute_batch("UPDATE tracks SET genre = 'Synth-pop' WHERE title = 'One';")
+            .unwrap();
+        rebuild_albums(&conn);
+        let key = crate::index::album_key("/m", "Disc");
+        assert_eq!(
+            album_detail(&conn, &key).unwrap().unwrap().genre,
+            "Synth-pop"
+        );
     }
 
     #[test]

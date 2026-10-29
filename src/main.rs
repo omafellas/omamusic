@@ -104,7 +104,7 @@ fn dump_library() {
     }
     let s = lib.snapshot();
     println!("albums={} tracks={}", s.album_count, s.track_count);
-    for album in lib.album_page(0, 1_000_000) {
+    for album in lib.album_page(0, 1_000_000, omamusic::models::AlbumSort::Artist) {
         println!(
             "ALBUM {:?} artist={:?} year={} n={}",
             album.title, album.artist, album.year, album.track_count

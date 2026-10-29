@@ -25,7 +25,7 @@ pub const MISSING_YEAR: u32 = 8;
 pub(crate) const REBUILD_ALBUMS: &str = r#"
 DELETE FROM albums;
 INSERT INTO albums(key, title, artist, year, dir, track_count, track_titles, genres,
-                   tags_missing, mb_release_group)
+                   tags_missing, mb_release_group, added_ns)
 SELECT album_key,
        MAX(album),
        CASE WHEN COUNT(DISTINCT artist) = 1 THEN MAX(artist) ELSE 'Various Artists' END,
@@ -35,7 +35,8 @@ SELECT album_key,
        GROUP_CONCAT(title, ' '),
        COALESCE(GROUP_CONCAT(DISTINCT NULLIF(genre, '')), ''),
        MAX(tags_missing & 1) | MAX(tags_missing & 2) | MAX(tags_missing & 4) | MAX(tags_missing & 8),
-       MAX(mb_release_group)
+       MAX(mb_release_group),
+       MAX(mtime_ns)
 FROM tracks
 GROUP BY album_key;
 "#;

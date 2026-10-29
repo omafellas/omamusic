@@ -25,6 +25,8 @@ pub struct Album {
     pub tracks: Arc<[Track]>,
     #[serde(default)]
     pub unmatched: bool,
+    #[serde(default)]
+    pub genre: String,
 }
 
 /// An album without its tracks, for grids and artist pages that only need
@@ -98,6 +100,42 @@ pub enum Section {
     Artists,
     Songs,
     Queue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlbumSort {
+    #[default]
+    Artist,
+    Title,
+    Year,
+    RecentlyAdded,
+}
+
+impl AlbumSort {
+    pub const ALL: [AlbumSort; 4] = [
+        AlbumSort::Artist,
+        AlbumSort::Title,
+        AlbumSort::Year,
+        AlbumSort::RecentlyAdded,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AlbumSort::Artist => "Artist",
+            AlbumSort::Title => "Title",
+            AlbumSort::Year => "Year",
+            AlbumSort::RecentlyAdded => "Recently Added",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlbumView {
+    #[default]
+    Grid,
+    List,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

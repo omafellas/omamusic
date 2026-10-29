@@ -1,22 +1,25 @@
 use crate::config::AppConfig;
 use crate::library::{Library, LibrarySnapshot};
-use crate::models::{Album, AlbumSummary, ArtistEntry, PlayerState, Section, Track};
+use crate::models::{
+    Album, AlbumSort, AlbumSummary, AlbumView, ArtistEntry, PlayerState, Section, Track,
+};
 use crate::player::Player;
+use crate::search::{highlight_ranges, top_result, TopResult};
 use crate::{DecreaseFontSize, FocusSearch, GoBack, IncreaseFontSize, ResetFontSize};
-use gpui_kit::base::input::InputState;
+use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::TestSupportExt;
 use gpui_kit::{
     div, px, rems, uniform_list, Animation, AnimationExt as _, AnyElement, App, AppContext,
     ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler, FocusHandle, Focusable,
-    ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection, ParentElement,
-    PathPromptOptions, Render, Stateful, StatefulInteractiveElement, StyleRefinement, Styled,
-    Window,
+    FontWeight, HighlightStyle, ImageSource, InteractiveElement, IntoElement, MouseButton,
+    NavigationDirection, ParentElement, PathPromptOptions, Render, SharedString, Stateful,
+    StatefulInteractiveElement, StyleRefinement, Styled, StyledText, Window,
 };
 use gpui_omarchy::{
-    avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, menu, panel,
-    separator, switch, with_tooltip, ActiveTheme, ButtonVariant, IconName, MenuItem,
+    avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, keycap, menu,
+    panel, separator, switch, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName, MenuItem,
 };
 use rand::Rng;
 use std::collections::BTreeSet;
@@ -57,6 +60,16 @@ pub struct Omamusic {
     focus_handle: FocusHandle,
     /// Refocus the root when one of our handles loses focus to nothing.
     _focus_guards: Vec<gpui_kit::Subscription>,
+    search_scope: SearchScope,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SearchScope {
+    #[default]
+    All,
+    Songs,
+    Albums,
+    Artists,
 }
 
 #[derive(Clone, PartialEq)]
@@ -133,6 +146,13 @@ const ALBUM_ACTIONS: &[RowAction] = &[
     RowAction::GoToArtist,
 ];
 const ARTIST_ACTIONS: &[RowAction] = &[RowAction::Play, RowAction::PlayNext, RowAction::AddToQueue];
+const ALBUM_MORE_ACTIONS: &[RowAction] = &[RowAction::PlayNext, RowAction::AddToQueue];
+
+const VARIOUS_ARTISTS: &str = "Various Artists";
+const SEARCH_PREVIEW_SONGS: usize = 6;
+const SEARCH_PREVIEW_ARTISTS: usize = 4;
+const SEARCH_TOP_CANDIDATES: usize = 50;
+const ALBUM_CARD_REMS: f32 = 10.;
 
 /// Default rem size in pixels; the UI scale multiplies it.
 const BASE_REM_SIZE: f32 = 16.0;
@@ -237,8 +257,34 @@ pub fn cover(
     }
 }
 
+fn highlighted(text: &str, query: &str, color: gpui_kit::Hsla) -> StyledText {
+    let style = HighlightStyle {
+        color: Some(color),
+        font_weight: Some(FontWeight::SEMIBOLD),
+        ..Default::default()
+    };
+    StyledText::new(text.to_string()).with_highlights(
+        highlight_ranges(text, query)
+            .into_iter()
+            .map(|range| (range, style)),
+    )
+}
+
 fn initials(text: &str) -> String {
     text.chars().take(2).collect()
+}
+
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+fn format_minutes(secs: f64) -> String {
+    let minutes = (secs.max(0.0) / 60.0).round() as u64;
+    if minutes >= 60 {
+        format!("{} hr {} min", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes} min")
+    }
 }
 
 pub fn format_time(secs: f64) -> String {
@@ -398,6 +444,12 @@ impl Omamusic {
         // Debounce the search so a burst of keystrokes runs a single query.
         cx.observe(&query, |this, _, cx| this.schedule_search(cx))
             .detach();
+        cx.subscribe(&query, |this, _, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.play_top_result(cx);
+            }
+        })
+        .detach();
 
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -472,6 +524,7 @@ impl Omamusic {
             _typing_guard,
             focus_handle,
             _focus_guards,
+            search_scope: SearchScope::All,
         }
     }
 
@@ -788,6 +841,16 @@ impl Omamusic {
         on_select: impl Fn(&mut Self, RowAction, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> Popover {
+        Self::action_menu(id, trigger, actions, on_select, cx).mouse_button(MouseButton::Right)
+    }
+
+    fn action_menu(
+        id: impl Into<ElementId>,
+        trigger: impl IntoElement,
+        actions: &'static [RowAction],
+        on_select: impl Fn(&mut Self, RowAction, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Popover {
         let this = cx.entity().downgrade();
         let items = actions
             .iter()
@@ -809,7 +872,6 @@ impl Omamusic {
                 let _ = this.update(cx, |this, cx| on_select(this, actions[index], cx));
             },
         )
-        .mouse_button(MouseButton::Right)
     }
 
     fn track_row(
@@ -842,7 +904,8 @@ impl Omamusic {
                         cx.notify();
                     }
                 }),
-            );
+            )
+            .test_support();
         let actions = if queue { QUEUE_ACTIONS } else { TRACK_ACTIONS };
         Self::context_menu(
             (id, row),
@@ -858,13 +921,12 @@ impl Omamusic {
     /// and the debounced path used by the view.
     fn apply_text(&mut self, text: String, cx: &mut Context<Self>) {
         if text != self.library.query() {
+            if self.library.query().trim().is_empty() {
+                self.search_scope = SearchScope::All;
+            }
             self.library.set_query(text.clone());
             self.pages.clear();
             self.clear_selection();
-            // Search always filters all songs, switch to Songs section.
-            if !text.trim().is_empty() && self.section != Section::Songs {
-                self.section = Section::Songs;
-            }
         }
         cx.notify();
     }
@@ -891,6 +953,14 @@ impl Omamusic {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
             let _ = this.update(cx, |this, cx| this.apply_pending_query(cx));
         }));
+    }
+
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.query.update(cx, |q, cx| q.set_value("", window, cx));
+        self.pending_query.clear();
+        self.search_task = None;
+        self.searching = false;
+        self.apply_text(String::new(), cx);
     }
 
     fn apply_pending_query(&mut self, cx: &mut Context<Self>) {
@@ -1115,9 +1185,7 @@ impl Render for Omamusic {
                                     self.section == section,
                                     cx,
                                     cx.listener(move |this, _, window, cx| {
-                                        this.query.update(cx, |q, cx| {
-                                            q.set_value("", window, cx);
-                                        });
+                                        this.clear_search(window, cx);
                                         this.set_section(section, cx)
                                     }),
                                 )
@@ -1157,6 +1225,19 @@ impl Render for Omamusic {
                                     .bg(theme.background)
                                     .pl(rems(0.75))
                                     .pr(px(0.))
+                                    .when(!self.pages.is_empty(), |d| {
+                                        d.child(with_tooltip(
+                                            icon_button(
+                                                "nav-back",
+                                                IconName::ChevronLeft,
+                                                "Back",
+                                                ButtonVariant::Secondary,
+                                                cx,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
+                                            "Back (Alt+Left)",
+                                        ))
+                                    })
                                     .child(div().flex_1().min_w_0().max_w(rems(28.)).child({
                                         let field = input("search", &self.query, window, cx);
                                         if self.searching {
@@ -1316,18 +1397,75 @@ impl Omamusic {
         match self.pages.last().cloned() {
             Some(Page::Album(id)) => {
                 if let Some(album) = self.library.album_detail(&id) {
-                    return self.render_album_detail(&album, cx);
+                    return self.render_album_detail(&album, window, cx);
                 }
             }
             Some(Page::Artist(name)) => return self.render_artist_albums(&name, window, cx),
             None => {}
         }
+        if self.library.snapshot().filter.is_some() {
+            return self.render_search(window, cx);
+        }
         match self.section {
-            Section::Albums => self.render_album_grid("albums", window, cx),
+            Section::Albums => self.render_albums_section(window, cx),
             Section::Artists => self.render_artist_list(cx),
             Section::Songs => self.render_song_list(cx),
             Section::Queue => self.render_queue(cx),
         }
+    }
+
+    fn view_title(
+        id: &'static str,
+        title: impl Into<SharedString>,
+        detail: String,
+        cx: &App,
+    ) -> Div {
+        let theme = cx.omarchy().clone();
+        let title = title.into();
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_baseline()
+            .gap(rems(0.5))
+            .child(
+                div()
+                    .id(id)
+                    .test_support()
+                    .aria_label(title.clone())
+                    .min_w_0()
+                    .text_size(rems(1.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(title),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(rems(0.6875))
+                    .text_color(theme.secondary)
+                    .child(detail),
+            )
+    }
+
+    fn section_heading(title: impl Into<SharedString>, see_all: Option<Button>, cx: &App) -> Div {
+        let theme = cx.omarchy().clone();
+        div()
+            .flex()
+            .items_center()
+            .gap(rems(0.5))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(rems(0.875))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(title.into()),
+            )
+            .children(see_all)
     }
 
     fn render_artist_albums(
@@ -1336,8 +1474,8 @@ impl Omamusic {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let theme = cx.omarchy().clone();
         let albums = self.library.artist_albums(name);
+        let detail = plural(albums.len(), "album");
         div()
             .flex_1()
             .min_h_0()
@@ -1347,39 +1485,134 @@ impl Omamusic {
                 div()
                     .flex()
                     .items_center()
-                    .gap(rems(0.75))
                     .px(rems(0.75))
                     .pt(rems(0.75))
-                    .child(
-                        button("artist-back", "Back", ButtonVariant::Secondary, cx)
-                            .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
-                    )
-                    .child(
-                        div()
-                            .text_size(rems(1.125))
-                            .text_color(theme.foreground)
-                            .child(name.to_string()),
-                    ),
+                    .child(Self::view_title(
+                        "artist-title",
+                        name.to_string(),
+                        detail,
+                        cx,
+                    )),
             )
             .child(self.render_album_list("artist-albums", albums, window, cx))
             .into_any_element()
     }
 
-    fn grid_columns(window: &Window) -> (usize, gpui_kit::Pixels) {
+    fn grid_columns(window: &Window) -> (usize, gpui_kit::Pixels, f32) {
         let rem = window.rem_size();
         let gap = rem * 0.75;
         let width = window.viewport_size().width - rem * 11. - px(1.) - gap * 2.;
-        let columns = (((width + gap) / (rem * 10. + gap)).floor() as usize).max(1);
-        (columns, gap)
+        let card = rem * ALBUM_CARD_REMS;
+        let columns = (((width + gap) / (card + gap)).floor() as usize).max(1);
+        (columns, gap, card / px(1.))
+    }
+
+    fn render_albums_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let sort = self.prefs.album_sort;
+        let view = self.prefs.album_view;
+        let total = self.library.album_total();
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(rems(0.5))
+            .px(rems(0.75))
+            .py(rems(0.5))
+            .child(Self::view_title(
+                "albums-title",
+                "Albums",
+                plural(total, "album"),
+                cx,
+            ))
+            .child(self.album_sort_menu(sort, cx))
+            .child(
+                div()
+                    .flex()
+                    .gap(rems(0.125))
+                    .child(with_tooltip(
+                        icon_button(
+                            "albums-view-grid",
+                            IconName::LayoutGrid,
+                            "Grid",
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .selected(view == AlbumView::Grid)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.set_album_view(AlbumView::Grid, cx)),
+                        ),
+                        "Grid",
+                    ))
+                    .child(with_tooltip(
+                        icon_button(
+                            "albums-view-list",
+                            IconName::List,
+                            "List",
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .selected(view == AlbumView::List)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.set_album_view(AlbumView::List, cx)),
+                        ),
+                        "List",
+                    )),
+            );
+        let body = match view {
+            AlbumView::Grid => self.render_album_grid("albums", sort, window, cx),
+            AlbumView::List => self.render_album_rows(sort, cx),
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn album_sort_menu(&self, sort: AlbumSort, cx: &mut Context<Self>) -> Popover {
+        let this = cx.entity().downgrade();
+        let trigger = button("album-sort", "", ButtonVariant::Secondary, cx)
+            .accessibility_label(format!("Sort by {}", sort.label()))
+            .child(format!("Sort: {}", sort.label()))
+            .child(icon(IconName::ChevronDown).size(rems(0.75)));
+        let items = AlbumSort::ALL
+            .iter()
+            .map(|&option| MenuItem::new(option.label()).checked(option == sort))
+            .collect();
+        menu(
+            "album-sort-menu",
+            MenuTrigger(trigger.into_any_element()),
+            items,
+            move |index, _, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_album_sort(AlbumSort::ALL[index], cx)
+                });
+            },
+        )
+    }
+
+    fn set_album_sort(&mut self, sort: AlbumSort, cx: &mut Context<Self>) {
+        self.prefs.album_sort = sort;
+        AppConfig::update(|c| c.album_sort = sort);
+        cx.notify();
+    }
+
+    fn set_album_view(&mut self, view: AlbumView, cx: &mut Context<Self>) {
+        self.prefs.album_view = view;
+        AppConfig::update(|c| c.album_view = view);
+        cx.notify();
     }
 
     fn render_album_grid(
         &mut self,
         id: &'static str,
+        sort: AlbumSort,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (columns, gap) = Self::grid_columns(window);
+        let (columns, gap, card) = Self::grid_columns(window);
         let total = self.library.album_total();
         let rows = total.div_ceil(columns);
         uniform_list(
@@ -1390,7 +1623,7 @@ impl Omamusic {
                     .map(|row| {
                         let start = row * columns;
                         let end = (start + columns).min(total);
-                        let albums = this.library.album_page(start, end - start);
+                        let albums = this.library.album_page(start, end - start, sort);
                         div()
                             .flex()
                             .gap(gap)
@@ -1398,7 +1631,7 @@ impl Omamusic {
                             .pt(gap)
                             .children((start..end).map(|idx| {
                                 let album = albums.get(idx - start).cloned().unwrap_or_default();
-                                this.album_card(&album, idx, cx)
+                                this.album_card(&album, "album", idx, card, cx)
                             }))
                     })
                     .collect::<Vec<_>>()
@@ -1417,7 +1650,7 @@ impl Omamusic {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (columns, gap) = Self::grid_columns(window);
+        let (columns, gap, card) = Self::grid_columns(window);
         let albums: Arc<[AlbumSummary]> = albums.into();
         let rows = albums.len().div_ceil(columns);
         uniform_list(
@@ -1429,7 +1662,8 @@ impl Omamusic {
                         let start = row * columns;
                         let end = (start + columns).min(albums.len());
                         div().flex().gap(gap).px(gap).pt(gap).children(
-                            (start..end).map(|idx| this.album_card(&albums[idx], idx, cx)),
+                            (start..end)
+                                .map(|idx| this.album_card(&albums[idx], "album", idx, card, cx)),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1441,27 +1675,90 @@ impl Omamusic {
         .into_any_element()
     }
 
-    fn album_card(&self, a: &AlbumSummary, idx: usize, cx: &mut Context<Self>) -> Popover {
+    fn album_menu(
+        menu_id: ElementId,
+        trigger: impl IntoElement,
+        album: &AlbumSummary,
+        cx: &mut Context<Self>,
+    ) -> Popover {
+        let key = album.id.clone();
+        let artist = album.artist.clone();
+        Self::context_menu(
+            menu_id,
+            trigger,
+            ALBUM_ACTIONS,
+            move |this, action, cx| match action {
+                RowAction::GoToArtist => this.navigate(Page::Artist(artist.clone()), cx),
+                _ => this.tracks_action(action, &TrackList::Album(key.clone()), cx),
+            },
+            cx,
+        )
+    }
+
+    fn album_card(
+        &self,
+        a: &AlbumSummary,
+        id: &'static str,
+        idx: usize,
+        size: f32,
+        cx: &mut Context<Self>,
+    ) -> Popover {
         let theme = cx.omarchy().clone();
-        let id = a.id.clone();
-        let menu_id = a.id.clone();
-        let n = a.track_count;
-        let count = format!("{n} song{}", if n == 1 { "" } else { "s" });
-        let artist = a.artist.clone();
+        let key = a.id.clone();
+        let play_key = a.id.clone();
+        let group: SharedString = format!("{id}-{idx}").into();
+        let subtitle = if a.year > 0 {
+            format!("{} · {}", a.artist, a.year)
+        } else {
+            a.artist.clone()
+        };
         let card = div()
-            .id(("album", idx))
-            .w(rems(10.))
+            .id((id, idx))
+            .test_support()
+            .aria_label(a.title.clone())
+            .group(group.clone())
+            .w(px(size))
+            .flex_none()
             .flex()
             .flex_col()
-            .gap(rems(0.375))
-            .p(rems(0.5))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.background)
-            .hover(|s| s.bg(theme.hover_fill()))
+            .gap(rems(0.125))
             .cursor_pointer()
-            .child(self.badged_cover(&a.id, a.unmatched, 128., &a.title, cx))
-            .on_click(cx.listener(move |this, _, _, cx| this.navigate(Page::Album(id.clone()), cx)))
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.navigate(Page::Album(key.clone()), cx)),
+            )
+            .child(
+                div()
+                    .relative()
+                    .mb(rems(0.375))
+                    .child(self.badged_cover(&a.id, a.unmatched, size, &a.title, cx))
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("album-play-{}", a.id).into()))
+                            .test_support()
+                            .aria_label(format!("Play {}", a.title))
+                            .absolute()
+                            .right(rems(0.5))
+                            .bottom(rems(0.5))
+                            .size(rems(2.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme.accent)
+                            .text_color(theme.background)
+                            .opacity(0.)
+                            .group_hover(group, |s| s.opacity(1.))
+                            .child(icon(IconName::Play).size(rems(0.875)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.tracks_action(
+                                    RowAction::Play,
+                                    &TrackList::Album(play_key.clone()),
+                                    cx,
+                                );
+                            })),
+                    ),
+            )
             .child(
                 div()
                     .text_size(rems(0.75))
@@ -1474,24 +1771,100 @@ impl Omamusic {
                     .text_size(rems(0.6875))
                     .text_color(theme.secondary)
                     .truncate()
-                    .child(a.artist.clone()),
+                    .child(subtitle),
+            );
+        Self::album_menu(
+            ElementId::Name(format!("{id}-menu-{idx}").into()),
+            card,
+            a,
+            cx,
+        )
+    }
+
+    fn render_album_rows(&mut self, sort: AlbumSort, cx: &mut Context<Self>) -> AnyElement {
+        let total = self.library.album_total();
+        uniform_list(
+            "album-rows",
+            total,
+            cx.processor(move |this, range: Range<usize>, _, cx| {
+                let start = range.start;
+                let albums = this.library.album_page(start, range.len(), sort);
+                range
+                    .map(|idx| {
+                        let album = albums.get(idx - start).cloned().unwrap_or_default();
+                        this.album_row(&album, idx, cx)
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element()
+    }
+
+    fn album_row(&self, a: &AlbumSummary, idx: usize, cx: &mut Context<Self>) -> Popover {
+        let theme = cx.omarchy().clone();
+        let key = a.id.clone();
+        let year = if a.year > 0 {
+            a.year.to_string()
+        } else {
+            String::new()
+        };
+        let cell = |width: f32, text: String| {
+            div()
+                .w(rems(width))
+                .flex_shrink_0()
+                .text_size(rems(0.6875))
+                .text_color(theme.secondary)
+                .truncate()
+                .child(text)
+        };
+        let row = div()
+            .id(("album-row", idx))
+            .test_support()
+            .aria_label(a.title.clone())
+            .flex()
+            .items_center()
+            .gap(rems(0.75))
+            .px(rems(0.75))
+            .py(rems(0.375))
+            .border_b_1()
+            .border_color(theme.border)
+            .hover(|s| s.bg(theme.hover_fill()))
+            .cursor_pointer()
+            .child(self.badged_cover(&a.id, a.unmatched, 36., &a.title, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .flex_grow(TITLE_GROW)
+                    .min_w_0()
+                    .text_size(rems(0.75))
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(a.title.clone()),
             )
             .child(
                 div()
+                    .flex_1()
+                    .max_w(rems(SECONDARY_MAX_W))
+                    .min_w_0()
                     .text_size(rems(0.6875))
                     .text_color(theme.secondary)
-                    .child(count),
+                    .truncate()
+                    .child(a.artist.clone()),
+            )
+            .child(cell(3., year))
+            .child(cell(4.5, plural(a.track_count, "song")))
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.navigate(Page::Album(key.clone()), cx)),
             );
-        Self::context_menu(
-            ("album-menu", idx),
-            card,
-            ALBUM_ACTIONS,
-            move |this, action, cx| match action {
-                RowAction::GoToArtist => this.navigate(Page::Artist(artist.clone()), cx),
-                _ => this.tracks_action(action, &TrackList::Album(menu_id.clone()), cx),
-            },
+        Self::album_menu(
+            ElementId::Name(format!("album-row-menu-{idx}").into()),
+            row,
+            a,
             cx,
         )
+        .w_full()
     }
 
     fn render_artist_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1514,7 +1887,6 @@ impl Omamusic {
         .min_h_0()
         .into_any_element()
     }
-
     fn artist_row(&self, idx: usize, entry: &ArtistEntry, cx: &mut Context<Self>) -> Popover {
         let theme = cx.omarchy().clone();
         let an = entry.album_count;
@@ -1570,10 +1942,11 @@ impl Omamusic {
             cx.processor(move |this, range: Range<usize>, _, cx| {
                 let start = range.start;
                 let tracks = this.library.track_page(start, range.len());
+                let query = this.library.query();
                 range
                     .map(|i| {
                         let track = tracks.get(i - start).cloned().unwrap_or_default();
-                        this.song_row(i, &track, cx)
+                        this.song_row(i, &track, &query, cx)
                     })
                     .collect::<Vec<_>>()
             }),
@@ -1583,16 +1956,13 @@ impl Omamusic {
         .into_any_element()
     }
 
-    fn song_row(&self, i: usize, t: &Track, cx: &mut Context<Self>) -> Popover {
+    fn song_row(&self, i: usize, t: &Track, query: &str, cx: &mut Context<Self>) -> Popover {
         let theme = cx.omarchy().clone();
         let bg = if i.is_multiple_of(2) {
             theme.background
         } else {
             theme.hover_fill()
         };
-        // Column layout priority: the title dominates and keeps its share on
-        // narrow screens, while the artist column grows from nothing and caps,
-        // so it truncates before the song name does.
         let cell = |width: f32, text: String| {
             div()
                 .w(rems(width))
@@ -1631,26 +2001,30 @@ impl Omamusic {
                     .text_size(rems(0.75))
                     .text_color(theme.foreground)
                     .truncate()
-                    .child(t.title.clone()),
+                    .child(highlighted(&t.title, query, theme.accent)),
             )
             .child(side_cell(t.artist.clone()))
             .child(cell(3., format_time(t.duration)));
         self.track_row("song", i, TrackList::Songs, false, row, cx)
     }
 
-    fn render_album_detail(&mut self, album: &Album, cx: &mut Context<Self>) -> AnyElement {
+    fn render_album_detail(
+        &mut self,
+        album: &Album,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.omarchy().clone();
         let total = album.tracks.iter().map(|t| t.duration).sum::<f64>();
-        let n = album.tracks.len();
-        let subtitle = [
-            album.artist.clone(),
+        let meta = [
             if album.year > 0 {
                 album.year.to_string()
             } else {
                 String::new()
             },
-            format!("{n} song{}", if n == 1 { "" } else { "s" }),
-            format_time(total),
+            album.genre.clone(),
+            plural(album.tracks.len(), "song"),
+            format_minutes(total),
         ]
         .into_iter()
         .filter(|part| !part.is_empty())
@@ -1670,152 +2044,635 @@ impl Omamusic {
                 cx.notify();
             }
         };
+        let linkable = !album.artist.is_empty() && album.artist != VARIOUS_ARTISTS;
+        let more: Vec<AlbumSummary> = if linkable {
+            self.library
+                .artist_albums(&album.artist)
+                .into_iter()
+                .filter(|other| other.id != album.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (columns, gap, card) = Self::grid_columns(window);
+        let artist_label: AnyElement = if linkable {
+            let name = album.artist.clone();
+            button(
+                "album-artist",
+                album.artist.clone(),
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .px_0()
+            .text_size(rems(0.875))
+            .text_color(theme.accent)
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.navigate(Page::Artist(name.clone()), cx)),
+            )
+            .into_any_element()
+        } else {
+            div()
+                .text_size(rems(0.875))
+                .text_color(theme.foreground)
+                .child(album.artist.clone())
+                .into_any_element()
+        };
+        let more_tracks = album.tracks.clone();
+        let more_menu = Self::action_menu(
+            "album-more-menu",
+            with_tooltip(
+                icon_button(
+                    "album-more",
+                    IconName::Ellipsis,
+                    "More",
+                    ButtonVariant::Secondary,
+                    cx,
+                ),
+                "More",
+            ),
+            ALBUM_MORE_ACTIONS,
+            move |this, action, cx| {
+                this.tracks_action(action, &TrackList::Loaded(more_tracks.clone()), cx)
+            },
+            cx,
+        );
+        let header = div()
+            .flex()
+            .items_end()
+            .gap(rems(1.25))
+            .child(self.badged_cover(&album.id, album.unmatched, 200., &album.title, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.25))
+                    .child(
+                        div()
+                            .text_size(rems(0.625))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.secondary)
+                            .child("ALBUM"),
+                    )
+                    .child(
+                        div()
+                            .id("album-title")
+                            .test_support()
+                            .aria_label(album.title.clone())
+                            .text_size(rems(1.75))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child(album.title.clone()),
+                    )
+                    .child(div().flex().child(artist_label))
+                    .child(
+                        div()
+                            .id("album-meta")
+                            .test_support()
+                            .aria_label(meta.clone())
+                            .text_size(rems(0.75))
+                            .text_color(theme.secondary)
+                            .child(meta),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(rems(0.5))
+                            .pt(rems(0.5))
+                            .child(
+                                button("play-album", "", ButtonVariant::Primary, cx)
+                                    .accessibility_label("Play")
+                                    .child(icon(IconName::Play).size(rems(0.75)))
+                                    .child("Play")
+                                    .on_click(cx.listener(play(false, album.tracks.clone()))),
+                            )
+                            .child(
+                                button("shuffle-album", "", ButtonVariant::Secondary, cx)
+                                    .accessibility_label("Shuffle")
+                                    .child(icon(IconName::Shuffle).size(rems(0.75)))
+                                    .child("Shuffle")
+                                    .on_click(cx.listener(play(true, album.tracks.clone()))),
+                            )
+                            .child(more_menu),
+                    ),
+            );
+        let rows = album.tracks.iter().enumerate().map(|(i, t)| {
+            let is_current = current.as_ref().is_some_and(|c| c.path == t.path);
+            let number = if is_current {
+                icon(if playing {
+                    IconName::Volume2
+                } else {
+                    IconName::Volume
+                })
+                .size(rems(0.875))
+                .text_color(theme.accent)
+                .into_any_element()
+            } else if t.track_number > 0 {
+                t.track_number.to_string().into_any_element()
+            } else {
+                "".into_any_element()
+            };
+            let group: SharedString = format!("album-track-{i}").into();
+            let tracks = album.tracks.clone();
+            let row = div()
+                .id(("album-track", i))
+                .group(group.clone())
+                .flex()
+                .items_center()
+                .gap(rems(0.75))
+                .px(rems(0.5))
+                .py(rems(0.375))
+                .border_b_1()
+                .border_color(theme.border)
+                .hover(|s| s.bg(theme.hover_fill()))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .relative()
+                        .w(rems(2.))
+                        .flex()
+                        .justify_end()
+                        .text_color(theme.secondary)
+                        .child(
+                            div()
+                                .group_hover(group.clone(), |s| s.opacity(0.))
+                                .child(number),
+                        )
+                        .child(
+                            div()
+                                .id(("album-track-play", i))
+                                .test_support()
+                                .aria_label(format!("Play {}", t.title))
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .right_0()
+                                .flex()
+                                .items_center()
+                                .text_color(theme.foreground)
+                                .opacity(0.)
+                                .group_hover(group, |s| s.opacity(1.))
+                                .child(icon(IconName::Play).size(rems(0.875)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.player.play(tracks.to_vec(), i);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .gap(rems(0.5))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(if is_current {
+                                    theme.accent
+                                } else {
+                                    theme.foreground
+                                })
+                                .child(t.title.clone()),
+                        )
+                        .when(t.artist != album.artist, |d| {
+                            d.child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.secondary)
+                                    .child(t.artist.clone()),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .text_color(theme.secondary)
+                        .child(format_time(t.duration)),
+                );
+            self.track_row(
+                "album-track-menu",
+                i,
+                TrackList::Loaded(album.tracks.clone()),
+                false,
+                row,
+                cx,
+            )
+        });
+        let rows: Vec<Popover> = rows.collect();
+        let more_section =
+            (!more.is_empty()).then(|| {
+                let name = album.artist.clone();
+                let see_all = button("album-more-by-all", "See All", ButtonVariant::Secondary, cx)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.navigate(Page::Artist(name.clone()), cx)
+                    }));
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.5))
+                    .pt(rems(0.5))
+                    .child(Self::section_heading(
+                        format!("More by {}", album.artist),
+                        Some(see_all),
+                        cx,
+                    ))
+                    .child(
+                        div().flex().gap(gap).overflow_hidden().children(
+                            more.iter()
+                                .take(columns)
+                                .enumerate()
+                                .map(|(i, a)| self.album_card(a, "more-by", i, card, cx))
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+            });
         div()
             .id("album-detail-scroll")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .p(rems(1.))
+            .p(rems(1.25))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(rems(0.75))
+                    .gap(rems(1.25))
+                    .child(header)
+                    .child(div().flex().flex_col().text_size(rems(0.75)).children(rows))
+                    .children(more_section),
+            )
+            .into_any_element()
+    }
+
+    fn current_top_result(&self) -> Option<TopResult> {
+        let query = self.library.query();
+        let artists = self.library.artist_page(0, SEARCH_TOP_CANDIDATES);
+        let albums = self
+            .library
+            .album_page(0, SEARCH_TOP_CANDIDATES, self.prefs.album_sort);
+        let tracks = self.library.track_page(0, SEARCH_TOP_CANDIDATES);
+        top_result(&query, &artists, &albums, &tracks)
+    }
+
+    fn play_top_result(&mut self, cx: &mut Context<Self>) {
+        if self.searching {
+            self.apply_pending_query(cx);
+        }
+        if self.library.snapshot().filter.is_none() {
+            return;
+        }
+        match self.current_top_result() {
+            Some(TopResult::Artist(artist)) => {
+                self.tracks_action(RowAction::Play, &TrackList::Artist(artist.name), cx)
+            }
+            Some(TopResult::Album(album)) => {
+                self.tracks_action(RowAction::Play, &TrackList::Album(album.id), cx)
+            }
+            Some(TopResult::Track(index, _)) => {
+                self.player.play(self.library.tracks_for_play(), index);
+                cx.notify();
+            }
+            None => {}
+        }
+    }
+
+    fn open_top_result(&mut self, top: &TopResult, cx: &mut Context<Self>) {
+        match top {
+            TopResult::Artist(artist) => self.navigate(Page::Artist(artist.name.clone()), cx),
+            TopResult::Album(album) => self.navigate(Page::Album(album.id.clone()), cx),
+            TopResult::Track(index, _) => {
+                self.player.play(self.library.tracks_for_play(), *index);
+                cx.notify();
+            }
+        }
+    }
+
+    fn set_search_scope(&mut self, scope: SearchScope, cx: &mut Context<Self>) {
+        self.search_scope = scope;
+        self.clear_selection();
+        cx.notify();
+    }
+
+    fn render_search(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.omarchy().clone();
+        let query = self.library.query().trim().to_string();
+        let songs = self.library.track_total();
+        let albums = self.library.album_total();
+        let artists = self.library.artist_total();
+        let total = songs + albums + artists;
+        if total == 0 {
+            return empty_state("No Results", format!("Nothing matches “{query}”."), cx)
+                .into_any_element();
+        }
+        let scope = self.search_scope;
+        let chips: Vec<Button> = [
+            (
+                "search-scope-all",
+                "All".to_string(),
+                SearchScope::All,
+                total,
+            ),
+            (
+                "search-scope-songs",
+                format!("Songs · {songs}"),
+                SearchScope::Songs,
+                songs,
+            ),
+            (
+                "search-scope-albums",
+                format!("Albums · {albums}"),
+                SearchScope::Albums,
+                albums,
+            ),
+            (
+                "search-scope-artists",
+                format!("Artists · {artists}"),
+                SearchScope::Artists,
+                artists,
+            ),
+        ]
+        .into_iter()
+        .map(|(id, label, option, count)| {
+            button(id, label, ButtonVariant::Secondary, cx)
+                .selected(scope == option)
+                .disabled(count == 0)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_search_scope(option, cx)))
+        })
+        .collect();
+        let summary = format!("{} for “{query}”", plural(total, "result"));
+        let header = div()
+            .flex()
+            .flex_col()
+            .gap(rems(0.5))
+            .px(rems(0.75))
+            .pt(rems(0.75))
+            .pb(rems(0.5))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap(rems(0.5))
                     .child(
                         div()
-                            .flex()
-                            .items_end()
-                            .gap(rems(1.))
-                            .child(self.badged_cover(
-                                &album.id,
-                                album.unmatched,
-                                176.,
-                                &album.title,
-                                cx,
-                            ))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(rems(0.25))
-                                    .child(
-                                        div()
-                                            .text_size(rems(1.125))
-                                            .text_color(theme.foreground)
-                                            .child(album.title.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(rems(0.75))
-                                            .text_color(theme.secondary)
-                                            .child(subtitle),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .gap(rems(0.5))
-                                            .child(
-                                                button(
-                                                    "play-album",
-                                                    "Play",
-                                                    ButtonVariant::Primary,
-                                                    cx,
-                                                )
-                                                .on_click(
-                                                    cx.listener(play(false, album.tracks.clone())),
-                                                ),
-                                            )
-                                            .child(
-                                                button(
-                                                    "shuffle-album",
-                                                    "Shuffle",
-                                                    ButtonVariant::Secondary,
-                                                    cx,
-                                                )
-                                                .on_click(
-                                                    cx.listener(play(true, album.tracks.clone())),
-                                                ),
-                                            )
-                                            .child(
-                                                button(
-                                                    "back",
-                                                    "Back",
-                                                    ButtonVariant::Secondary,
-                                                    cx,
-                                                )
-                                                .on_click(
-                                                    cx.listener(|this, _, _, cx| this.back(cx)),
-                                                ),
-                                            ),
-                                    ),
-                            ),
+                            .text_size(rems(1.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child("Search"),
+                    )
+                    .child(
+                        div()
+                            .id("search-summary")
+                            .test_support()
+                            .aria_label(summary.clone())
+                            .min_w_0()
+                            .truncate()
+                            .text_size(rems(0.6875))
+                            .text_color(theme.secondary)
+                            .child(summary),
+                    ),
+            )
+            .child(div().flex().flex_wrap().gap(rems(0.25)).children(chips));
+        let body = match scope {
+            SearchScope::All => self.render_search_overview(&query, window, cx),
+            SearchScope::Songs => self.render_song_list(cx),
+            SearchScope::Albums => {
+                self.render_album_grid("search-albums", self.prefs.album_sort, window, cx)
+            }
+            SearchScope::Artists => self.render_artist_list(cx),
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_search_overview(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (columns, gap, card) = Self::grid_columns(window);
+        let song_total = self.library.track_total();
+        let album_total = self.library.album_total();
+        let artist_total = self.library.artist_total();
+        let tracks = self.library.track_page(0, SEARCH_PREVIEW_SONGS);
+        let albums = self.library.album_page(0, columns, self.prefs.album_sort);
+        let artists = self.library.artist_page(0, SEARCH_PREVIEW_ARTISTS);
+        let top = self.current_top_result();
+        let see_all = |id: &'static str, scope: SearchScope, cx: &mut Context<Self>| {
+            button(id, "See All", ButtonVariant::Secondary, cx)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_search_scope(scope, cx)))
+        };
+        let mut sections: Vec<AnyElement> = Vec::new();
+        if let Some(top) = top {
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.5))
+                    .px(rems(0.75))
+                    .child(Self::section_heading("Top Result", None, cx))
+                    .child(self.top_result_card(top, query, cx))
+                    .into_any_element(),
+            );
+        }
+        if !tracks.is_empty() {
+            let more = (song_total > tracks.len())
+                .then(|| see_all("search-songs-all", SearchScope::Songs, cx));
+            let rows: Vec<Popover> = tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| self.song_row(i, t, query, cx))
+                .collect();
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.25))
+                    .child(
+                        div()
+                            .px(rems(0.75))
+                            .child(Self::section_heading("Songs", more, cx)),
+                    )
+                    .child(div().flex().flex_col().children(rows))
+                    .into_any_element(),
+            );
+        }
+        if !albums.is_empty() {
+            let more = (album_total > albums.len())
+                .then(|| see_all("search-albums-all", SearchScope::Albums, cx));
+            let cards: Vec<Popover> = albums
+                .iter()
+                .enumerate()
+                .map(|(i, a)| self.album_card(a, "search-album", i, card, cx))
+                .collect();
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.5))
+                    .child(
+                        div()
+                            .px(rems(0.75))
+                            .child(Self::section_heading("Albums", more, cx)),
                     )
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .children(album.tracks.iter().enumerate().map(|(i, t)| {
-                                let is_current = current.as_ref().is_some_and(|c| c.path == t.path);
-                                let number = if is_current {
-                                    icon(if playing {
-                                        IconName::Volume2
-                                    } else {
-                                        IconName::Volume
-                                    })
-                                    .size(rems(0.875))
-                                    .text_color(theme.accent)
-                                    .into_any_element()
-                                } else if t.track_number > 0 {
-                                    t.track_number.to_string().into_any_element()
-                                } else {
-                                    "".into_any_element()
-                                };
-                                let row = div()
-                                    .id(("album-track", i))
-                                    .flex()
-                                    .items_center()
-                                    .gap(rems(0.75))
-                                    .px(rems(0.5))
-                                    .py(rems(0.375))
-                                    .hover(|s| s.bg(theme.hover_fill()))
-                                    .cursor_pointer()
-                                    .child(
-                                        div()
-                                            .w(rems(2.))
-                                            .flex()
-                                            .justify_end()
-                                            .text_color(theme.secondary)
-                                            .child(number),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .flex()
-                                            .gap(rems(0.5))
-                                            .text_color(theme.foreground)
-                                            .child(t.title.clone())
-                                            .when(t.artist != album.artist, |d| {
-                                                d.child(
-                                                    div()
-                                                        .text_color(theme.secondary)
-                                                        .child(t.artist.clone()),
-                                                )
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(theme.secondary)
-                                            .child(format_time(t.duration)),
-                                    );
-                                self.track_row(
-                                    "album-track-menu",
-                                    i,
-                                    TrackList::Loaded(album.tracks.clone()),
-                                    false,
-                                    row,
-                                    cx,
-                                )
+                            .gap(gap)
+                            .px(gap)
+                            .overflow_hidden()
+                            .children(cards),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if !artists.is_empty() {
+            let more = (artist_total > artists.len())
+                .then(|| see_all("search-artists-all", SearchScope::Artists, cx));
+            let rows: Vec<Popover> = artists
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| self.artist_row(i, entry, cx))
+                .collect();
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.25))
+                    .child(
+                        div()
+                            .px(rems(0.75))
+                            .child(Self::section_heading("Artists", more, cx)),
+                    )
+                    .child(div().flex().flex_col().children(rows))
+                    .into_any_element(),
+            );
+        }
+        div()
+            .id("search-overview")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .py(rems(0.75))
+            .child(div().flex().flex_col().gap(rems(1.25)).children(sections))
+            .into_any_element()
+    }
+
+    fn top_result_card(&self, top: TopResult, query: &str, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.omarchy().clone();
+        let (kind, name, detail, cover_id) = match &top {
+            TopResult::Artist(artist) => (
+                "ARTIST",
+                artist.name.clone(),
+                format!(
+                    "{} · {}",
+                    plural(artist.album_count, "album"),
+                    plural(artist.song_count, "song")
+                ),
+                artist.cover_album_id.clone(),
+            ),
+            TopResult::Album(album) => (
+                "ALBUM",
+                album.title.clone(),
+                if album.year > 0 {
+                    format!("{} · {}", album.artist, album.year)
+                } else {
+                    album.artist.clone()
+                },
+                Some(album.id.clone()),
+            ),
+            TopResult::Track(_, track) => (
+                "SONG",
+                track.title.clone(),
+                format!("{} · {}", track.artist, track.album),
+                Some(track.album_id.clone()),
+            ),
+        };
+        let open = top.clone();
+        div()
+            .id("search-top-result")
+            .test_support()
+            .aria_label(name.clone())
+            .flex()
+            .items_center()
+            .gap(rems(1.))
+            .p(rems(0.875))
+            .w(rems(28.))
+            .max_w_full()
+            .border_1()
+            .border_color(theme.border)
+            .hover(|s| s.bg(theme.hover_fill()))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.open_top_result(&open, cx)))
+            .child(self.cover(cover_id.as_deref(), 88., &name, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.25))
+                    .child(
+                        div()
+                            .text_size(rems(0.625))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.secondary)
+                            .child(kind),
+                    )
+                    .child(
+                        div()
+                            .text_size(rems(1.125))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .truncate()
+                            .child(highlighted(&name, query, theme.accent)),
+                    )
+                    .child(
+                        div()
+                            .text_size(rems(0.75))
+                            .text_color(theme.secondary)
+                            .truncate()
+                            .child(detail),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(rems(0.375))
+                    .child(
+                        button("search-top-play", "", ButtonVariant::Primary, cx)
+                            .accessibility_label(format!("Play {name}"))
+                            .child(icon(IconName::Play).size(rems(0.75)))
+                            .child("Play")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.play_top_result(cx);
                             })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(rems(0.25))
+                            .text_size(rems(0.625))
+                            .text_color(theme.secondary)
+                            .child("or press")
+                            .child(keycap("Enter", cx)),
                     ),
             )
             .into_any_element()
@@ -2400,6 +3257,16 @@ mod tests {
             .map(|b| visualizer_height(0.2, 0.4, b))
             .sum::<f32>();
         assert!(loud > quiet, "the strip as a whole reacts to the level");
+    }
+
+    #[test]
+    fn album_length_reads_in_minutes_then_hours() {
+        assert_eq!(format_minutes(0.0), "0 min");
+        assert_eq!(format_minutes(200.0), "3 min");
+        assert_eq!(format_minutes(42.0 * 60.0 + 20.0), "42 min");
+        assert_eq!(format_minutes(72.0 * 60.0), "1 hr 12 min");
+        assert_eq!(plural(1, "song"), "1 song");
+        assert_eq!(plural(2, "song"), "2 songs");
     }
 
     #[test]

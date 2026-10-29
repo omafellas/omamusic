@@ -7,7 +7,7 @@ use crate::db::{self, Db};
 use crate::index;
 use crate::lookup::http::UreqHttp;
 use crate::lookup::worker::{Wake, Worker, WorkerDeps};
-use crate::models::{Album, AlbumSummary, ArtistEntry, Track};
+use crate::models::{Album, AlbumSort, AlbumSummary, ArtistEntry, Track};
 use crate::search;
 use anyhow::{Context, Result};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -458,7 +458,7 @@ impl Library {
             .map_or(s.album_count, |f| f.album_keys.len())
     }
 
-    pub fn album_page(&self, offset: usize, limit: usize) -> Vec<AlbumSummary> {
+    pub fn album_page(&self, offset: usize, limit: usize, sort: AlbumSort) -> Vec<AlbumSummary> {
         if limit == 0 {
             return Vec::new();
         }
@@ -472,7 +472,9 @@ impl Library {
                 self.db
                     .read(|conn| db::albums_by_keys(conn, &f.album_keys[offset..end]))
             }
-            None => self.db.read(|conn| db::albums_page(conn, offset, limit)),
+            None => self
+                .db
+                .read(|conn| db::albums_page(conn, offset, limit, sort)),
         };
         result.unwrap_or_default()
     }
@@ -616,7 +618,7 @@ mod tests {
         assert_eq!(library.track_at(0).unwrap().title, "Moon River");
         assert_eq!(library.track_page(0, 2).len(), 2);
         assert_eq!(library.track_page(2, 2).len(), 1);
-        assert_eq!(library.album_page(0, 10).len(), 2);
+        assert_eq!(library.album_page(0, 10, AlbumSort::Artist).len(), 2);
         assert_eq!(library.artist_page(0, 10)[0].name, "Andy");
 
         // BM25 filtering narrows all three views.
@@ -628,7 +630,7 @@ mod tests {
         assert_eq!(library.artist_page(0, 10)[0].name, "Kraftwerk");
 
         // Album and artist detail pages read their tracks from SQLite.
-        let key = library.album_page(0, 1)[0].id.clone();
+        let key = library.album_page(0, 1, AlbumSort::Artist)[0].id.clone();
         let album = library.album_detail(&key).unwrap();
         assert_eq!(album.tracks.len(), 2);
         assert_eq!(library.album_tracks(&key).len(), 2);

@@ -1,3 +1,4 @@
+use crate::models::{AlbumSort, AlbumView};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -25,6 +26,8 @@ pub struct AppConfig {
     /// Empty disables fingerprinting; a build-time `OMAMUSIC_ACOUSTID_KEY`
     /// provides the default.
     pub acoustid_key: String,
+    pub album_sort: AlbumSort,
+    pub album_view: AlbumView,
 }
 
 impl Default for AppConfig {
@@ -40,6 +43,8 @@ impl Default for AppConfig {
             visual_effects: true,
             online_lookup: false,
             acoustid_key: default_acoustid_key(),
+            album_sort: AlbumSort::default(),
+            album_view: AlbumView::default(),
         }
     }
 }

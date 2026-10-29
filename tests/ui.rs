@@ -1,7 +1,7 @@
 //! UI smoke tests. Each test drives the production `Root` view in a headless
 //! window with the real key bindings and asserts the visible outcome.
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{px, Entity, Pixels, TestAppContext, VisualTestContext};
+use gpui_kit::{px, ElementId, Entity, Pixels, TestAppContext, VisualTestContext};
 use omamusic::lookup::http::FakeHttp;
 use omamusic::models::AlbumSummary;
 use omamusic::{AppConfig, Library, Omamusic, Player, Root};
@@ -68,6 +68,75 @@ impl Smoke<'_> {
             window.render_frame(cx);
             window.try_find(id).is_some()
         })
+    }
+
+    fn label_of(&mut self, id: impl Into<ElementId>) -> Option<String> {
+        let id = id.into();
+        self.cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.try_find(id)?.label().map(str::to_owned)
+        })
+    }
+
+    fn has(&mut self, id: impl Into<ElementId>) -> bool {
+        let id = id.into();
+        self.cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.try_find(id).is_some()
+        })
+    }
+
+    fn click_on(&mut self, id: impl Into<ElementId>) {
+        let id = id.into();
+        self.cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click(id, cx)
+        });
+        self.cx.run_until_parked();
+    }
+
+    fn play_with(&mut self, act: impl FnOnce(&mut gpui_kit::Window, &mut gpui_kit::App)) {
+        self.cx.update(|window, cx| {
+            window.render_frame(cx);
+            act(window, cx)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        self.cx.run_until_parked();
+    }
+
+    fn hover_on(&mut self, id: impl Into<ElementId>) {
+        let id = id.into();
+        self.cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.hover(id, cx)
+        });
+        self.cx.run_until_parked();
+    }
+
+    fn search(&mut self, text: &str) {
+        self.press("ctrl-f");
+        self.cx.update(|window, cx| window.input(text, cx));
+        self.cx.executor().advance_clock(Duration::from_millis(400));
+        self.cx.run_until_parked();
+    }
+
+    fn queued(&mut self) -> Vec<(String, String)> {
+        self.view.read_with(self.cx, |view, _| {
+            view.player
+                .queue()
+                .0
+                .iter()
+                .map(|t| (t.album_id.clone(), t.artist.clone()))
+                .collect()
+        })
+    }
+
+    fn saved(&self, key: &str) -> serde_json::Value {
+        let text = std::fs::read_to_string(self.config_dir.join("config.json")).unwrap_or_default();
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get(key).cloned())
+            .unwrap_or_default()
     }
 
     fn search_text(&mut self) -> String {
@@ -413,4 +482,193 @@ async fn saved_text_size_is_applied_on_start(cx: &mut TestAppContext) {
     let view = root.read_with(cx, |root, _| root.main().clone());
     assert_eq!(view.read_with(cx, |view, _| view.ui_scale()), 1.5);
     assert_eq!(cx.update(|window, _| window.rem_size()), px(24.0));
+}
+
+fn release(key: &str, title: &str, artist: &str, year: u32) -> AlbumSummary {
+    AlbumSummary {
+        id: key.to_string(),
+        title: title.to_string(),
+        artist: artist.to_string(),
+        year,
+        track_count: 1,
+        unmatched: false,
+    }
+}
+
+fn library_of(albums: &[AlbumSummary]) -> Arc<Library> {
+    let library = Arc::new(Library::empty());
+    for album in albums {
+        library.insert_album(album);
+    }
+    library
+}
+
+#[gpui_kit::test]
+async fn album_sort_menu_reorders_the_grid_and_persists(cx: &mut TestAppContext) {
+    let library = library_of(&[
+        release("z", "Zebra", "Exxótica", 1990),
+        release("a", "Alpha", "Exxótica", 2005),
+    ]);
+    let mut app = open_with(cx, library);
+    app.click("nav-albums");
+    assert_eq!(app.label_of(("album", 0usize)).as_deref(), Some("Zebra"));
+    assert_eq!(app.label("album-sort").as_deref(), Some("Sort by Artist"));
+
+    app.click("album-sort");
+    app.press("down");
+    app.press("enter");
+    assert_eq!(app.label("album-sort").as_deref(), Some("Sort by Title"));
+    assert_eq!(app.label_of(("album", 0usize)).as_deref(), Some("Alpha"));
+    assert_eq!(app.saved("album_sort"), "title");
+}
+
+#[gpui_kit::test]
+async fn album_view_toggle_switches_to_rows_and_persists(cx: &mut TestAppContext) {
+    let library = library_of(&[release("k", "Estranhos no Ninho", "Exxótica", 2002)]);
+    let mut app = open_with(cx, library);
+    app.click("nav-albums");
+    assert!(app.has(("album", 0usize)));
+    assert!(!app.has(("album-row", 0usize)));
+
+    app.click("albums-view-list");
+    assert_eq!(
+        app.label_of(("album-row", 0usize)).as_deref(),
+        Some("Estranhos no Ninho")
+    );
+    assert!(!app.has(("album", 0usize)));
+    assert_eq!(app.saved("album_view"), "list");
+
+    app.click("albums-view-grid");
+    assert!(app.has(("album", 0usize)));
+    assert_eq!(app.saved("album_view"), "grid");
+}
+
+#[gpui_kit::test]
+async fn album_card_play_button_plays_without_opening_the_album(cx: &mut TestAppContext) {
+    let library = library_of(&[release("k", "Estranhos no Ninho", "Exxótica", 2002)]);
+    let mut app = open_with(cx, library);
+    app.click("nav-albums");
+    app.hover_on(("album", 0usize));
+    app.play_with(|window, cx| window.click("album-play-k", cx));
+    assert_eq!(
+        app.queued(),
+        [("k".to_string(), "Exxótica".to_string())],
+        "the hover button queues the album"
+    );
+    assert!(!app.has("album-title"), "the click stays on the grid");
+}
+
+#[gpui_kit::test]
+async fn album_page_links_to_the_artist_and_other_albums(cx: &mut TestAppContext) {
+    let library = library_of(&[
+        release("k", "Estranhos no Ninho", "Exxótica", 2002),
+        release("k2", "Arquivo", "Exxótica", 2002),
+    ]);
+    let mut app = open_with(cx, library);
+    app.click("nav-albums");
+    assert!(!app.has("nav-back"), "no history on a top-level view");
+
+    app.click_on(("album", 0usize));
+    assert_eq!(app.label("album-title").as_deref(), Some("Arquivo"));
+    assert_eq!(
+        app.label("album-meta").as_deref(),
+        Some("2002 · 1 song · 3 min")
+    );
+    assert!(app.has("nav-back"));
+    assert_eq!(
+        app.label_of(("more-by", 0usize)).as_deref(),
+        Some("Estranhos no Ninho")
+    );
+
+    app.click_on(("more-by", 0usize));
+    assert_eq!(
+        app.label("album-title").as_deref(),
+        Some("Estranhos no Ninho")
+    );
+
+    app.click("album-artist");
+    assert_eq!(app.label("artist-title").as_deref(), Some("Exxótica"));
+
+    app.press("alt-left");
+    assert_eq!(
+        app.label("album-title").as_deref(),
+        Some("Estranhos no Ninho")
+    );
+
+    app.click("nav-back");
+    assert_eq!(app.label("album-title").as_deref(), Some("Arquivo"));
+    app.hover_on(("album-track", 0usize));
+    app.play_with(|window, cx| window.click(("album-track-play", 0usize), cx));
+    assert_eq!(app.queued(), [("k2".to_string(), "Exxótica".to_string())]);
+
+    app.click("nav-back");
+    assert!(!app.has("nav-back"));
+    assert!(app.has(("album", 0usize)), "back lands on the grid");
+}
+
+#[gpui_kit::test]
+async fn search_groups_results_and_enter_plays_the_top_result(cx: &mut TestAppContext) {
+    let library = library_of(&[
+        release("k", "Estranhos no Ninho", "Exxótica", 2002),
+        release("k2", "Arquivo", "Exxótica", 2002),
+        release("o", "Outro", "Banda", 2010),
+    ]);
+    let mut app = open_with(cx, library);
+    app.click("nav-albums");
+    app.search("exx");
+    assert_eq!(app.search_text(), "exx");
+    assert_eq!(
+        app.label("search-summary").as_deref(),
+        Some("5 results for “exx”")
+    );
+    assert_eq!(app.label("search-top-result").as_deref(), Some("Exxótica"));
+    assert_eq!(
+        app.label("search-scope-songs").as_deref(),
+        Some("Songs · 2")
+    );
+    assert_eq!(
+        app.label("search-scope-albums").as_deref(),
+        Some("Albums · 2")
+    );
+    assert_eq!(
+        app.label("search-scope-artists").as_deref(),
+        Some("Artists · 1")
+    );
+    assert!(
+        !app.has(("album", 0usize)),
+        "the Albums view gives way to search"
+    );
+
+    app.play_with(|window, cx| window.press("enter", cx));
+    let queued = app.queued();
+    assert_eq!(queued.len(), 2, "{queued:?}");
+    assert!(queued.iter().all(|(_, artist)| artist == "Exxótica"));
+}
+
+#[gpui_kit::test]
+async fn search_scopes_and_top_result_navigate_and_come_back(cx: &mut TestAppContext) {
+    let library = library_of(&[
+        release("k", "Estranhos no Ninho", "Exxótica", 2002),
+        release("o", "Outro", "Banda", 2010),
+    ]);
+    let mut app = open_with(cx, library);
+    app.search("exx");
+
+    app.click("search-scope-albums");
+    assert!(app.has(("album", 0usize)));
+    assert!(!app.has("search-top-result"));
+
+    app.click("search-scope-all");
+    app.click("search-top-result");
+    assert_eq!(app.label("artist-title").as_deref(), Some("Exxótica"));
+
+    app.click("nav-back");
+    assert!(app.has("search-top-result"), "back returns to the results");
+
+    app.click("nav-songs");
+    assert_eq!(app.search_text(), "");
+    assert!(
+        !app.has("search-summary"),
+        "a section click ends the search"
+    );
 }

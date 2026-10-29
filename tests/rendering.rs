@@ -170,6 +170,23 @@ mod pixels {
             count
         }
 
+        fn changed_in(&self, other: &Capture, bounds: Bounds<Pixels>) -> usize {
+            let (x0, y0) = (self.device(bounds.left()), self.device(bounds.top()));
+            let (x1, y1) = (
+                self.device(bounds.right()).min(self.width),
+                self.device(bounds.bottom()).min(self.height),
+            );
+            let mut count = 0;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if self.pixel(x, y) != other.pixel(x, y) {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+
         fn ink(&self) -> usize {
             self.ink_in(Bounds::new(
                 Default::default(),
@@ -262,10 +279,36 @@ mod pixels {
         plain.act(|window, cx| window.click("nav-albums", cx));
         let plain = plain.capture();
         assert!(
-            capture.ink_in(bounds) > plain.ink_in(bounds),
-            "the badge must add ink at {bounds:?}: {} vs {} without it",
-            capture.ink_in(bounds),
-            plain.ink_in(bounds)
+            capture.changed_in(&plain, bounds) > 0,
+            "the badge must paint over the cover at {bounds:?}"
+        );
+    }
+
+    fn hovering_an_album_paints_its_play_button() {
+        let library = Arc::new(Library::empty());
+        library.insert_album(&AlbumSummary {
+            id: "k".to_string(),
+            title: "Estranhos no Ninho".to_string(),
+            artist: "Exxótica".to_string(),
+            year: 2002,
+            track_count: 1,
+            unmatched: false,
+        });
+        let mut scene = Scene::open_with(library);
+        scene.act(|window, cx| window.click("nav-albums", cx));
+        let resting = scene.capture();
+        let button = scene.bounds("album-play-k");
+        scene.act(|window, cx| window.hover(("album", 0usize), cx));
+        let hovered = scene.capture();
+        assert!(
+            hovered.changed_in(&resting, button) > 0,
+            "hovering the card must reveal the play button at {button:?}"
+        );
+        let elsewhere = scene.bounds("nav-songs");
+        assert_eq!(
+            hovered.changed_in(&resting, elsewhere),
+            0,
+            "the hover must not repaint the sidebar"
         );
     }
 
@@ -282,7 +325,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 4] = [
+        let tests: [(&str, fn()); 5] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -293,6 +336,10 @@ mod pixels {
                 settings_draws_the_text_size_row,
             ),
             ("unmatched_badge_paints_ink", unmatched_badge_paints_ink),
+            (
+                "hovering_an_album_paints_its_play_button",
+                hovering_an_album_paints_its_play_button,
+            ),
         ];
         for (name, test) in tests {
             println!("running {name}");
