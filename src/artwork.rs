@@ -1,4 +1,3 @@
-use async_channel::{Receiver, Sender, TrySendError};
 use gpui_kit::RenderImage;
 use image::{Frame, RgbaImage};
 use parking_lot::{Condvar, Mutex};
@@ -46,7 +45,6 @@ struct Queue {
 pub struct ArtworkCache {
     inner: Arc<Mutex<Covers>>,
     queue: Arc<Queue>,
-    listeners: Arc<Mutex<Vec<Sender<()>>>>,
     provider: Arc<Mutex<Option<Provider>>>,
 }
 
@@ -140,25 +138,20 @@ impl ArtworkCache {
     pub fn with_workers(workers: usize) -> Self {
         let inner = Arc::new(Mutex::new(Covers::default()));
         let queue = Arc::new(Queue::default());
-        let listeners: Arc<Mutex<Vec<Sender<()>>>> = Arc::default();
         let provider: Arc<Mutex<Option<Provider>>> = Arc::default();
         for _ in 0..workers.max(1) {
             let alive = Arc::downgrade(&inner);
-            let (queue, listeners, provider) = (queue.clone(), listeners.clone(), provider.clone());
+            let (queue, provider) = (queue.clone(), provider.clone());
             std::thread::spawn(move || {
                 while let Some(key) = next_job(&queue, &alive) {
                     let Some(inner) = alive.upgrade() else { break };
                     work(&inner, &provider, key);
-                    listeners.lock().retain(|listener| {
-                        !matches!(listener.try_send(()), Err(TrySendError::Closed(_)))
-                    });
                 }
             });
         }
         Self {
             inner,
             queue,
-            listeners,
             provider,
         }
     }
@@ -195,9 +188,14 @@ impl ArtworkCache {
         self.queue.wake.notify_one();
     }
 
+    /// Thumbnails requested but not rendered yet. A view that got `None`
+    /// from [`cached`](Self::cached) polls this to know when to draw again.
+    pub fn pending_count(&self) -> usize {
+        self.inner.lock().pending.len()
+    }
+
     /// The thumbnail if it is ready. Otherwise the request moves to the front
-    /// of the queue and `None` comes back at once; subscribers are woken when
-    /// it lands.
+    /// of the queue and `None` comes back at once.
     pub fn cached(&self, album_id: &str, size: u32) -> Option<Thumbnail> {
         let key = (album_id.to_string(), size);
         let mut covers = self.inner.lock();
@@ -224,12 +222,6 @@ impl ArtworkCache {
     pub fn thumbnail(&self, album_id: &str, size: u32) -> Option<RgbaImage> {
         let raw = load_raw(&self.inner, &self.provider, album_id)?;
         decode(&raw, size)
-    }
-
-    pub fn subscribe(&self) -> Receiver<()> {
-        let (sender, receiver) = async_channel::bounded(1);
-        self.listeners.lock().push(sender);
-        receiver
     }
 }
 

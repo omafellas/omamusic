@@ -26,9 +26,11 @@ use gpui_omarchy::{
     IconName, MenuItem,
 };
 use rand::Rng;
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,6 +49,7 @@ pub struct Omamusic {
     rescan_notify: Option<(String, f32)>,
     /// Bumped for every toast; makes an older fade task ignore a replaced toast.
     notify_seq: u64,
+    cover_poll: CoverPoll,
     prev_scanning: bool,
     /// Music-reactive bottom strip; see `Visualizer`.
     visualizer: Entity<Visualizer>,
@@ -308,6 +311,30 @@ impl Selectable for MenuTrigger {
     }
 }
 
+/// Re-renders a view while cover thumbnails it asked for are still being
+/// decoded. Polling a timer keeps the wake-up on the foreground executor,
+/// where GPUI's deterministic test scheduler can see it.
+#[derive(Clone, Default)]
+pub(crate) struct CoverPoll(Rc<Cell<bool>>);
+
+const COVER_POLL: Duration = Duration::from_millis(40);
+
+impl CoverPoll {
+    pub(crate) fn tick<V: 'static>(&self, library: &Library, cx: &mut Context<V>) {
+        if self.0.get() || library.covers().pending_count() == 0 {
+            return;
+        }
+        self.0.set(true);
+        let flag = self.0.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COVER_POLL).await;
+            flag.set(false);
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+}
+
 pub fn cover(
     library: &Library,
     album_id: Option<&str>,
@@ -550,16 +577,6 @@ impl Omamusic {
         })
         .detach();
 
-        let covers = library.covers().subscribe();
-        cx.spawn(async move |this, cx| {
-            while covers.recv().await.is_ok() {
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-
         let visualizer = cx.new(|cx| Visualizer::new(player.clone(), cx));
 
         let view = std::env::var("OMADRIVE_VIEW").ok();
@@ -594,6 +611,7 @@ impl Omamusic {
             new_folder,
             rescan_notify: None,
             notify_seq: 0,
+            cover_poll: CoverPoll::default(),
             prev_scanning: false,
             visualizer,
             pending_query: String::new(),
@@ -1390,6 +1408,7 @@ impl Render for Omamusic {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_scale(window);
         self.reclaim_focus(window, cx);
+        self.cover_poll.tick(&self.library, cx);
         let snap = self.library.snapshot();
         let theme = cx.omarchy().clone();
 

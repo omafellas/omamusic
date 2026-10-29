@@ -1,4 +1,4 @@
-use crate::app::{cover, format_time, Omamusic};
+use crate::app::{cover, format_time, CoverPoll, Omamusic};
 use crate::config::AppConfig;
 use crate::library::Library;
 use crate::models::{PlayerState, RepeatMode};
@@ -27,6 +27,7 @@ pub struct PlayerBar {
     volume: Entity<SliderState>,
     progress: Entity<SliderState>,
     seeking: bool,
+    cover_poll: CoverPoll,
 }
 
 impl PlayerBar {
@@ -98,16 +99,6 @@ impl PlayerBar {
         })
         .detach();
 
-        let covers = library.covers().subscribe();
-        cx.spawn(async move |this, cx| {
-            while covers.recv().await.is_ok() {
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-
         Self {
             library,
             player,
@@ -115,6 +106,7 @@ impl PlayerBar {
             volume,
             progress,
             seeking: false,
+            cover_poll: CoverPoll::default(),
         }
     }
 
@@ -205,6 +197,7 @@ fn progress_slider(state: &Entity<SliderState>, disabled: bool, cx: &App) -> Sli
 
 impl Render for PlayerBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.cover_poll.tick(&self.library, cx);
         let theme = cx.omarchy().clone();
         let current = self.player.current();
         let current = current.as_ref();

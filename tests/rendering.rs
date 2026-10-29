@@ -372,6 +372,7 @@ mod pixels {
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
+            scene.cx.advance_clock(std::time::Duration::from_millis(50));
             scene.act(|_, _| {});
             let capture = scene.capture();
             let painted = centers.iter().enumerate().all(|(i, &p)| {
