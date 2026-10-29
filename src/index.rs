@@ -14,12 +14,18 @@ pub fn album_key(dir: &str, album: &str) -> String {
     format!("{dir}\n{album}")
 }
 
+pub const MISSING_TITLE: u32 = 1;
+pub const MISSING_ARTIST: u32 = 2;
+pub const MISSING_ALBUM: u32 = 4;
+pub const MISSING_YEAR: u32 = 8;
+
 /// Roll the `albums` table up from `tracks`. Album artists collapse to
 /// "Various Artists" when the tracks disagree, and all track titles are
 /// concatenated so album search can match on song names.
 pub(crate) const REBUILD_ALBUMS: &str = r#"
 DELETE FROM albums;
-INSERT INTO albums(key, title, artist, year, dir, track_count, track_titles, genres)
+INSERT INTO albums(key, title, artist, year, dir, track_count, track_titles, genres,
+                   tags_missing, mb_release_group)
 SELECT album_key,
        MAX(album),
        CASE WHEN COUNT(DISTINCT artist) = 1 THEN MAX(artist) ELSE 'Various Artists' END,
@@ -27,7 +33,9 @@ SELECT album_key,
        MAX(dir),
        COUNT(*),
        GROUP_CONCAT(title, ' '),
-       COALESCE(GROUP_CONCAT(DISTINCT NULLIF(genre, '')), '')
+       COALESCE(GROUP_CONCAT(DISTINCT NULLIF(genre, '')), ''),
+       MAX(tags_missing & 1) | MAX(tags_missing & 2) | MAX(tags_missing & 4) | MAX(tags_missing & 8),
+       MAX(mb_release_group)
 FROM tracks
 GROUP BY album_key;
 "#;
@@ -79,7 +87,11 @@ fn under(folder: &Path, path: &str) -> bool {
 }
 
 /// Reconcile the database with what is on disk. Returns what changed.
-pub fn reconcile(conn: &mut Connection, folders: &[PathBuf]) -> Result<ScanStats> {
+pub fn reconcile(
+    conn: &mut Connection,
+    folders: &[PathBuf],
+    cache_dir: &Path,
+) -> Result<ScanStats> {
     let existing = load_existing(conn)?;
     let mut stats = ScanStats::default();
     let mut seen: HashSet<String> = HashSet::new();
@@ -87,7 +99,7 @@ pub fn reconcile(conn: &mut Connection, folders: &[PathBuf]) -> Result<ScanStats
     let mut embedded: HashMap<String, Vec<u8>> = HashMap::new();
     let mut album_path: HashMap<String, PathBuf> = HashMap::new();
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for folder in folders {
         if !folder.is_dir() {
             continue;
@@ -123,6 +135,19 @@ pub fn reconcile(conn: &mut Connection, folders: &[PathBuf]) -> Result<ScanStats
                 .parent()
                 .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let mut tags_missing = 0;
+            if md.title.is_empty() {
+                tags_missing |= MISSING_TITLE;
+            }
+            if md.artist.is_empty() {
+                tags_missing |= MISSING_ARTIST;
+            }
+            if md.album.is_empty() {
+                tags_missing |= MISSING_ALBUM;
+            }
+            if md.year == 0 {
+                tags_missing |= MISSING_YEAR;
+            }
             let album_name = if md.album.is_empty() {
                 path.parent()
                     .and_then(|d| d.file_name())
@@ -148,13 +173,17 @@ pub fn reconcile(conn: &mut Connection, folders: &[PathBuf]) -> Result<ScanStats
             };
             tx.execute(
                 "INSERT INTO tracks(path, dir, title, artist, album, album_key, genre, track_number, \
-                 year, duration, mtime_ns, size) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
+                 year, duration, mtime_ns, size, tags_missing, mb_release_group, mb_release, \
+                 mb_recording) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
                  ON CONFLICT(path) DO UPDATE SET dir = excluded.dir, title = excluded.title, \
                  artist = excluded.artist, album = excluded.album, album_key = excluded.album_key, \
                  genre = excluded.genre, track_number = excluded.track_number, \
                  year = excluded.year, duration = excluded.duration, \
-                 mtime_ns = excluded.mtime_ns, size = excluded.size",
+                 mtime_ns = excluded.mtime_ns, size = excluded.size, \
+                 tags_missing = excluded.tags_missing, \
+                 mb_release_group = excluded.mb_release_group, mb_release = excluded.mb_release, \
+                 mb_recording = excluded.mb_recording",
                 params![
                     path_str,
                     dir,
@@ -168,6 +197,10 @@ pub fn reconcile(conn: &mut Connection, folders: &[PathBuf]) -> Result<ScanStats
                     md.duration.max(0.0),
                     mtime,
                     size,
+                    tags_missing as i64,
+                    md.mb_release_group,
+                    md.mb_release,
+                    md.mb_recording,
                 ],
             )?;
             if existing.contains_key(&path_str) {
@@ -206,7 +239,7 @@ pub fn reconcile(conn: &mut Connection, folders: &[PathBuf]) -> Result<ScanStats
     }
     // Artwork is refreshed even when no audio file changed, so dropping a
     // `cover.jpg` next to the files is picked up by the watcher.
-    update_artwork(&tx, &touched, &embedded, &album_path, &mut stats)?;
+    update_artwork(&tx, &touched, &embedded, &album_path, cache_dir, &mut stats)?;
     tx.commit()?;
     Ok(stats)
 }
@@ -216,6 +249,7 @@ fn update_artwork(
     touched: &HashSet<String>,
     embedded: &HashMap<String, Vec<u8>>,
     album_path: &HashMap<String, PathBuf>,
+    cache_dir: &Path,
     stats: &mut ScanStats,
 ) -> Result<()> {
     let mut changed: Vec<String> = touched.iter().cloned().collect();
@@ -224,7 +258,8 @@ fn update_artwork(
         let data = embedded
             .get(key)
             .cloned()
-            .or_else(|| path.and_then(|p| metadata::folder_artwork(p)));
+            .or_else(|| path.and_then(|p| metadata::folder_artwork(p)))
+            .or_else(|| cached_artwork(cache_dir, key));
         upsert_artwork(conn, key, data.as_deref(), path)?;
     }
 
@@ -245,7 +280,7 @@ fn update_artwork(
         let Some(path) = path.map(PathBuf::from) else {
             continue;
         };
-        let data = metadata::folder_artwork(&path);
+        let data = metadata::folder_artwork(&path).or_else(|| cached_artwork(cache_dir, &key));
         if data.is_some() {
             changed.push(key.clone());
         }
@@ -261,6 +296,12 @@ fn update_artwork(
     changed.dedup();
     stats.changed_albums = changed;
     Ok(())
+}
+
+fn cached_artwork(cache_dir: &Path, key: &str) -> Option<Vec<u8>> {
+    std::fs::read(crate::lookup::write::cache_path(cache_dir, key))
+        .ok()
+        .filter(|data| !data.is_empty())
 }
 
 fn upsert_artwork(
@@ -320,6 +361,86 @@ mod tests {
         conn
     }
 
+    fn cache() -> PathBuf {
+        std::env::temp_dir().join(format!("omamusic-index-cache-{}", std::process::id()))
+    }
+
+    #[test]
+    fn missing_tags_are_recorded_as_bits() {
+        let temp = TempDir::new();
+        write(&temp.dir().join("song.mp3"), b"a");
+        let mut conn = memory();
+        reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
+        let bits: i64 = conn
+            .query_row("SELECT tags_missing FROM tracks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            bits as u32,
+            MISSING_TITLE | MISSING_ARTIST | MISSING_ALBUM | MISSING_YEAR
+        );
+        let album_bits: i64 = conn
+            .query_row("SELECT tags_missing FROM albums", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(album_bits, bits);
+    }
+
+    #[test]
+    fn album_missing_bits_are_the_union_of_its_tracks() {
+        use lofty::config::WriteOptions;
+        use lofty::prelude::*;
+        use lofty::tag::{Tag, TagType};
+
+        let temp = TempDir::new();
+        let no_year = temp.dir().join("one.wav");
+        write(&no_year, &crate::metadata::fixtures::wav_bytes(1));
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("One".into());
+        tag.set_artist("Band".into());
+        tag.set_album("Record".into());
+        tag.save_to_path(&no_year, WriteOptions::default()).unwrap();
+
+        let no_title = temp.dir().join("two.wav");
+        write(&no_title, &crate::metadata::fixtures::wav_bytes(1));
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_artist("Band".into());
+        tag.set_album("Record".into());
+        tag.set_year(2002);
+        tag.save_to_path(&no_title, WriteOptions::default())
+            .unwrap();
+
+        let mut conn = memory();
+        reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
+        let bits: i64 = conn
+            .query_row("SELECT tags_missing FROM albums", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(bits as u32, MISSING_TITLE | MISSING_YEAR);
+    }
+
+    #[test]
+    fn cached_cover_is_used_when_file_and_folder_have_none() {
+        let temp = TempDir::new();
+        write(&temp.dir().join("song.mp3"), b"a");
+        let mut conn = memory();
+        let cache = TempDir::new();
+        let dir = temp.dir().to_string_lossy().into_owned();
+        let album = temp
+            .dir()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let key = album_key(&dir, &album);
+        reconcile(&mut conn, &[temp.dir().to_path_buf()], cache.dir()).unwrap();
+        assert_eq!(db::artwork(&conn, &key).unwrap(), None);
+
+        let path = crate::lookup::write::cache_path(cache.dir(), &key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write(&path, b"cached");
+        let stats = reconcile(&mut conn, &[temp.dir().to_path_buf()], cache.dir()).unwrap();
+        assert!(stats.changed_albums.contains(&key));
+        assert_eq!(db::artwork(&conn, &key).unwrap(), Some(b"cached".to_vec()));
+    }
+
     #[test]
     fn first_scan_indexes_and_later_scans_skip_unchanged_files() {
         let temp = TempDir::new();
@@ -327,13 +448,13 @@ mod tests {
         write(&temp.dir().join("two.mp3"), b"bb");
         let mut conn = memory();
 
-        let first = reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        let first = reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
         assert_eq!(first.added, 2);
         assert_eq!(first.updated, 0);
         assert_eq!(first.removed, 0);
         assert_eq!(db::track_count(&conn).unwrap(), 2);
 
-        let second = reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        let second = reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
         assert_eq!(second.added, 0);
         assert_eq!(second.skipped, 2);
         assert!(!second.changed());
@@ -345,14 +466,14 @@ mod tests {
         let file = temp.dir().join("one.mp3");
         write(&file, b"a");
         let mut conn = memory();
-        reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
 
         write(&file, b"changed-length");
-        let updated = reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        let updated = reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
         assert_eq!(updated.updated, 1);
 
         std::fs::remove_file(&file).unwrap();
-        let removed = reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        let removed = reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
         assert_eq!(removed.removed, 1);
         assert_eq!(db::track_count(&conn).unwrap(), 0);
     }
@@ -362,7 +483,7 @@ mod tests {
         let temp = TempDir::new();
         write(&temp.dir().join("mystery song.mp3"), b"a");
         let mut conn = memory();
-        reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
         let tracks = db::all_tracks(&conn).unwrap();
         assert_eq!(tracks.len(), 1);
         // No ID3 header: the file stem is used as the title.
@@ -389,11 +510,12 @@ mod tests {
         reconcile(
             &mut conn,
             &[other.dir().to_path_buf(), temp.dir().to_path_buf()],
+            &cache(),
         )
         .unwrap();
         assert_eq!(db::track_count(&conn).unwrap(), 2);
         // Scanning only the remaining folder drops the tracks of the removed one.
-        reconcile(&mut conn, &[other.dir().to_path_buf()]).unwrap();
+        reconcile(&mut conn, &[other.dir().to_path_buf()], &cache()).unwrap();
         assert_eq!(db::track_count(&conn).unwrap(), 1);
     }
 
@@ -402,12 +524,12 @@ mod tests {
         let temp = TempDir::new();
         write(&temp.dir().join("one.mp3"), b"a");
         let mut conn = memory();
-        reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
         assert_eq!(db::track_count(&conn).unwrap(), 1);
         // Simulate an unmounted drive: the configured folder is gone but the
         // index must not be wiped.
         std::fs::remove_dir_all(temp.dir()).unwrap();
-        let stats = reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        let stats = reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
         assert_eq!(stats.removed, 0);
         assert_eq!(db::track_count(&conn).unwrap(), 1);
     }
@@ -419,7 +541,7 @@ mod tests {
         write(&temp.dir().join("notes.txt"), b"text");
         write(&temp.dir().join("song.flac"), b"flac");
         let mut conn = memory();
-        let stats = reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        let stats = reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
         assert_eq!(stats.added, 1);
         assert_eq!(db::track_count(&conn).unwrap(), 1);
     }
@@ -429,7 +551,7 @@ mod tests {
         let temp = TempDir::new();
         write(&temp.dir().join("song.mp3"), b"a");
         let mut conn = memory();
-        reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
 
         let dir = temp.dir().to_string_lossy().into_owned();
         let album = temp
@@ -444,7 +566,7 @@ mod tests {
         // A cover dropped next to the files is not an audio change, but the
         // watcher still triggers a reconcile and the cover must appear.
         write(&temp.dir().join("cover.jpg"), b"image-bytes");
-        let stats = reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        let stats = reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
         assert!(!stats.changed());
         assert!(stats.changed_albums.contains(&key));
         assert_eq!(
@@ -467,7 +589,7 @@ mod tests {
         write(&temp.dir().join("__MACOSX/Album/song.mp3"), b"appledouble");
 
         let mut conn = memory();
-        let stats = reconcile(&mut conn, &[temp.dir().to_path_buf()]).unwrap();
+        let stats = reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
         assert_eq!(stats.added, 1);
         let tracks = db::all_tracks(&conn).unwrap();
         assert_eq!(tracks.len(), 1);

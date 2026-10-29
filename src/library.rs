@@ -5,6 +5,8 @@ use crate::artwork::ArtworkCache;
 use crate::config::AppConfig;
 use crate::db::{self, Db};
 use crate::index;
+use crate::lookup::http::UreqHttp;
+use crate::lookup::worker::{Wake, Worker, WorkerDeps};
 use crate::models::{Album, AlbumSummary, ArtistEntry, Track};
 use crate::search;
 use anyhow::{Context, Result};
@@ -33,9 +35,12 @@ pub struct LibrarySnapshot {
     pub scanning: bool,
     pub query: String,
     pub version: u64,
+    pub lookup_pending: usize,
+    pub lookup_total: usize,
+    pub lookup_unmatched: Vec<AlbumSummary>,
 }
 
-type SharedSnapshot = Arc<RwLock<Arc<LibrarySnapshot>>>;
+pub(crate) type SharedSnapshot = Arc<RwLock<Arc<LibrarySnapshot>>>;
 
 pub struct Library {
     state: SharedSnapshot,
@@ -43,9 +48,10 @@ pub struct Library {
     covers: ArtworkCache,
     watcher: Mutex<Option<RecommendedWatcher>>,
     rescan_tx: Sender<()>,
+    lookup_tx: Option<Sender<Wake>>,
 }
 
-fn update(state: &SharedSnapshot, change: impl FnOnce(&mut LibrarySnapshot)) {
+pub(crate) fn update(state: &SharedSnapshot, change: impl FnOnce(&mut LibrarySnapshot)) {
     let mut guard = state.write();
     let snapshot = Arc::make_mut(&mut guard);
     change(snapshot);
@@ -54,7 +60,8 @@ fn update(state: &SharedSnapshot, change: impl FnOnce(&mut LibrarySnapshot)) {
 
 impl Library {
     pub fn new() -> Result<Self> {
-        let folders = AppConfig::load().folders;
+        let config = AppConfig::load();
+        let folders = config.folders;
         let db_path = Self::db_path()?;
         let db = Arc::new(Db::open(db_path)?);
 
@@ -75,9 +82,22 @@ impl Library {
         )?)));
         update(&state, |s| s.scanning = true);
 
+        let cache_dir = Self::cache_dir()?;
+        let lookup_tx = Worker::spawn(
+            WorkerDeps {
+                http: Arc::new(UreqHttp::new()),
+                db_path: db.path.clone(),
+                cache_dir: cache_dir.clone(),
+                covers: covers.clone(),
+                state: state.clone(),
+            },
+            config.online_lookup,
+        );
+
         let thread_state = state.clone();
         let thread_db = db.clone();
         let thread_covers = covers.clone();
+        let thread_lookup = lookup_tx.clone();
         std::thread::spawn(move || {
             let mut writer = match Db::open_writer(&thread_db.path) {
                 Ok(writer) => writer,
@@ -89,7 +109,7 @@ impl Library {
             loop {
                 let folders = thread_state.read().folders.clone();
                 update(&thread_state, |s| s.scanning = true);
-                match index::reconcile(&mut writer, &folders) {
+                match index::reconcile(&mut writer, &folders, &cache_dir) {
                     Ok(stats) => {
                         for key in &stats.changed_albums {
                             thread_covers.remove(key);
@@ -102,6 +122,7 @@ impl Library {
                     Err(err) => eprintln!("scan library: {err:#}"),
                 }
                 update(&thread_state, |s| s.scanning = false);
+                let _ = thread_lookup.send(Wake::ScanFinished);
 
                 if rx.recv().is_err() {
                     break;
@@ -117,12 +138,115 @@ impl Library {
             covers,
             watcher: Mutex::new(watcher),
             rescan_tx,
+            lookup_tx: Some(lookup_tx),
         })
     }
 
-    fn db_path() -> Result<PathBuf> {
+    pub fn set_online_lookup(&self, on: bool) {
+        AppConfig::update(|c| c.online_lookup = on);
+        if let Some(tx) = &self.lookup_tx {
+            let _ = tx.send(Wake::SettingChanged(on));
+        }
+    }
+
+    pub fn retry_unmatched(&self) {
+        if let Err(err) = self.db.read(db::clear_unmatched) {
+            eprintln!("online lookup: clear unmatched: {err:#}");
+        }
+        update(&self.state, |s| s.lookup_unmatched.clear());
+        if let Some(tx) = &self.lookup_tx {
+            let _ = tx.send(Wake::Retry);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_album(&self, summary: &AlbumSummary) {
+        let path = format!("/music/{}/01.mp3", summary.title);
+        let dir = format!("/music/{}", summary.title);
+        self.db
+            .read(|conn| {
+                conn.execute(
+                    "INSERT INTO tracks(path, dir, title, artist, album, album_key, track_number, \
+                     year, duration, mtime_ns, size) VALUES (?1, ?2, 'Song', ?3, ?4, ?5, 1, ?6, \
+                     200.0, 1, 1)",
+                    rusqlite::params![
+                        path,
+                        dir,
+                        summary.artist,
+                        summary.title,
+                        summary.id,
+                        summary.year
+                    ],
+                )?;
+                conn.execute_batch(index::REBUILD_ALBUMS)?;
+                if summary.unmatched {
+                    db::record_lookup(
+                        conn,
+                        &db::LookupRow {
+                            album_key: summary.id.clone(),
+                            status: db::LookupStatus::Unmatched,
+                            release: None,
+                            release_group: None,
+                            score: Some(0.5),
+                            candidate: None,
+                            attempted_at: 1,
+                        },
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("insert album");
+        Self::reload(&self.state, &self.db);
+        update(&self.state, |s| {
+            if s.folders.is_empty() {
+                s.folders.push(PathBuf::from("/music"));
+            }
+            if summary.unmatched {
+                s.lookup_unmatched.push(summary.clone());
+            }
+        });
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_lookup(dir: &Path, http: Arc<dyn crate::lookup::http::Http>) -> Result<Self> {
+        let db = Arc::new(Db::open(dir.join("library.db"))?);
+        let covers = ArtworkCache::default();
+        {
+            let db = db.clone();
+            covers.set_provider(Arc::new(move |key: &str| {
+                db.read(|conn| db::artwork(conn, key)).ok().flatten()
+            }));
+        }
+        let state: SharedSnapshot =
+            Arc::new(RwLock::new(Arc::new(Self::load_snapshot(&db, Vec::new())?)));
+        let lookup_tx = Worker::spawn(
+            WorkerDeps {
+                http,
+                db_path: db.path.clone(),
+                cache_dir: dir.join("cache"),
+                covers: covers.clone(),
+                state: state.clone(),
+            },
+            AppConfig::load().online_lookup,
+        );
+        let (rescan_tx, _rx) = mpsc::channel::<()>();
+        Ok(Self {
+            state,
+            db,
+            covers,
+            watcher: Mutex::new(None),
+            rescan_tx,
+            lookup_tx: Some(lookup_tx),
+        })
+    }
+
+    fn cache_dir() -> Result<PathBuf> {
         let dir = dirs::cache_dir().context("no cache directory")?;
-        Ok(dir.join("omamusic").join("library.db"))
+        Ok(dir.join("omamusic"))
+    }
+
+    fn db_path() -> Result<PathBuf> {
+        Ok(Self::cache_dir()?.join("library.db"))
     }
 
     fn load_snapshot(db: &Db, folders: Vec<PathBuf>) -> Result<LibrarySnapshot> {
@@ -210,6 +334,7 @@ impl Library {
             covers: ArtworkCache::default(),
             watcher: Mutex::new(None),
             rescan_tx,
+            lookup_tx: None,
         }
     }
 
@@ -424,6 +549,7 @@ impl Library {
             covers,
             watcher: Mutex::new(None),
             rescan_tx,
+            lookup_tx: None,
         })
     }
 }

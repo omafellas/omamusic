@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Bump when the schema changes. Older databases are discarded and rebuilt.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tracks (
@@ -29,7 +29,11 @@ CREATE TABLE IF NOT EXISTS tracks (
     year         INTEGER NOT NULL DEFAULT 0,
     duration     REAL NOT NULL DEFAULT 0,
     mtime_ns     INTEGER NOT NULL,
-    size         INTEGER NOT NULL
+    size         INTEGER NOT NULL,
+    tags_missing     INTEGER NOT NULL DEFAULT 0,
+    mb_release_group TEXT NOT NULL DEFAULT '',
+    mb_release       TEXT NOT NULL DEFAULT '',
+    mb_recording     TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS tracks_dir ON tracks(dir);
 CREATE INDEX IF NOT EXISTS tracks_album_key ON tracks(album_key);
@@ -44,7 +48,9 @@ CREATE TABLE IF NOT EXISTS albums (
     dir          TEXT NOT NULL,
     track_count  INTEGER NOT NULL DEFAULT 0,
     track_titles TEXT NOT NULL DEFAULT '',
-    genres       TEXT NOT NULL DEFAULT ''
+    genres       TEXT NOT NULL DEFAULT '',
+    tags_missing     INTEGER NOT NULL DEFAULT 0,
+    mb_release_group TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS artwork (
@@ -52,6 +58,16 @@ CREATE TABLE IF NOT EXISTS artwork (
     data      BLOB,
     src_path  TEXT,
     src_mtime INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS lookup (
+    album_key     TEXT PRIMARY KEY,
+    status        TEXT NOT NULL,
+    release       TEXT,
+    release_group TEXT,
+    score         REAL,
+    candidate     TEXT,
+    attempted_at  INTEGER NOT NULL
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
@@ -102,6 +118,7 @@ DROP TABLE IF EXISTS albums_fts;
 DROP TABLE IF EXISTS tracks;
 DROP TABLE IF EXISTS albums;
 DROP TABLE IF EXISTS artwork;
+DROP TABLE IF EXISTS lookup;
 "#;
 
 /// Columns of `tracks`, aliased as `t`, in the order [`track_from_row`] reads.
@@ -114,6 +131,12 @@ const TRACK_ORDER: &str = "(t.track_number = 0), t.track_number, t.path";
 
 /// Album ordering used everywhere the album list is shown.
 const ALBUM_ORDER: &str = "a.artist COLLATE NOCASE, a.year, a.title COLLATE NOCASE";
+
+const ALBUM_COLS: &str = "a.key, a.title, a.artist, a.year, a.track_count, \
+     EXISTS(SELECT 1 FROM lookup l WHERE l.album_key = a.key \
+     AND l.status IN ('unmatched', 'error')) AS unmatched";
+
+pub const ERROR_RETRY_SECS: i64 = 60 * 60;
 
 /// A SQLite file shared by the UI (reader) and the indexer (writer).
 pub struct Db {
@@ -228,6 +251,7 @@ fn album_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlbumSumm
         artist: row.get("artist")?,
         year: row.get::<_, i64>("year")?.max(0) as u32,
         track_count: row.get::<_, i64>("track_count")?.max(0) as usize,
+        unmatched: row.get::<_, i64>("unmatched")? != 0,
     })
 }
 
@@ -305,7 +329,7 @@ pub fn tracks_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<Track>> {
 
 pub fn albums_page(conn: &Connection, offset: usize, limit: usize) -> Result<Vec<AlbumSummary>> {
     let sql = format!(
-        "SELECT a.key, a.title, a.artist, a.year, a.track_count FROM albums a \
+        "SELECT {ALBUM_COLS} FROM albums a \
          ORDER BY {ALBUM_ORDER} LIMIT ?1 OFFSET ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -319,7 +343,7 @@ pub fn albums_by_keys(conn: &Connection, keys: &[String]) -> Result<Vec<AlbumSum
         return Ok(Vec::new());
     }
     let sql = format!(
-        "SELECT a.key, a.title, a.artist, a.year, a.track_count FROM albums a \
+        "SELECT {ALBUM_COLS} FROM albums a \
          WHERE a.key IN ({})",
         placeholders(keys.len())
     );
@@ -365,7 +389,7 @@ pub fn artists_page(conn: &Connection, offset: usize, limit: usize) -> Result<Ve
 pub fn album_detail(conn: &Connection, key: &str) -> Result<Option<Album>> {
     let album = conn
         .query_row(
-            "SELECT a.key, a.title, a.artist, a.year FROM albums a WHERE a.key = ?1",
+            &format!("SELECT {ALBUM_COLS} FROM albums a WHERE a.key = ?1"),
             params![key],
             |row| {
                 Ok(Album {
@@ -374,6 +398,7 @@ pub fn album_detail(conn: &Connection, key: &str) -> Result<Option<Album>> {
                     artist: row.get("artist")?,
                     year: row.get::<_, i64>("year")?.max(0) as u32,
                     tracks: Vec::new().into(),
+                    unmatched: row.get::<_, i64>("unmatched")? != 0,
                 })
             },
         )
@@ -400,7 +425,7 @@ pub fn album_tracks(conn: &Connection, key: &str) -> Result<Vec<Track>> {
 
 pub fn artist_albums(conn: &Connection, name: &str) -> Result<Vec<AlbumSummary>> {
     let sql = format!(
-        "SELECT a.key, a.title, a.artist, a.year, a.track_count FROM albums a \
+        "SELECT {ALBUM_COLS} FROM albums a \
          WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_key = a.key AND t.artist = ?1) \
          ORDER BY {ALBUM_ORDER}"
     );
@@ -452,6 +477,154 @@ pub fn artwork(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>> {
     Ok(data.flatten())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupStatus {
+    Matched,
+    Unmatched,
+    Error,
+}
+
+impl LookupStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LookupStatus::Matched => "matched",
+            LookupStatus::Unmatched => "unmatched",
+            LookupStatus::Error => "error",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "matched" => Some(LookupStatus::Matched),
+            "unmatched" => Some(LookupStatus::Unmatched),
+            "error" => Some(LookupStatus::Error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookupRow {
+    pub album_key: String,
+    pub status: LookupStatus,
+    pub release: Option<String>,
+    pub release_group: Option<String>,
+    pub score: Option<f64>,
+    pub candidate: Option<String>,
+    pub attempted_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookupCandidate {
+    pub album_key: String,
+    pub title: String,
+    pub artist: String,
+    pub year: u32,
+    pub tags_missing: u32,
+    pub mb_release_group: String,
+    pub needs_cover: bool,
+    pub tracks: Vec<Track>,
+    pub recordings: Vec<String>,
+}
+
+pub fn record_lookup(conn: &Connection, row: &LookupRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO lookup(album_key, status, release, release_group, score, candidate, attempted_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(album_key) DO UPDATE SET status = excluded.status, release = excluded.release, \
+         release_group = excluded.release_group, score = excluded.score, \
+         candidate = excluded.candidate, attempted_at = excluded.attempted_at",
+        params![
+            row.album_key,
+            row.status.as_str(),
+            row.release,
+            row.release_group,
+            row.score,
+            row.candidate,
+            row.attempted_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn unmatched_albums(conn: &Connection) -> Result<Vec<AlbumSummary>> {
+    let sql = format!(
+        "SELECT {ALBUM_COLS} FROM albums a \
+         JOIN lookup l ON l.album_key = a.key WHERE l.status IN ('unmatched', 'error') \
+         ORDER BY {ALBUM_ORDER}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], album_summary_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn clear_unmatched(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM lookup WHERE status IN ('unmatched', 'error')",
+        [],
+    )?)
+}
+
+pub fn set_artwork(conn: &Connection, key: &str, data: &[u8]) -> Result<()> {
+    conn.execute(
+        "INSERT INTO artwork(album_key, data) VALUES (?1, ?2) \
+         ON CONFLICT(album_key) DO UPDATE SET data = excluded.data",
+        params![key, data],
+    )?;
+    Ok(())
+}
+
+pub fn albums_needing_lookup(
+    conn: &Connection,
+    now: i64,
+    retry_after: i64,
+) -> Result<Vec<LookupCandidate>> {
+    let sql = format!(
+        "SELECT a.key, a.title, a.artist, a.year, a.tags_missing, a.mb_release_group, \
+         (ar.data IS NULL) AS needs_cover \
+         FROM albums a \
+         LEFT JOIN artwork ar ON ar.album_key = a.key \
+         LEFT JOIN lookup l ON l.album_key = a.key \
+         WHERE (ar.data IS NULL OR a.tags_missing != 0) \
+         AND (l.album_key IS NULL OR l.attempted_at <= ?1 \
+              OR (l.status = 'error' AND l.attempted_at <= ?2)) \
+         ORDER BY l.attempted_at IS NOT NULL, l.attempted_at, {ALBUM_ORDER}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let albums: Vec<LookupCandidate> = stmt
+        .query_map(params![now - retry_after, now - ERROR_RETRY_SECS], |row| {
+            Ok(LookupCandidate {
+                album_key: row.get(0)?,
+                title: row.get(1)?,
+                artist: row.get(2)?,
+                year: row.get::<_, i64>(3)?.max(0) as u32,
+                tags_missing: row.get::<_, i64>(4)?.max(0) as u32,
+                mb_release_group: row.get(5)?,
+                needs_cover: row.get::<_, i64>(6)? != 0,
+                tracks: Vec::new(),
+                recordings: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let sql = format!(
+        "SELECT {TRACK_COLS}, t.mb_recording FROM tracks t WHERE t.album_key = ?1 ORDER BY {TRACK_ORDER}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut out = Vec::with_capacity(albums.len());
+    for mut album in albums {
+        let rows = stmt.query_map(params![album.album_key], |row| {
+            Ok((track_from_row(row)?, row.get::<_, String>("mb_recording")?))
+        })?;
+        for row in rows {
+            let (track, recording) = row?;
+            album.tracks.push(track);
+            album.recordings.push(recording);
+        }
+        out.push(album);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +655,150 @@ mod tests {
 
     fn rebuild_albums(conn: &Connection) {
         conn.execute_batch(crate::index::REBUILD_ALBUMS).unwrap();
+    }
+
+    fn lookup(key: &str, status: LookupStatus, attempted_at: i64) -> LookupRow {
+        LookupRow {
+            album_key: key.to_string(),
+            status,
+            release: None,
+            release_group: None,
+            score: Some(0.4),
+            candidate: Some("Someone – Something (1999)".to_string()),
+            attempted_at,
+        }
+    }
+
+    #[test]
+    fn lookup_rows_round_trip_and_mark_summaries() {
+        let conn = memory();
+        insert_track(&conn, "/m/a/1.mp3", "One", "Band", "Record", 1);
+        rebuild_albums(&conn);
+        let key = albums_page(&conn, 0, 1).unwrap()[0].id.clone();
+        assert!(!albums_page(&conn, 0, 1).unwrap()[0].unmatched);
+
+        record_lookup(&conn, &lookup(&key, LookupStatus::Unmatched, 100)).unwrap();
+        let unmatched = unmatched_albums(&conn).unwrap();
+        assert_eq!(unmatched.len(), 1);
+        assert!(unmatched[0].unmatched);
+        assert!(albums_page(&conn, 0, 1).unwrap()[0].unmatched);
+        assert!(albums_by_keys(&conn, std::slice::from_ref(&key)).unwrap()[0].unmatched);
+        assert!(artist_albums(&conn, "Band").unwrap()[0].unmatched);
+
+        record_lookup(&conn, &lookup(&key, LookupStatus::Matched, 200)).unwrap();
+        assert!(unmatched_albums(&conn).unwrap().is_empty());
+        assert!(!albums_page(&conn, 0, 1).unwrap()[0].unmatched);
+        assert_eq!(clear_unmatched(&conn).unwrap(), 0);
+
+        record_lookup(&conn, &lookup(&key, LookupStatus::Unmatched, 300)).unwrap();
+        assert_eq!(clear_unmatched(&conn).unwrap(), 1);
+        assert!(unmatched_albums(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn error_rows_count_as_unmatched_and_retry_sooner() {
+        let conn = memory();
+        insert_track(&conn, "/m/a/1.mp3", "One", "Band", "Record", 1);
+        rebuild_albums(&conn);
+        let key = albums_page(&conn, 0, 1).unwrap()[0].id.clone();
+        let now = 10_000_000;
+        let month = 2_592_000;
+
+        record_lookup(&conn, &lookup(&key, LookupStatus::Error, now - 10)).unwrap();
+        assert!(albums_needing_lookup(&conn, now, month).unwrap().is_empty());
+        assert_eq!(
+            unmatched_albums(&conn).unwrap().len(),
+            1,
+            "errors are shown too"
+        );
+        assert!(albums_page(&conn, 0, 1).unwrap()[0].unmatched);
+
+        record_lookup(
+            &conn,
+            &lookup(&key, LookupStatus::Error, now - ERROR_RETRY_SECS - 1),
+        )
+        .unwrap();
+        assert_eq!(
+            albums_needing_lookup(&conn, now, month).unwrap().len(),
+            1,
+            "errors are retried after an hour, not a month"
+        );
+        assert_eq!(
+            clear_unmatched(&conn).unwrap(),
+            1,
+            "retry all covers errors"
+        );
+        assert!(unmatched_albums(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_artwork_stores_a_cover() {
+        let conn = memory();
+        insert_track(&conn, "/m/a/1.mp3", "One", "Band", "Record", 1);
+        rebuild_albums(&conn);
+        let key = albums_page(&conn, 0, 1).unwrap()[0].id.clone();
+        assert_eq!(artwork(&conn, &key).unwrap(), None);
+        set_artwork(&conn, &key, b"img").unwrap();
+        assert_eq!(artwork(&conn, &key).unwrap(), Some(b"img".to_vec()));
+        set_artwork(&conn, &key, b"new").unwrap();
+        assert_eq!(artwork(&conn, &key).unwrap(), Some(b"new".to_vec()));
+    }
+
+    #[test]
+    fn albums_needing_lookup_respects_retry_window() {
+        let conn = memory();
+        insert_track(&conn, "/m/a/1.mp3", "One", "Band", "Record", 1);
+        insert_track(&conn, "/m/a/2.mp3", "Two", "Band", "Record", 2);
+        conn.execute(
+            "UPDATE tracks SET duration = 200.5, mb_recording = 'rec-2' WHERE path = '/m/a/2.mp3'",
+            [],
+        )
+        .unwrap();
+        rebuild_albums(&conn);
+        let now = 10_000_000;
+        let month = 2_592_000;
+
+        let need = albums_needing_lookup(&conn, now, month).unwrap();
+        assert_eq!(need.len(), 1, "no artwork row means a cover is needed");
+        let album = &need[0];
+        assert_eq!(album.title, "Record");
+        assert_eq!(album.artist, "Band");
+        assert!(album.needs_cover);
+        assert_eq!(album.tags_missing, 0);
+        assert_eq!(album.tracks.len(), 2);
+        assert_eq!(album.tracks[1].duration, 200.5);
+        assert_eq!(album.recordings, ["", "rec-2"]);
+        let key = album.album_key.clone();
+
+        record_lookup(&conn, &lookup(&key, LookupStatus::Unmatched, now - 10)).unwrap();
+        assert!(albums_needing_lookup(&conn, now, month).unwrap().is_empty());
+
+        record_lookup(
+            &conn,
+            &lookup(&key, LookupStatus::Unmatched, now - month - 1),
+        )
+        .unwrap();
+        assert_eq!(albums_needing_lookup(&conn, now, month).unwrap().len(), 1);
+
+        record_lookup(&conn, &lookup(&key, LookupStatus::Matched, now - 10)).unwrap();
+        assert!(
+            albums_needing_lookup(&conn, now, month).unwrap().is_empty(),
+            "a fresh match without a cover is not retried until the window passes"
+        );
+        record_lookup(&conn, &lookup(&key, LookupStatus::Matched, now - month - 1)).unwrap();
+        assert_eq!(albums_needing_lookup(&conn, now, month).unwrap().len(), 1);
+        conn.execute(
+            "INSERT INTO artwork(album_key, data) VALUES (?1, ?2)",
+            params![key, vec![1u8]],
+        )
+        .unwrap();
+        assert!(albums_needing_lookup(&conn, now, month).unwrap().is_empty());
+
+        conn.execute("UPDATE albums SET tags_missing = 1", [])
+            .unwrap();
+        let need = albums_needing_lookup(&conn, now, month).unwrap();
+        assert_eq!(need.len(), 1, "missing tags need work even with a cover");
+        assert!(!need[0].needs_cover);
     }
 
     #[test]

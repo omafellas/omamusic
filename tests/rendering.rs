@@ -17,6 +17,7 @@ mod pixels {
     use gpui_kit::{
         px, size, AnyWindowHandle, AppContext, Bounds, Entity, HeadlessAppContext, Pixels,
     };
+    use omamusic::models::AlbumSummary;
     use omamusic::{AppConfig, Library, Omamusic, Player, Root};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,13 +51,16 @@ mod pixels {
 
     impl Scene {
         fn open() -> Self {
+            Self::open_with(Arc::new(Library::empty()))
+        }
+
+        fn open_with(library: Arc<Library>) -> Self {
             isolated_config_dir();
             let mut cx = HeadlessAppContext::with_platform(
                 gpui_kit::platform::current_platform(true).text_system(),
                 Arc::new(gpui_kit::assets::AllAssets),
                 gpui_kit::platform::current_headless_renderer,
             );
-            let library = Arc::new(Library::empty());
             let player = Arc::new(Player::new_test());
             cx.update(|cx| {
                 gpui_omarchy::init(cx);
@@ -236,6 +240,35 @@ mod pixels {
         );
     }
 
+    fn unmatched_badge_paints_ink() {
+        let summary = |unmatched: bool| AlbumSummary {
+            id: "k".to_string(),
+            title: "Estranhos no Ninho".to_string(),
+            artist: "Exxótica".to_string(),
+            year: 2002,
+            track_count: 1,
+            unmatched,
+        };
+        let library = Arc::new(Library::empty());
+        library.insert_album(&summary(true));
+        let mut scene = Scene::open_with(library);
+        scene.act(|window, cx| window.click("nav-albums", cx));
+        let capture = scene.capture();
+        let bounds = scene.bounds("album-unmatched-k");
+
+        let library = Arc::new(Library::empty());
+        library.insert_album(&summary(false));
+        let mut plain = Scene::open_with(library);
+        plain.act(|window, cx| window.click("nav-albums", cx));
+        let plain = plain.capture();
+        assert!(
+            capture.ink_in(bounds) > plain.ink_in(bounds),
+            "the badge must add ink at {bounds:?}: {} vs {} without it",
+            capture.ink_in(bounds),
+            plain.ink_in(bounds)
+        );
+    }
+
     pub fn run() {
         match renderer_available() {
             Ok(true) => {}
@@ -249,7 +282,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 3] = [
+        let tests: [(&str, fn()); 4] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -259,6 +292,7 @@ mod pixels {
                 "settings_draws_the_text_size_row",
                 settings_draws_the_text_size_row,
             ),
+            ("unmatched_badge_paints_ink", unmatched_badge_paints_ink),
         ];
         for (name, test) in tests {
             println!("running {name}");

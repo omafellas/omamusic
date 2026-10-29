@@ -23,6 +23,8 @@ pub struct Album {
     pub year: u32,
     #[serde(with = "arc_vec_serde")]
     pub tracks: Arc<[Track]>,
+    #[serde(default)]
+    pub unmatched: bool,
 }
 
 /// An album without its tracks, for grids and artist pages that only need
@@ -34,6 +36,8 @@ pub struct AlbumSummary {
     pub artist: String,
     pub year: u32,
     pub track_count: usize,
+    #[serde(default)]
+    pub unmatched: bool,
 }
 
 /// A row in the Artists view: aggregate counts plus a representative album

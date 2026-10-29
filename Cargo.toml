@@ -26,6 +26,10 @@ async-io = "2"
 async-channel = "2"
 futures-lite = "2"
 resvg = "0.46"
+lofty = "0.22"
+sha2 = "0.10"
+percent-encoding = "2"
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 
 [features]
 test-support = []

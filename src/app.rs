@@ -541,6 +541,115 @@ impl Omamusic {
         cover(&self.library, album_id, size, name, cx)
     }
 
+    fn badged_cover(
+        &self,
+        album_id: &str,
+        unmatched: bool,
+        size: f32,
+        name: &str,
+        cx: &App,
+    ) -> impl IntoElement {
+        let theme = cx.omarchy().clone();
+        div()
+            .relative()
+            .flex_none()
+            .child(self.cover(Some(album_id), size, name, cx))
+            .when(unmatched, |d| {
+                d.child(with_tooltip(
+                    div()
+                        .id(ElementId::Name(
+                            format!("album-unmatched-{album_id}").into(),
+                        ))
+                        .test_support()
+                        .absolute()
+                        .top(px(-4.))
+                        .right(px(-4.))
+                        .size(rems(1.125))
+                        .rounded_full()
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(theme.accent)
+                        .child(icon(IconName::CircleAlert).size(rems(0.875))),
+                    "Could not be identified online",
+                ))
+            })
+    }
+
+    fn lookup_status(&self, snap: &LibrarySnapshot, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = cx.omarchy().clone();
+        if snap.lookup_total > 0 && snap.lookup_pending > 0 {
+            let text = format!(
+                "Looking up albums… {} of {}",
+                snap.lookup_total - snap.lookup_pending,
+                snap.lookup_total
+            );
+            return Some(
+                div()
+                    .id("lookup-status")
+                    .test_support()
+                    .aria_label(text.clone())
+                    .px(rems(0.3125))
+                    .text_size(rems(0.6875))
+                    .text_color(theme.secondary)
+                    .child(text)
+                    .into_any_element(),
+            );
+        }
+        if snap.lookup_unmatched.is_empty() {
+            return None;
+        }
+        let n = snap.lookup_unmatched.len();
+        let text = format!(
+            "{n} album{} could not be identified",
+            if n == 1 { "" } else { "s" }
+        );
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(rems(0.25))
+                .px(rems(0.3125))
+                .child(
+                    div()
+                        .id("lookup-status")
+                        .test_support()
+                        .aria_label(text.clone())
+                        .text_size(rems(0.75))
+                        .text_color(theme.foreground)
+                        .child(text),
+                )
+                .child(
+                    div()
+                        .id("lookup-unmatched-list")
+                        .max_h(rems(8.))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .text_size(rems(0.6875))
+                        .text_color(theme.secondary)
+                        .children(snap.lookup_unmatched.iter().map(|a| {
+                            div()
+                                .truncate()
+                                .child(format!("{} – {}", a.artist, a.title))
+                        })),
+                )
+                .child(div().child(
+                    button("lookup-retry", "Retry all", ButtonVariant::Secondary, cx).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.library.retry_unmatched();
+                            this.tick(true, cx);
+                            cx.notify();
+                        }),
+                    ),
+                ))
+                .into_any_element(),
+        )
+    }
+
     fn navigate(&mut self, page: Page, cx: &mut Context<Self>) {
         if self.pages.last() != Some(&page) {
             self.pages.push(page);
@@ -881,9 +990,13 @@ impl Omamusic {
         let this = cx.entity().downgrade();
         switch(id, label, checked, cx).on_change(move |on, _, _, cx| {
             let _ = this.update(cx, |this, cx| {
+                let lookup_before = this.prefs.online_lookup;
                 change(&mut this.prefs, on);
                 AppConfig::update(|c| change(c, on));
                 crate::desktop::set_cover_icon(!this.prefs.plain_tray_icon);
+                if this.prefs.online_lookup != lookup_before {
+                    this.library.set_online_lookup(this.prefs.online_lookup);
+                }
                 cx.notify();
             });
         })
@@ -1347,7 +1460,7 @@ impl Omamusic {
             .bg(theme.background)
             .hover(|s| s.bg(theme.hover_fill()))
             .cursor_pointer()
-            .child(self.cover(Some(&a.id), 128., &a.title, cx))
+            .child(self.badged_cover(&a.id, a.unmatched, 128., &a.title, cx))
             .on_click(cx.listener(move |this, _, _, cx| this.navigate(Page::Album(id.clone()), cx)))
             .child(
                 div()
@@ -1573,7 +1686,13 @@ impl Omamusic {
                             .flex()
                             .items_end()
                             .gap(rems(1.))
-                            .child(self.cover(Some(&album.id), 176., &album.title, cx))
+                            .child(self.badged_cover(
+                                &album.id,
+                                album.unmatched,
+                                176.,
+                                &album.title,
+                                cx,
+                            ))
                             .child(
                                 div()
                                     .flex()
@@ -1843,7 +1962,7 @@ impl Omamusic {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.omarchy();
+        let theme = cx.omarchy().clone();
         // Overlay backdrop
         div()
             .absolute()
@@ -1911,6 +2030,25 @@ impl Omamusic {
                                 |c, on| c.visual_effects = on,
                                 cx,
                             ))
+                            .child(self.pref_switch(
+                                "pref-online-lookup",
+                                "Complete missing tags and covers online",
+                                self.prefs.online_lookup,
+                                |c, on| c.online_lookup = on,
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .px(rems(0.3125))
+                                    .text_size(rems(0.6875))
+                                    .text_color(theme.secondary)
+                                    .child(
+                                        "Sends album and artist names to MusicBrainz, Apple and \
+                                         Deezer. Writes covers and missing tags into your music \
+                                         files.",
+                                    ),
+                            )
+                            .children(self.lookup_status(snap, cx))
                             .child(self.text_size_row(cx)),
                     )
                     .child(separator(cx))

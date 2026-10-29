@@ -5,6 +5,7 @@ pub mod db;
 pub mod desktop;
 pub mod index;
 pub mod library;
+pub mod lookup;
 pub mod metadata;
 pub mod models;
 pub mod mpris;
