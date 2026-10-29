@@ -132,13 +132,10 @@ const TRACK_ORDER: &str = "(t.track_number = 0), t.track_number, t.path";
 /// Album ordering used everywhere the album list is shown.
 const ALBUM_ORDER: &str = "a.artist COLLATE NOCASE, a.year, a.title COLLATE NOCASE";
 
-/// Columns of `albums`, aliased as `a`, in the order [`album_summary_from_row`]
-/// reads. `unmatched` marks albums the online lookup gave up on.
 const ALBUM_COLS: &str = "a.key, a.title, a.artist, a.year, a.track_count, \
      EXISTS(SELECT 1 FROM lookup l WHERE l.album_key = a.key \
      AND l.status IN ('unmatched', 'error')) AS unmatched";
 
-/// Failed attempts (network or bad answers) are retried after an hour.
 pub const ERROR_RETRY_SECS: i64 = 60 * 60;
 
 /// A SQLite file shared by the UI (reader) and the indexer (writer).
@@ -480,7 +477,6 @@ pub fn artwork(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>> {
     Ok(data.flatten())
 }
 
-/// Outcome of one online lookup attempt for an album.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupStatus {
     Matched,
@@ -514,25 +510,20 @@ pub struct LookupRow {
     pub release: Option<String>,
     pub release_group: Option<String>,
     pub score: Option<f64>,
-    /// "Artist – Title (year)" of the best candidate, shown to the user.
     pub candidate: Option<String>,
-    /// Unix seconds.
     pub attempted_at: i64,
 }
 
-/// An album the online lookup should work on, with what is known about it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LookupCandidate {
     pub album_key: String,
     pub title: String,
     pub artist: String,
     pub year: u32,
-    /// Bitmask from `index::MISSING_*`, OR of all tracks.
     pub tags_missing: u32,
     pub mb_release_group: String,
     pub needs_cover: bool,
     pub tracks: Vec<Track>,
-    /// MusicBrainz recording id per track, parallel to `tracks`, `""` when unknown.
     pub recordings: Vec<String>,
 }
 
@@ -556,7 +547,6 @@ pub fn record_lookup(conn: &Connection, row: &LookupRow) -> Result<()> {
     Ok(())
 }
 
-/// Albums the lookup gave up on or failed on, for the Settings list.
 pub fn unmatched_albums(conn: &Connection) -> Result<Vec<AlbumSummary>> {
     let sql = format!(
         "SELECT {ALBUM_COLS} FROM albums a \
@@ -575,7 +565,6 @@ pub fn clear_unmatched(conn: &Connection) -> Result<usize> {
     )?)
 }
 
-/// Store a cover fetched online so the UI can show it before the next scan.
 pub fn set_artwork(conn: &Connection, key: &str, data: &[u8]) -> Result<()> {
     conn.execute(
         "INSERT INTO artwork(album_key, data) VALUES (?1, ?2) \
@@ -585,9 +574,6 @@ pub fn set_artwork(conn: &Connection, key: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Albums with no cover or with missing tags that have not been tried within
-/// `retry_after` seconds of `now`. Never-tried albums come first, then the
-/// oldest attempts.
 pub fn albums_needing_lookup(
     conn: &Connection,
     now: i64,

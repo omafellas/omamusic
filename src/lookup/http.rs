@@ -1,6 +1,3 @@
-//! The only place that touches the network. Everything else in `lookup` talks
-//! to an [`Http`] so tests can replay canned responses.
-
 use anyhow::Result;
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
@@ -11,12 +8,9 @@ pub struct Response {
 }
 
 pub trait Http: Send + Sync + 'static {
-    /// One GET. Non-2xx statuses are returned as `Ok`; only transport
-    /// failures are errors.
     fn get(&self, url: &str) -> Result<Response>;
 }
 
-/// MusicBrainz requires a descriptive agent with contact information.
 pub const USER_AGENT: &str = concat!(
     "omamusic/",
     env!("CARGO_PKG_VERSION"),
@@ -25,8 +19,6 @@ pub const USER_AGENT: &str = concat!(
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Spaces calls so that any two are at least `min_gap` apart. MusicBrainz
-/// allows one request per second per client.
 pub struct Throttle {
     min_gap: Duration,
     last: Mutex<Option<Instant>>,
@@ -84,8 +76,6 @@ impl Http for UreqHttp {
     }
 }
 
-/// Canned responses keyed by URL prefix; the longest matching prefix wins and
-/// unknown URLs answer 404 with an empty body.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct FakeHttp {
@@ -105,7 +95,6 @@ impl FakeHttp {
         self
     }
 
-    /// Make every answer take this long, so a pass can be observed mid-way.
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
         self

@@ -14,8 +14,6 @@ pub fn album_key(dir: &str, album: &str) -> String {
     format!("{dir}\n{album}")
 }
 
-/// Bits of `tracks.tags_missing`: which fields came from file or folder
-/// names instead of tags, so the online lookup knows what to fill.
 pub const MISSING_TITLE: u32 = 1;
 pub const MISSING_ARTIST: u32 = 2;
 pub const MISSING_ALBUM: u32 = 4;
@@ -300,7 +298,6 @@ fn update_artwork(
     Ok(())
 }
 
-/// A cover fetched online earlier, kept outside the disposable database.
 fn cached_artwork(cache_dir: &Path, key: &str) -> Option<Vec<u8>> {
     std::fs::read(crate::lookup::write::cache_path(cache_dir, key))
         .ok()

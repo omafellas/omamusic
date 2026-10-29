@@ -23,7 +23,6 @@ pub struct Album {
     pub year: u32,
     #[serde(with = "arc_vec_serde")]
     pub tracks: Arc<[Track]>,
-    /// Online lookup ran and found no confident match.
     #[serde(default)]
     pub unmatched: bool,
 }
@@ -37,7 +36,6 @@ pub struct AlbumSummary {
     pub artist: String,
     pub year: u32,
     pub track_count: usize,
-    /// Online lookup ran and found no confident match.
     #[serde(default)]
     pub unmatched: bool,
 }

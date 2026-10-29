@@ -1,6 +1,3 @@
-//! Writing fetched covers and tags: into the cache directory, and into the
-//! audio files themselves.
-
 use anyhow::{anyhow, Context, Result};
 use lofty::config::{ParseOptions, ParsingMode, WriteOptions};
 use lofty::file::{AudioFile, FileType};
@@ -20,8 +17,6 @@ use std::path::{Path, PathBuf};
 
 const TEMP_SUFFIX: &str = ".omamusic-tmp";
 
-/// Values to write into one track. `None` fields are left alone, and a field
-/// that already has a value in the file is never replaced.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrackFill<'a> {
     pub title: Option<&'a str>,
@@ -37,16 +32,11 @@ pub struct TrackFill<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOutcome {
     Written,
-    /// Every requested field already had a value; the file was not touched.
     Unchanged,
-    /// The file or its directory is not writable; the file was not touched.
     ReadOnly,
-    /// A symlink or hard link; replacing it would break the link, so it was skipped.
     Linked,
 }
 
-/// Where a fetched cover for `album_key` is kept. The cache survives database
-/// rebuilds, so a cover is fetched once per album.
 pub fn cache_path(cache_dir: &Path, album_key: &str) -> PathBuf {
     let hash = Sha256::digest(album_key.as_bytes());
     let mut name = String::with_capacity(68);
@@ -66,9 +56,6 @@ pub fn save_cache_cover(cache_dir: &Path, album_key: &str, bytes: &[u8]) -> Resu
     Ok(path)
 }
 
-/// Add the missing tag values and the cover to the file at `path`. The
-/// rewrite goes through a temporary copy in the same directory that is
-/// renamed over the original, so a crash leaves the original intact.
 pub fn fill_file(path: &Path, fill: &TrackFill, cover: Option<&[u8]>) -> Result<WriteOutcome> {
     let link_info = std::fs::symlink_metadata(path)?;
     if link_info.file_type().is_symlink() || link_info.nlink() > 1 {
@@ -95,8 +82,6 @@ pub fn fill_file(path: &Path, fill: &TrackFill, cover: Option<&[u8]>) -> Result<
     }
 }
 
-/// A file read through its concrete lofty type so frames the generic tag
-/// cannot represent survive the rewrite.
 enum Edited {
     Mpeg(MpegFile),
     Flac(FlacFile),
@@ -122,8 +107,6 @@ impl Edited {
     }
 }
 
-/// Split the concrete tag into the part lofty can map and a remainder,
-/// change only the mapped part, and merge the remainder back.
 fn through<T: SplitTag>(
     tag: T,
     fill: &TrackFill,
@@ -227,7 +210,6 @@ fn read_only_or(err: std::io::Error, temp: &Path) -> Result<WriteOutcome> {
     Err(err.into())
 }
 
-/// Set each `Some` value whose slot is empty. Returns whether anything changed.
 fn apply(tag: &mut Tag, fill: &TrackFill, cover: Option<&[u8]>, has_picture: bool) -> bool {
     let mut changed = false;
     let texts = [

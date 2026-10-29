@@ -235,7 +235,6 @@ fn album(key: &str, title: &str, unmatched: bool) -> AlbumSummary {
     }
 }
 
-/// Wait for the background lookup thread, which `run_until_parked` cannot see.
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {

@@ -20,9 +20,6 @@ pub struct AppConfig {
     pub ui_scale: f64,
     /// Music-reactive background strip; on by default, switchable in Settings.
     pub visual_effects: bool,
-    /// Identify albums online and write missing covers and tags into the
-    /// files. Off by default: it sends album and artist names to third
-    /// parties and modifies the user's music.
     pub online_lookup: bool,
 }
 

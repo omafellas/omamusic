@@ -50,9 +50,6 @@ pub fn is_audio(path: &Path) -> bool {
         .is_some_and(|e| AUDIO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
 }
 
-/// Read tags, duration and embedded cover art. Any unreadable or untagged
-/// file yields an empty `AudioMetadata`; the indexer fills in names from the
-/// path.
 pub fn read(path: &Path) -> AudioMetadata {
     read_tagged(path).unwrap_or_default()
 }
@@ -499,11 +496,8 @@ fn id3_text(data: &[u8]) -> String {
         .to_string()
 }
 
-/// Synthetic audio files for tests across the crate.
 #[cfg(test)]
 pub(crate) mod fixtures {
-    /// ID3v2.3 header plus the given frames, followed by four silent MPEG-1
-    /// Layer III frames (128 kbit/s, 44.1 kHz, 417 bytes each).
     pub(crate) fn mp3_bytes(frames: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
         let mut body = Vec::new();
         for (id, data) in frames {
@@ -528,7 +522,6 @@ pub(crate) mod fixtures {
         out
     }
 
-    /// Minimal PCM WAV: `seconds` of silence at 8 kHz mono, 16-bit.
     pub(crate) fn wav_bytes(seconds: u32) -> Vec<u8> {
         let samples = 8000u32 * 2 * seconds;
         let mut out = Vec::new();

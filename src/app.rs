@@ -541,8 +541,6 @@ impl Omamusic {
         cover(&self.library, album_id, size, name, cx)
     }
 
-    /// A cover with a small warning badge when the online lookup could not
-    /// identify the album.
     fn badged_cover(
         &self,
         album_id: &str,

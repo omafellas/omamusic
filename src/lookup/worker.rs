@@ -1,7 +1,3 @@
-//! Background thread that identifies albums, fetches covers and writes them
-//! back, one album at a time, whenever the setting is on and a scan has just
-//! finished.
-
 use crate::artwork::ArtworkCache;
 use crate::db::{self, Db, LookupCandidate, LookupRow, LookupStatus};
 use crate::index::{MISSING_ALBUM, MISSING_ARTIST, MISSING_YEAR};
@@ -18,14 +14,12 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Albums are retried after 30 days: Cover Art Archive gains images over time.
 pub const RETRY_AFTER_SECS: i64 = 30 * 24 * 60 * 60;
 const MUSICBRAINZ_GAP: Duration = Duration::from_millis(1000);
 const BACKOFFS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(30)];
 const SCAN_POLL: Duration = Duration::from_millis(500);
 const UNKNOWN_ARTIST: &str = "Unknown Artist";
 
-/// MusicBrainz answered 503: the caller backs off instead of recording an error.
 #[derive(Debug)]
 pub struct RateLimited;
 
@@ -37,8 +31,6 @@ impl std::fmt::Display for RateLimited {
 
 impl std::error::Error for RateLimited {}
 
-/// The network is unreachable: the pass stops and resumes on the next wake
-/// instead of marking every album as failed.
 #[derive(Debug)]
 pub struct Offline;
 
@@ -67,8 +59,6 @@ pub struct WorkerDeps {
 pub struct Worker;
 
 impl Worker {
-    /// Start the thread. It publishes the current unmatched list right away
-    /// and then works only while enabled.
     pub fn spawn(deps: WorkerDeps, enabled: bool) -> Sender<Wake> {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || run_thread(deps, rx, enabled));
@@ -107,8 +97,6 @@ fn run_thread(deps: WorkerDeps, rx: Receiver<Wake>, mut enabled: bool) {
     }
 }
 
-/// One pass over everything that needs work. Returns the enabled flag, which
-/// a `SettingChanged(false)` received mid-pass turns off.
 fn run_pass(
     deps: &WorkerDeps,
     conn: &rusqlite::Connection,
@@ -123,8 +111,6 @@ fn run_pass(
     }
 }
 
-/// One pass over everything that needs work. Returns the enabled flag and
-/// whether a wake received mid-pass asks for another pass.
 fn run_once(
     deps: &WorkerDeps,
     conn: &rusqlite::Connection,
@@ -198,8 +184,6 @@ struct Drained {
     disconnected: bool,
 }
 
-/// Take every pending wake without blocking. The last setting change wins;
-/// any scan or retry asks for another pass.
 fn drain(rx: &Receiver<Wake>) -> Drained {
     let mut drained = Drained {
         enabled: None,
@@ -219,8 +203,6 @@ fn drain(rx: &Receiver<Wake>) -> Drained {
     }
 }
 
-/// Run `attempt`, sleeping through [`BACKOFFS`] on rate limits. `None` means
-/// the limit held through every backoff; other errors pass through.
 fn with_backoff(
     mut attempt: impl FnMut() -> Result<LookupRow>,
     mut sleep: impl FnMut(Duration),
@@ -238,8 +220,6 @@ fn with_backoff(
     }
 }
 
-/// Copy a cached cover into the index so it shows without waiting for a
-/// rescan, which never comes when the files could not be written.
 fn store_cover(conn: &rusqlite::Connection, cache_dir: &Path, album_key: &str) -> Result<bool> {
     let bytes = match std::fs::read(write::cache_path(cache_dir, album_key)) {
         Ok(bytes) if !bytes.is_empty() => bytes,
@@ -274,9 +254,6 @@ fn error_row(album_key: &str, now: i64) -> LookupRow {
     }
 }
 
-/// Identify one album, fetch its cover and write everything back. Transport
-/// and parse failures become an `Error` row; only [`RateLimited`] is returned
-/// as an error so the caller can back off.
 pub fn process_album(
     http: &dyn Http,
     throttle: &Throttle,
@@ -511,7 +488,6 @@ mod tests {
             Self::build(folder, Some(artist), true)
         }
 
-        /// Loose files by three different artists with no album tag.
         fn loose(folder: &str) -> Self {
             let mut fx = Self::build(folder, None, false);
             for (i, artist) in ["A", "B", "C"].into_iter().enumerate() {
@@ -524,9 +500,6 @@ mod tests {
             fx
         }
 
-        /// Three tracks of 1, 2 and 3 seconds in a folder named after the
-        /// album; `artist` and album are written when given, title and year
-        /// too when `full`.
         fn build(folder: &str, artist: Option<&str>, full: bool) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let root =

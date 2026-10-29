@@ -1,6 +1,3 @@
-//! Beets-style distance between a local album and a MusicBrainz release.
-//! Lower is better; [`accept`] decides whether a match is safe to write.
-
 use crate::lookup::musicbrainz::Release;
 use crate::lookup::text::{normalize, similarity};
 
@@ -20,31 +17,24 @@ const YEAR_FULL_PENALTY: f64 = 5.0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalAlbum {
     pub title: String,
-    /// The album name came from the folder, not a tag.
     pub title_from_folder: bool,
-    /// `None` when unknown; "Various Artists" is treated as unknown too.
     pub artist: Option<String>,
     pub year: u32,
     pub tracks: Vec<LocalTrack>,
-    /// Tags carried MusicBrainz ids, so the candidate came from them.
     pub has_ids: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalTrack {
     pub number: u32,
-    /// `None` when the title came from the file name.
     pub title: Option<String>,
-    /// Seconds; 0.0 when unknown.
     pub duration: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
     pub distance: f64,
-    /// For each local track, the index into `release.tracks` it was paired with.
     pub pairing: Vec<Option<usize>>,
-    /// Every local track has a known duration within tolerance of its pair.
     pub durations_matched: bool,
 }
 
@@ -122,8 +112,6 @@ pub fn distance(local: &LocalAlbum, release: &Release) -> Match {
     }
 }
 
-/// A match is written only when it is close and backed by evidence stronger
-/// than text: durations for every track, or ids from the tags themselves.
 pub fn accept(m: &Match, local: &LocalAlbum) -> bool {
     m.distance <= ACCEPT_THRESHOLD && (m.durations_matched || local.has_ids)
 }

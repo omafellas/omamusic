@@ -35,10 +35,8 @@ pub struct LibrarySnapshot {
     pub scanning: bool,
     pub query: String,
     pub version: u64,
-    /// Online lookup progress: albums left in the current pass, and the pass size.
     pub lookup_pending: usize,
     pub lookup_total: usize,
-    /// Albums the online lookup could not identify.
     pub lookup_unmatched: Vec<AlbumSummary>,
 }
 
@@ -144,8 +142,6 @@ impl Library {
         })
     }
 
-    /// Turn the online lookup on or off, persisting the choice. Turning it
-    /// on starts a pass right away.
     pub fn set_online_lookup(&self, on: bool) {
         AppConfig::update(|c| c.online_lookup = on);
         if let Some(tx) = &self.lookup_tx {
@@ -153,7 +149,6 @@ impl Library {
         }
     }
 
-    /// Forget every album the lookup gave up on and try them again.
     pub fn retry_unmatched(&self) {
         if let Err(err) = self.db.read(db::clear_unmatched) {
             eprintln!("online lookup: clear unmatched: {err:#}");
@@ -165,9 +160,6 @@ impl Library {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    /// Put one album into the index the way a scan would, and when
-    /// `summary.unmatched` is set, record that the online lookup gave up on
-    /// it. For view tests.
     pub fn insert_album(&self, summary: &AlbumSummary) {
         let path = format!("/music/{}/01.mp3", summary.title);
         let dir = format!("/music/{}", summary.title);
@@ -216,9 +208,6 @@ impl Library {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    /// A library with a real lookup worker talking to `http`, a database and
-    /// cache under `dir`, and no folder scanner. For tests of the wiring
-    /// between the switch, the worker and the views.
     pub fn with_lookup(dir: &Path, http: Arc<dyn crate::lookup::http::Http>) -> Result<Self> {
         let db = Arc::new(Db::open(dir.join("library.db"))?);
         let covers = ArtworkCache::default();

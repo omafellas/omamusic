@@ -1,6 +1,3 @@
-//! String normalization and similarity for matching local tags against
-//! MusicBrainz candidates.
-
 const EDITION_SUFFIXES: [&str; 7] = [
     "deluxe edition",
     "remastered",
@@ -11,8 +8,6 @@ const EDITION_SUFFIXES: [&str; 7] = [
     "expanded",
 ];
 
-/// Lowercase, without bracketed asides, a leading "the", punctuation, or
-/// trailing edition words, so "The Wall (Deluxe Edition)" and "Wall" agree.
 pub fn normalize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut depth = 0u32;
@@ -47,8 +42,6 @@ pub fn normalize(s: &str) -> String {
     text
 }
 
-/// Equal after lowercasing and dropping punctuation, nothing more. Used
-/// where a near miss would fetch the wrong album's cover.
 pub fn same_name(a: &str, b: &str) -> bool {
     let strict = |s: &str| {
         s.chars()
@@ -63,8 +56,6 @@ pub fn same_name(a: &str, b: &str) -> bool {
     !a.is_empty() && a == b
 }
 
-/// Normalized Levenshtein similarity in `[0, 1]`; 1.0 means equal after
-/// [`normalize`].
 pub fn similarity(a: &str, b: &str) -> f64 {
     let a: Vec<char> = normalize(a).chars().collect();
     let b: Vec<char> = normalize(b).chars().collect();

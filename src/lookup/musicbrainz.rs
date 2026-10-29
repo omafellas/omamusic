@@ -1,5 +1,3 @@
-//! MusicBrainz web service: query building and JSON parsing. No network here.
-
 use crate::lookup::text::normalize;
 use anyhow::{Context, Result};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -15,14 +13,12 @@ pub struct Release {
     pub title: String,
     pub artist: String,
     pub year: u32,
-    /// Number of discs or other media; track positions restart per medium.
     pub media: usize,
     pub tracks: Vec<ReleaseTrack>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReleaseTrack {
-    /// Position counted across all media, starting at 1.
     pub number: u32,
     pub title: String,
     pub artist: String,
@@ -30,7 +26,6 @@ pub struct ReleaseTrack {
     pub length_secs: Option<f64>,
 }
 
-/// Escape Lucene query syntax so album names are matched literally.
 pub fn lucene_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     let mut chars = s.chars().peekable();
@@ -53,8 +48,6 @@ pub fn lucene_escape(s: &str) -> String {
     out
 }
 
-/// Release search by album title, artist (skipped for compilations) and
-/// track count.
 pub fn search_url(album: &str, artist: Option<&str>, track_count: usize) -> String {
     let mut query = format!("release:\"{}\"", lucene_escape(album));
     if let Some(artist) = artist.filter(|a| normalize(a) != "various artists") {
@@ -67,7 +60,6 @@ pub fn search_url(album: &str, artist: Option<&str>, track_count: usize) -> Stri
     )
 }
 
-/// Releases of a known release group, for libraries whose tags carry ids.
 pub fn release_group_search_url(release_group: &str) -> String {
     format!(
         "{BASE}/?fmt=json&limit={SEARCH_LIMIT}&query={}",
@@ -79,7 +71,6 @@ pub fn release_url(id: &str) -> String {
     format!("{BASE}/{id}?fmt=json&inc=recordings+artist-credits+release-groups")
 }
 
-/// Release ids from a search response, best match first.
 pub fn parse_search(body: &[u8]) -> Result<Vec<String>> {
     let json: Value = serde_json::from_slice(body).context("MusicBrainz search response")?;
     Ok(json["releases"]

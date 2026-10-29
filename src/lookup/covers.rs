@@ -1,7 +1,3 @@
-//! Front cover sources, tried in order: Cover Art Archive by release, then by
-//! release group, then iTunes and Deezer by name. Every image is validated
-//! before it is accepted.
-
 use crate::lookup::http::{Http, Throttle};
 use crate::lookup::text::same_name;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -27,7 +23,6 @@ pub fn itunes_search_url(artist: &str, album: &str) -> String {
     )
 }
 
-/// The large artwork of the first result whose artist and album both match.
 pub fn itunes_pick(body: &[u8], artist: &str, album: &str) -> Option<String> {
     let json: Value = serde_json::from_slice(body).ok()?;
     json["results"].as_array()?.iter().find_map(|result| {
@@ -70,8 +65,6 @@ fn names_match(found_artist: &str, found_album: &str, artist: &str, album: &str)
     same_name(found_artist, artist) && same_name(found_album, album)
 }
 
-/// Accept only images that decode, are at least 300 px on the short side and
-/// close to square. Non-JPEG input is re-encoded so the cache holds one format.
 pub fn validate_image(bytes: &[u8]) -> Option<Vec<u8>> {
     let format = image::guess_format(bytes).ok()?;
     let decoded = image::load_from_memory(bytes).ok()?;
@@ -92,8 +85,6 @@ pub fn validate_image(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out.into_inner())
 }
 
-/// First valid cover from the sources in order. Cover Art Archive requests go
-/// through `throttle`; it shares MusicBrainz's rate limit.
 pub fn fetch_cover(
     http: &dyn Http,
     throttle: &Throttle,
