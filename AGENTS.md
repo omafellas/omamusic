@@ -48,6 +48,12 @@ facts (before vs after, inside vs outside bounds), never absolute colors, since
 the theme follows the machine. The file has no test harness; add a test to the
 list in `run()`.
 
+Pixel tests cover golden paths only: the settled frame after an action. Do not
+test animations whose timing depends on the wall clock. GPUI's `with_animation`
+runs on real time, so on a slow CI renderer the first frame is already settled
+and a before-vs-after assertion fails at random. Leave `reduce_motion` on, which
+`Scene` sets by default, and assert the final state.
+
 Run:
 
 ```sh
