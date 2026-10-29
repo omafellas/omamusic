@@ -47,15 +47,15 @@ jobs:
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mr-boxington-action@v1
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: mbx clippy --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --all-targets
+        run: mbx build --all-targets
 
       - name: Test
-        run: cargo test
+        run: mbx test
         env:
           RENDERING_REQUIRED: "1"
