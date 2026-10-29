@@ -13,11 +13,12 @@ use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::TestSupportExt;
 use gpui_kit::{
-    div, px, rems, uniform_list, Animation, AnimationExt as _, AnyElement, App, AppContext,
+    div, img, px, rems, uniform_list, Animation, AnimationExt as _, AnyElement, App, AppContext,
     ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler, FocusHandle, Focusable,
     FontWeight, HighlightStyle, ImageSource, InteractiveElement, IntoElement, MouseButton,
-    NavigationDirection, ParentElement, PathPromptOptions, Render, SharedString, Stateful,
-    StatefulInteractiveElement, StyleRefinement, Styled, StyledText, Window,
+    NavigationDirection, ObjectFit, ParentElement, PathPromptOptions, Render, SharedString,
+    Stateful, StatefulInteractiveElement, StyleRefinement, Styled, StyledImage as _, StyledText,
+    Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, keycap,
@@ -564,6 +565,7 @@ impl Omamusic {
         let view = std::env::var("OMADRIVE_VIEW").ok();
         let (section, pages, show_settings) = match view.as_deref() {
             Some("artists") => (Section::Artists, Vec::new(), false),
+            Some("genres") => (Section::Genres, Vec::new(), false),
             Some("songs") => (Section::Songs, Vec::new(), false),
             Some("queue") => (Section::Queue, Vec::new(), false),
             Some("settings") => (Section::Albums, Vec::new(), true),
@@ -2125,66 +2127,211 @@ impl Omamusic {
             .into_any_element()
     }
 
-    fn render_genre_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_genre_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let genres: Arc<[GenreEntry]> = self.library.genres().into();
         if genres.is_empty() {
             return empty_state("No Genres", "Songs with a genre tag show up here.", cx)
                 .into_any_element();
         }
+        let (columns, gap, card) = Self::grid_columns(window);
+        let rows = genres.len().div_ceil(columns);
         uniform_list(
             "genres",
-            genres.len(),
+            rows,
             cx.processor(move |this, range: Range<usize>, _, cx| {
                 range
-                    .map(|i| this.genre_row(i, &genres[i], cx))
+                    .map(|row| {
+                        let start = row * columns;
+                        let end = (start + columns).min(genres.len());
+                        div().flex().gap(gap).px(gap).pt(gap).children(
+                            (start..end).map(|idx| this.genre_tile(idx, &genres[idx], card, cx)),
+                        )
+                    })
                     .collect::<Vec<_>>()
             }),
         )
         .flex_1()
         .min_h_0()
+        .pb(gap)
         .into_any_element()
     }
 
-    fn genre_row(&self, i: usize, genre: &GenreEntry, cx: &mut Context<Self>) -> AnyElement {
+    fn genre_tile(
+        &self,
+        idx: usize,
+        genre: &GenreEntry,
+        size: f32,
+        cx: &mut Context<Self>,
+    ) -> Popover {
         let theme = cx.omarchy().clone();
         let name = genre.name.clone();
-        div()
-            .id(("genre", i))
+        let open_name = genre.name.clone();
+        let play_name = genre.name.clone();
+        let menu_name = genre.name.clone();
+        let sort = self.prefs.song_sort;
+        let group: SharedString = format!("genre-{idx}").into();
+        let count = format!(
+            "{} · {}",
+            plural(genre.song_count, "song"),
+            plural(genre.album_count, "album")
+        );
+        let tile = div()
+            .id(("genre", idx))
+            .test_support()
+            .aria_label(name.clone())
+            .group(group.clone())
+            .w(px(size))
+            .flex_none()
             .flex()
-            .items_center()
-            .gap(rems(0.75))
-            .px(rems(0.75))
-            .py(rems(0.5))
-            .border_b_1()
-            .border_color(theme.border)
-            .hover(|s| s.bg(theme.hover_fill()))
+            .flex_col()
+            .gap(rems(0.125))
             .cursor_pointer()
             .on_click(
-                cx.listener(move |this, _, _, cx| this.navigate(Page::Genre(name.clone()), cx)),
-            )
-            .child(
-                icon(IconName::Tag)
-                    .size(rems(0.875))
-                    .text_color(theme.secondary),
+                cx.listener(move |this, _, _, cx| {
+                    this.navigate(Page::Genre(open_name.clone()), cx)
+                }),
             )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
+                    .relative()
+                    .mb(rems(0.375))
+                    .child(self.genre_art(idx, genre, size, cx))
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .rounded(rems(0.5))
+                            .bg(theme.foreground.opacity(0.08))
+                            .opacity(0.)
+                            .group_hover(group.clone(), |s| s.opacity(1.)),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("genre-play-{name}").into()))
+                            .test_support()
+                            .aria_label(format!("Play {name}"))
+                            .absolute()
+                            .right(rems(0.5))
+                            .bottom(rems(0.5))
+                            .size(rems(2.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme.accent)
+                            .text_color(theme.background)
+                            .opacity(0.)
+                            .group_hover(group, |s| s.opacity(1.))
+                            .child(icon(IconName::Play).size(rems(0.875)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.tracks_action(
+                                    RowAction::Play,
+                                    &TrackList::Source(SongSource::Genre(play_name.clone(), sort)),
+                                    cx,
+                                );
+                            })),
+                    ),
+            )
+            .child(
+                div()
                     .text_size(rems(0.75))
+                    .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.foreground)
+                    .truncate()
                     .child(genre.name.clone()),
             )
             .child(
                 div()
+                    .id(("genre-count", idx))
+                    .test_support()
+                    .aria_label(count.clone())
                     .text_size(rems(0.6875))
                     .text_color(theme.secondary)
-                    .child(plural(genre.song_count, "song")),
-            )
+                    .truncate()
+                    .child(count),
+            );
+        self.context_menu(
+            ("genre-menu", idx),
+            tile,
+            ARTIST_ACTIONS,
+            move |this, action, cx| {
+                this.tracks_action(
+                    action,
+                    &TrackList::Source(SongSource::Genre(menu_name.clone(), sort)),
+                    cx,
+                )
+            },
+            cx,
+        )
+    }
+
+    /// A square of album covers from the genre: four in a mosaic when the
+    /// genre has that many covered albums, one filling the square otherwise,
+    /// and a tag glyph when none of its albums has art.
+    fn genre_art(&self, idx: usize, genre: &GenreEntry, size: f32, cx: &App) -> AnyElement {
+        let theme = cx.omarchy().clone();
+        let radius = rems(0.5);
+        let art = div()
+            .id(("genre-art", idx))
             .test_support()
-            .aria_label(genre.name.clone())
-            .into_any_element()
+            .size(px(size))
+            .flex_none()
+            .rounded(radius)
+            .bg(theme.hover_fill())
+            .border_1()
+            .border_color(theme.border);
+        let ids = &genre.cover_album_ids;
+        if ids.len() >= crate::db::GENRE_COVERS {
+            let cell = (size - 2.) / 2.;
+            return art
+                .flex()
+                .flex_wrap()
+                .overflow_hidden()
+                .children(
+                    ids.iter()
+                        .take(crate::db::GENRE_COVERS)
+                        .enumerate()
+                        .map(|(i, id)| {
+                            let corner = |d: Div| match i {
+                                0 => d.rounded_tl(radius),
+                                1 => d.rounded_tr(radius),
+                                2 => d.rounded_bl(radius),
+                                _ => d.rounded_br(radius),
+                            };
+                            corner(self.genre_cell(id, cell))
+                        }),
+                )
+                .into_any_element();
+        }
+        match ids.first() {
+            Some(id) => art
+                .overflow_hidden()
+                .child(self.genre_cell(id, size - 2.).rounded(radius))
+                .into_any_element(),
+            None => art
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    icon(IconName::Tag)
+                        .size(px(size * 0.3))
+                        .text_color(theme.secondary),
+                )
+                .into_any_element(),
+        }
+    }
+
+    fn genre_cell(&self, album_id: &str, size: f32) -> Div {
+        let cell = div().size(px(size)).flex_none().overflow_hidden();
+        match self.library.covers().cached(album_id, size as u32 * 2) {
+            Some(thumb) => cell.child(
+                img(ImageSource::Render(thumb.image))
+                    .size_full()
+                    .object_fit(ObjectFit::Cover),
+            ),
+            None => cell,
+        }
     }
 
     fn render_song_table(
@@ -2546,7 +2693,7 @@ impl Omamusic {
             }
             Section::Albums => self.render_albums_section(window, cx),
             Section::Artists => self.render_artist_list(cx),
-            Section::Genres => self.render_genre_list(cx),
+            Section::Genres => self.render_genre_list(window, cx),
             Section::Queue => self.render_queue(cx),
             Section::Playlist(id) => self.render_playlist(id, cx),
         }

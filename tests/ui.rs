@@ -754,6 +754,37 @@ async fn sidebar_sections_show_their_title_and_counts(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn genre_tiles_show_counts_and_play_the_genre(cx: &mut TestAppContext) {
+    let mut app = open_with(cx, songs_library());
+    app.click("nav-genres");
+    assert_eq!(app.label_of(("genre", 0usize)).as_deref(), Some("Jazz"));
+    assert_eq!(
+        app.label_of(("genre-count", 0usize)).as_deref(),
+        Some("1 song · 1 album")
+    );
+    assert_eq!(
+        app.label_of(("genre-count", 1usize)).as_deref(),
+        Some("2 songs · 1 album")
+    );
+    assert!(app.has(("genre-art", 1usize)), "a tile always has art");
+    app.hover_on(("genre", 1usize));
+    assert_eq!(app.label("genre-play-Rock").as_deref(), Some("Play Rock"));
+    app.click("genre-play-Rock");
+    assert_eq!(
+        app.queued(),
+        [
+            ("Mod-key".to_string(), "Mid".to_string()),
+            ("Mod-key".to_string(), "Mid".to_string())
+        ]
+    );
+    assert_eq!(
+        app.label("view-title").as_deref(),
+        Some("Genres"),
+        "the play button must not open the genre"
+    );
+}
+
+#[gpui_kit::test]
 async fn song_column_headers_sort_and_persist(cx: &mut TestAppContext) {
     let mut app = open_with(cx, songs_library());
     assert_eq!(

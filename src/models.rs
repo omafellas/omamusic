@@ -111,6 +111,10 @@ pub enum Section {
 pub struct GenreEntry {
     pub name: String,
     pub song_count: usize,
+    pub album_count: usize,
+    /// Up to four albums with cover art, the ones with most songs in the
+    /// genre first, for the tile mosaic.
+    pub cover_album_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

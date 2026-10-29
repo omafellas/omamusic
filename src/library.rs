@@ -217,6 +217,14 @@ impl Library {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_cover(&self, album_id: &str, png: &[u8]) {
+        self.db
+            .read(|conn| db::set_artwork(conn, album_id, png))
+            .expect("insert cover");
+        self.covers.remove(album_id);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn insert_song(&self, track: &Track, added_ns: i64) {
         let dir = track
             .path
@@ -377,10 +385,18 @@ impl Library {
     /// A library with no folders, watcher, or scanner thread; for view tests.
     pub fn empty() -> Self {
         let (rescan_tx, _rx) = mpsc::channel::<()>();
+        let db = Arc::new(Db::in_memory().expect("in-memory library database"));
+        let covers = ArtworkCache::default();
+        {
+            let db = db.clone();
+            covers.set_provider(Arc::new(move |key: &str| {
+                db.read(|conn| db::artwork(conn, key)).ok().flatten()
+            }));
+        }
         Self {
             state: Arc::new(RwLock::new(Arc::new(LibrarySnapshot::default()))),
-            db: Arc::new(Db::in_memory().expect("in-memory library database")),
-            covers: ArtworkCache::default(),
+            db,
+            covers,
             watcher: Mutex::new(None),
             rescan_tx,
             lookup_tx: None,

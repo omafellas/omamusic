@@ -365,18 +365,33 @@ pub fn songs_stats(conn: &Connection, genre: Option<&str>) -> Result<(usize, f64
     })?)
 }
 
+pub const GENRE_COVERS: usize = 4;
+
 pub fn genres(conn: &Connection) -> Result<Vec<GenreEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT genre, COUNT(*) FROM tracks WHERE genre != '' \
+        "SELECT genre, COUNT(*), COUNT(DISTINCT album_key) FROM tracks WHERE genre != '' \
          GROUP BY genre ORDER BY genre COLLATE NOCASE",
+    )?;
+    let mut covers = conn.prepare(
+        "SELECT t.album_key FROM tracks t \
+         JOIN artwork ar ON ar.album_key = t.album_key AND ar.data IS NOT NULL \
+         WHERE t.genre = ?1 GROUP BY t.album_key ORDER BY COUNT(*) DESC, t.album_key LIMIT ?2",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(GenreEntry {
             name: row.get(0)?,
             song_count: row.get::<_, i64>(1)?.max(0) as usize,
+            album_count: row.get::<_, i64>(2)?.max(0) as usize,
+            cover_album_ids: Vec::new(),
         })
     })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut genres = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for genre in &mut genres {
+        genre.cover_album_ids = covers
+            .query_map(params![genre.name, GENRE_COVERS as i64], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+    }
+    Ok(genres)
 }
 
 pub fn tracks_by_paths(conn: &Connection, paths: &[PathBuf]) -> Result<Vec<Track>> {
@@ -1146,6 +1161,34 @@ mod tests {
         assert_eq!(titles(AlbumSort::Title), ["Alef", "Beta", "Gamma"]);
         assert_eq!(titles(AlbumSort::Year), ["Gamma", "Beta", "Alef"]);
         assert_eq!(titles(AlbumSort::RecentlyAdded), ["Beta", "Alef", "Gamma"]);
+    }
+
+    #[test]
+    fn genres_count_albums_and_pick_covered_albums_first() {
+        let conn = memory();
+        insert_track(&conn, "/m/a/1.mp3", "A1", "Band", "Alpha", 1);
+        insert_track(&conn, "/m/a/2.mp3", "A2", "Band", "Alpha", 2);
+        insert_track(&conn, "/m/b/1.mp3", "B1", "Band", "Beta", 1);
+        insert_track(&conn, "/m/c/1.mp3", "C1", "Band", "Gamma", 1);
+        insert_track(&conn, "/m/d/1.mp3", "D1", "Band", "Delta", 1);
+        conn.execute_batch("UPDATE tracks SET genre = 'Rock'; UPDATE tracks SET genre = 'Jazz' WHERE album = 'Delta'")
+            .unwrap();
+        rebuild_albums(&conn);
+        let key = |dir: &str, album: &str| crate::index::album_key(dir, album);
+        set_artwork(&conn, &key("/m/b", "Beta"), b"png").unwrap();
+        set_artwork(&conn, &key("/m/c", "Gamma"), b"png").unwrap();
+        let genres = genres(&conn).unwrap();
+        assert_eq!(genres.len(), 2);
+        assert_eq!(genres[0].name, "Jazz");
+        assert_eq!((genres[0].song_count, genres[0].album_count), (1, 1));
+        assert!(genres[0].cover_album_ids.is_empty(), "Delta has no cover");
+        assert_eq!(genres[1].name, "Rock");
+        assert_eq!((genres[1].song_count, genres[1].album_count), (4, 3));
+        assert_eq!(
+            genres[1].cover_album_ids,
+            [key("/m/b", "Beta"), key("/m/c", "Gamma")],
+            "only albums with art, most songs first, then by key"
+        );
     }
 
     #[test]

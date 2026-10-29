@@ -90,6 +90,11 @@ mod pixels {
         }
 
         fn bounds(&mut self, id: &'static str) -> Bounds<Pixels> {
+            self.bounds_of(id)
+        }
+
+        fn bounds_of(&mut self, id: impl Into<gpui_kit::ElementId>) -> Bounds<Pixels> {
+            let id = id.into();
             self.cx
                 .update_window(self.handle, |_, window, _| window.find(id).bounds())
                 .unwrap()
@@ -185,6 +190,10 @@ mod pixels {
                 }
             }
             count
+        }
+
+        fn color_at(&self, p: gpui_kit::Point<Pixels>) -> [u8; 4] {
+            self.pixel(self.device(p.x), self.device(p.y))
         }
 
         fn ink(&self) -> usize {
@@ -312,6 +321,76 @@ mod pixels {
         );
     }
 
+    fn genre_tile_paints_its_art() {
+        let library = Arc::new(Library::empty());
+        for (i, album) in ["Afterglow", "Backwater", "Coastline", "Dusk"]
+            .iter()
+            .enumerate()
+        {
+            let id = album.to_lowercase();
+            library.insert_song(
+                &omamusic::models::Track {
+                    path: format!("/m/{album}/One.flac").into(),
+                    title: "One".into(),
+                    artist: "Neon Harbor".into(),
+                    album: album.to_string(),
+                    track_number: 1,
+                    year: 2020,
+                    duration: 230.0,
+                    album_id: id.clone(),
+                    genre: "Synth-pop".into(),
+                },
+                i as i64,
+            );
+            let mut png = Vec::new();
+            image::RgbaImage::from_pixel(
+                64,
+                64,
+                image::Rgba([40 + 50 * i as u8, 90, 200 - 40 * i as u8, 255]),
+            )
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+            library.insert_cover(&id, &png);
+        }
+        let mut scene = Scene::open_with(library);
+        scene.act(|window, cx| window.click("nav-genres", cx));
+        let art = scene.bounds_of(("genre-art", 0usize));
+        let center = |dx: f32, dy: f32| {
+            let quarter = art.size.width / 4.;
+            art.origin + gpui_kit::point(quarter * (1. + 2. * dx), quarter * (1. + 2. * dy))
+        };
+        let centers = [
+            center(0., 0.),
+            center(1., 0.),
+            center(0., 1.),
+            center(1., 1.),
+        ];
+        let close = |got: [u8; 4], want: [u8; 3]| {
+            got.iter()
+                .zip(want)
+                .all(|(&g, w)| (g as i32 - w as i32).abs() <= 12)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            scene.act(|_, _| {});
+            let capture = scene.capture();
+            let painted = centers.iter().enumerate().all(|(i, &p)| {
+                close(
+                    capture.color_at(p),
+                    [40 + 50 * i as u8, 90, 200 - 40 * i as u8],
+                )
+            });
+            if painted {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the mosaic must show the four covers in order at {art:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     fn hovering_a_song_reveals_its_play_button() {
         let library = Arc::new(Library::empty());
         library.insert_song(
@@ -357,7 +436,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 6] = [
+        let tests: [(&str, fn()); 7] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -372,6 +451,7 @@ mod pixels {
                 "hovering_an_album_paints_its_play_button",
                 hovering_an_album_paints_its_play_button,
             ),
+            ("genre_tile_paints_its_art", genre_tile_paints_its_art),
             (
                 "hovering_a_song_reveals_its_play_button",
                 hovering_a_song_reveals_its_play_button,
