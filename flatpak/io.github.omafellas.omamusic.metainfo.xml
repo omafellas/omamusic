@@ -12,7 +12,8 @@
   <url type="bugtracker">https://github.com/omafellas/omamusic/issues</url>
   <launchable type="desktop-id">io.github.omafellas.omamusic.desktop</launchable>
   <description>
-    <p>Local music only: no network, no accounts, no codecs to install.</p>
+    <p>Local music library with optional online tag and cover lookup
+       (MusicBrainz, AcoustID, Deezer). No accounts or codecs required.</p>
     <p>A SQLite-backed library with album, artist and song views, BM25
        full-text search, cover art, shuffle and repeat, MPRIS media
        integration, and a system tray icon — rendered in GPUI and following

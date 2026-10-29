@@ -59,3 +59,30 @@ jobs:
         run: cargo test
         env:
           RENDERING_REQUIRED: "1"
+
+  flatpak:
+    name: Flatpak build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install flatpak tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+
+      - name: Add Flathub remote
+        run: flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Install GNOME Platform and SDK 48
+        run: |
+          flatpak install -y --user flathub org.gnome.Platform//48 org.gnome.Sdk//48
+
+      - name: Build flatpak bundle
+        run: ./flatpak/build.sh
+
+      - name: Verify bundle produced
+        run: test -f io.github.omafellas.omamusic.flatpak
