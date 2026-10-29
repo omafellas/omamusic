@@ -352,6 +352,38 @@ async fn lookup_progress_is_shown_while_working(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn settings_hint_at_missing_acoustid_key(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    app.click("settings");
+    assert!(
+        app.exists("lookup-acoustid-hint"),
+        "without a key the settings explain how to enable fingerprinting"
+    );
+}
+
+#[gpui_kit::test]
+async fn no_acoustid_hint_once_a_key_is_configured(cx: &mut TestAppContext) {
+    let dir = isolated_config_dir();
+    std::fs::write(dir.join("config.json"), r#"{"acoustid_key": "k3y"}"#).unwrap();
+    let library = Arc::new(Library::empty());
+    let player = Arc::new(Player::new_test());
+    cx.update(|cx| {
+        gpui_omarchy::init(cx);
+        omamusic::init_actions(&library, &player, cx);
+    });
+    let (root, cx) = cx.add_window_view(|window, cx| Root::new(library, player, window, cx));
+    cx.run_until_parked();
+    let view = root.read_with(cx, |root, _| root.main().clone());
+    let mut app = Smoke {
+        view,
+        cx,
+        config_dir: dir,
+    };
+    app.click("settings");
+    assert!(!app.exists("lookup-acoustid-hint"));
+}
+
+#[gpui_kit::test]
 async fn saved_text_size_is_applied_on_start(cx: &mut TestAppContext) {
     let dir = isolated_config_dir();
     std::fs::write(dir.join("config.json"), r#"{"ui_scale": 1.5}"#).unwrap();

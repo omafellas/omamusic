@@ -90,6 +90,7 @@ impl Library {
                 cache_dir: cache_dir.clone(),
                 covers: covers.clone(),
                 state: state.clone(),
+                acoustid_key: config.acoustid_key.clone(),
             },
             config.online_lookup,
         );
@@ -226,6 +227,7 @@ impl Library {
                 cache_dir: dir.join("cache"),
                 covers: covers.clone(),
                 state: state.clone(),
+                acoustid_key: AppConfig::load().acoustid_key,
             },
             AppConfig::load().online_lookup,
         );

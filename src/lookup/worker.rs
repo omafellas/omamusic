@@ -3,6 +3,7 @@ use crate::db::{self, Db, LookupCandidate, LookupRow, LookupStatus};
 use crate::index::{MISSING_ALBUM, MISSING_ARTIST, MISSING_YEAR};
 use crate::library::{self, SharedSnapshot};
 use crate::lookup::covers::fetch_cover;
+use crate::lookup::fingerprint;
 use crate::lookup::http::{Http, Response, Throttle};
 use crate::lookup::musicbrainz::{self, Release};
 use crate::lookup::score::{self, LocalAlbum, LocalTrack, Match};
@@ -16,6 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const RETRY_AFTER_SECS: i64 = 30 * 24 * 60 * 60;
 const MUSICBRAINZ_GAP: Duration = Duration::from_millis(1000);
+const ACOUSTID_GAP: Duration = Duration::from_millis(340);
+const MAX_RELEASE_GROUPS_FROM_FINGERPRINTS: usize = 2;
 const BACKOFFS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(30)];
 const SCAN_POLL: Duration = Duration::from_millis(500);
 const UNKNOWN_ARTIST: &str = "Unknown Artist";
@@ -54,6 +57,35 @@ pub struct WorkerDeps {
     pub cache_dir: PathBuf,
     pub covers: ArtworkCache,
     pub state: SharedSnapshot,
+    pub acoustid_key: String,
+}
+
+pub struct Limits {
+    pub musicbrainz: Throttle,
+    pub acoustid: Throttle,
+}
+
+impl Limits {
+    pub fn new() -> Self {
+        Self {
+            musicbrainz: Throttle::new(MUSICBRAINZ_GAP),
+            acoustid: Throttle::new(ACOUSTID_GAP),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unlimited() -> Self {
+        Self {
+            musicbrainz: Throttle::new(Duration::ZERO),
+            acoustid: Throttle::new(Duration::ZERO),
+        }
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct Worker;
@@ -74,7 +106,7 @@ fn run_thread(deps: WorkerDeps, rx: Receiver<Wake>, mut enabled: bool) {
             return;
         }
     };
-    let throttle = Throttle::new(MUSICBRAINZ_GAP);
+    let limits = Limits::new();
     publish_unmatched(&deps, &conn);
     loop {
         let wake = match rx.recv() {
@@ -92,7 +124,7 @@ fn run_thread(deps: WorkerDeps, rx: Receiver<Wake>, mut enabled: bool) {
             Wake::ScanFinished => {}
         }
         if enabled {
-            enabled = run_pass(&deps, &conn, &throttle, &rx);
+            enabled = run_pass(&deps, &conn, &limits, &rx);
         }
     }
 }
@@ -100,11 +132,11 @@ fn run_thread(deps: WorkerDeps, rx: Receiver<Wake>, mut enabled: bool) {
 fn run_pass(
     deps: &WorkerDeps,
     conn: &rusqlite::Connection,
-    throttle: &Throttle,
+    limits: &Limits,
     rx: &Receiver<Wake>,
 ) -> bool {
     loop {
-        let (enabled, rerun) = run_once(deps, conn, throttle, rx);
+        let (enabled, rerun) = run_once(deps, conn, limits, rx);
         if !enabled || !rerun {
             return enabled;
         }
@@ -114,7 +146,7 @@ fn run_pass(
 fn run_once(
     deps: &WorkerDeps,
     conn: &rusqlite::Connection,
-    throttle: &Throttle,
+    limits: &Limits,
     rx: &Receiver<Wake>,
 ) -> (bool, bool) {
     let mut enabled = true;
@@ -149,7 +181,17 @@ fn run_once(
         if !enabled {
             break;
         }
-        let attempt = || process_album(&*deps.http, throttle, &deps.cache_dir, &album, unix_now());
+        let key = (!deps.acoustid_key.is_empty()).then_some(deps.acoustid_key.as_str());
+        let attempt = || {
+            process_album(
+                &*deps.http,
+                limits,
+                &deps.cache_dir,
+                key,
+                &album,
+                unix_now(),
+            )
+        };
         let row = match with_backoff(attempt, std::thread::sleep) {
             Ok(Some(row)) => row,
             Ok(None) => {
@@ -256,12 +298,13 @@ fn error_row(album_key: &str, now: i64) -> LookupRow {
 
 pub fn process_album(
     http: &dyn Http,
-    throttle: &Throttle,
+    limits: &Limits,
     cache_dir: &Path,
+    acoustid_key: Option<&str>,
     album: &LookupCandidate,
     now: i64,
 ) -> Result<LookupRow> {
-    match identify_and_write(http, throttle, cache_dir, album, now) {
+    match identify_and_write(http, limits, cache_dir, acoustid_key, album, now) {
         Ok(row) => Ok(row),
         Err(err)
             if err.downcast_ref::<RateLimited>().is_some()
@@ -278,12 +321,13 @@ pub fn process_album(
 
 fn identify_and_write(
     http: &dyn Http,
-    throttle: &Throttle,
+    limits: &Limits,
     cache_dir: &Path,
+    acoustid_key: Option<&str>,
     album: &LookupCandidate,
     now: i64,
 ) -> Result<LookupRow> {
-    let local = local_album(album);
+    let mut local = local_album(album);
     let mut row = LookupRow {
         album_key: album.album_key.clone(),
         status: LookupStatus::Unmatched,
@@ -293,14 +337,39 @@ fn identify_and_write(
         candidate: None,
         attempted_at: now,
     };
-    if local.title_from_folder && local.artist.is_none() {
-        return Ok(row);
+    let searchable = !(local.title_from_folder && local.artist.is_none());
+    let mut best = if searchable {
+        let search = if local.has_ids {
+            musicbrainz::release_group_search_url(&album.mb_release_group)
+        } else {
+            musicbrainz::search_url(&local.title, local.artist.as_deref(), local.tracks.len())
+        };
+        best_candidate(http, limits, &local, &search)?
+    } else {
+        None
+    };
+    let accepted = best.as_ref().is_some_and(|(_, m)| score::accept(m, &local));
+    if !accepted {
+        if let Some(key) = acoustid_key {
+            if let Some((by_sound, found)) = identify_by_sound(http, limits, key, album)? {
+                if found
+                    .as_ref()
+                    .is_some_and(|(_, m)| score::accept(m, &by_sound))
+                {
+                    local = by_sound;
+                    best = found;
+                } else if best.is_none() {
+                    best = found;
+                }
+            }
+        }
     }
-
-    let best = best_candidate(http, throttle, &local, album)?;
     if let Some((release, m)) = &best {
         row.score = Some(m.distance);
         row.candidate = Some(describe(release));
+    }
+    if !searchable && best.is_none() {
+        return Ok(row);
     }
 
     match best {
@@ -310,7 +379,7 @@ fn identify_and_write(
                 .then(|| {
                     fetch_cover(
                         http,
-                        throttle,
+                        &limits.musicbrainz,
                         Some(&release.id),
                         Some(&release.release_group),
                         &release.artist,
@@ -330,7 +399,7 @@ fn identify_and_write(
             if album.needs_cover && album.tags_missing == 0 {
                 if let Some(artist) = &local.artist {
                     if let Some(cover) =
-                        fetch_cover(http, throttle, None, None, artist, &local.title)
+                        fetch_cover(http, &limits.musicbrainz, None, None, artist, &local.title)
                     {
                         write::save_cache_cover(cache_dir, &album.album_key, &cover)?;
                     }
@@ -367,27 +436,88 @@ fn local_album(album: &LookupCandidate) -> LocalAlbum {
                     title: (track.title != stem && !track.title.is_empty())
                         .then(|| track.title.clone()),
                     duration: track.duration,
+                    recording: None,
                 }
             })
             .collect(),
     }
 }
 
+/// Fingerprint every track, ask AcoustID, and score the release groups the
+/// recordings belong to. Returns the local album annotated with recording
+/// ids and the best candidate, or `None` when nothing was recognised.
+type Candidate = Option<(Release, Match)>;
+
+fn identify_by_sound(
+    http: &dyn Http,
+    limits: &Limits,
+    key: &str,
+    album: &LookupCandidate,
+) -> Result<Option<(LocalAlbum, Candidate)>> {
+    let mut local = local_album(album);
+    let mut hits = Vec::with_capacity(album.tracks.len());
+    for track in &album.tracks {
+        let hit = match fingerprint::fingerprint(&track.path) {
+            Ok(print) => {
+                limits.acoustid.wait();
+                let url = fingerprint::lookup_url(key, print.duration, &print.compressed);
+                let Response { status, body } = http.get(&url).map_err(|err| {
+                    eprintln!("online lookup: AcoustID: {err:#}");
+                    anyhow::Error::from(Offline)
+                })?;
+                match status {
+                    200 => fingerprint::parse_lookup(&body).unwrap_or_else(|err| {
+                        eprintln!("online lookup: {}: {err:#}", track.path.display());
+                        fingerprint::Hit::default()
+                    }),
+                    other => {
+                        eprintln!("online lookup: AcoustID answered {other}");
+                        fingerprint::Hit::default()
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("online lookup: {err:#}");
+                fingerprint::Hit::default()
+            }
+        };
+        hits.push(hit);
+    }
+    let groups = fingerprint::vote_release_groups(&hits);
+    if groups.is_empty() {
+        return Ok(None);
+    }
+    for (track, hit) in local.tracks.iter_mut().zip(&hits) {
+        track.recording = hit.recording.clone();
+    }
+    local.has_ids = true;
+    let mut best: Option<(Release, Match)> = None;
+    for group in groups.iter().take(MAX_RELEASE_GROUPS_FROM_FINGERPRINTS) {
+        let found = best_candidate(
+            http,
+            limits,
+            &local,
+            &musicbrainz::release_group_search_url(group),
+        )?;
+        if let Some((release, m)) = found {
+            if best.as_ref().is_none_or(|(_, b)| m.distance < b.distance) {
+                best = Some((release, m));
+            }
+        }
+    }
+    Ok(Some((local, best)))
+}
+
 fn best_candidate(
     http: &dyn Http,
-    throttle: &Throttle,
+    limits: &Limits,
     local: &LocalAlbum,
-    album: &LookupCandidate,
+    search: &str,
 ) -> Result<Option<(Release, Match)>> {
-    let search = if local.has_ids {
-        musicbrainz::release_group_search_url(&album.mb_release_group)
-    } else {
-        musicbrainz::search_url(&local.title, local.artist.as_deref(), local.tracks.len())
-    };
-    let ids = musicbrainz::parse_search(&musicbrainz_get(http, throttle, &search)?)?;
+    let ids = musicbrainz::parse_search(&musicbrainz_get(http, limits, search)?)?;
     let mut best: Option<(Release, Match)> = None;
     for id in ids {
-        let body = match musicbrainz_get(http, throttle, &musicbrainz::release_url(&id)) {
+        let body = match musicbrainz_get(http, limits, &musicbrainz::release_url(&id)) {
             Ok(body) => body,
             Err(err)
                 if err.downcast_ref::<RateLimited>().is_some()
@@ -411,8 +541,8 @@ fn best_candidate(
     Ok(best)
 }
 
-fn musicbrainz_get(http: &dyn Http, throttle: &Throttle, url: &str) -> Result<Vec<u8>> {
-    throttle.wait();
+fn musicbrainz_get(http: &dyn Http, limits: &Limits, url: &str) -> Result<Vec<u8>> {
+    limits.musicbrainz.wait();
     let Response { status, body } = http.get(url).map_err(|err| {
         eprintln!("online lookup: {url}: {err:#}");
         anyhow::Error::from(Offline)
@@ -500,6 +630,22 @@ mod tests {
 
         fn complete(folder: &str, artist: &str) -> Self {
             Self::build(folder, Some(artist), true)
+        }
+
+        fn tones(folder: &str) -> Self {
+            let mut fx = Self::build(folder, None, false);
+            for (i, (seconds, hz)) in [(3u32, 300.0), (4, 600.0), (5, 900.0)]
+                .into_iter()
+                .enumerate()
+            {
+                std::fs::write(
+                    fx.music.join(format!("track{}.wav", i + 1)),
+                    fixtures::wav_tone(seconds, hz),
+                )
+                .unwrap();
+            }
+            index::reconcile(&mut fx.conn, std::slice::from_ref(&fx.music), &fx.cache).unwrap();
+            fx
         }
 
         fn loose(folder: &str) -> Self {
@@ -603,8 +749,8 @@ mod tests {
             .on("https://coverartarchive.org/release/r1", 200, png(400))
     }
 
-    fn throttle() -> Throttle {
-        Throttle::new(Duration::ZERO)
+    fn throttle() -> Limits {
+        Limits::unlimited()
     }
 
     #[test]
@@ -617,7 +763,7 @@ mod tests {
         );
         let http = matching_http();
 
-        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Matched);
         assert_eq!(row.release.as_deref(), Some("r1"));
         assert_eq!(row.release_group.as_deref(), Some("g1"));
@@ -676,7 +822,7 @@ mod tests {
             200,
             br#"{"releases":[]}"#.to_vec(),
         );
-        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Unmatched);
         assert_eq!(row.candidate, None);
         assert_eq!(fx.tracks(), before);
@@ -706,7 +852,7 @@ mod tests {
                 200,
                 release.as_bytes().to_vec(),
             );
-        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Unmatched);
         assert_eq!(row.candidate.as_deref(), Some("Radiohead – Kid A (2000)"));
         assert!(row.score.unwrap() > ACCEPT_THRESHOLD);
@@ -718,7 +864,7 @@ mod tests {
         let fx = Fixture::new("Downloads", None);
         let candidate = fx.candidate();
         let http = matching_http();
-        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Unmatched);
         assert!(http.requests().is_empty());
     }
@@ -735,7 +881,15 @@ mod tests {
             .unwrap();
         }
         std::fs::set_permissions(&fx.music, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let row = process_album(&matching_http(), &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(
+            &matching_http(),
+            &throttle(),
+            &fx.cache,
+            None,
+            &candidate,
+            NOW,
+        )
+        .unwrap();
         assert_eq!(row.status, LookupStatus::Matched);
         assert!(write::cache_path(&fx.cache, &candidate.album_key).exists());
         assert_eq!(fx.tracks()[0].title, "", "file left alone");
@@ -751,7 +905,8 @@ mod tests {
         }
         let fx = Fixture::new("Estranhos no Ninho", Some("Exxótica"));
         let candidate = fx.candidate();
-        let err = process_album(&Broken, &throttle(), &fx.cache, &candidate, NOW).unwrap_err();
+        let err =
+            process_album(&Broken, &throttle(), &fx.cache, None, &candidate, NOW).unwrap_err();
         assert!(err.downcast_ref::<Offline>().is_some());
     }
 
@@ -764,7 +919,7 @@ mod tests {
             200,
             b"<html>".to_vec(),
         );
-        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Error);
         assert_eq!(row.attempted_at, NOW);
     }
@@ -786,9 +941,87 @@ mod tests {
                 RELEASE.as_bytes().to_vec(),
             )
             .on("https://coverartarchive.org/release/r1", 200, png(400));
-        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Matched);
         assert_eq!(row.release.as_deref(), Some("r1"));
+    }
+
+    const TONES_RELEASE: &str = r#"{
+        "id":"r1","title":"Estranhos no Ninho","date":"2002-06-01",
+        "artist-credit":[{"name":"Exxótica","joinphrase":""}],
+        "release-group":{"id":"g1","first-release-date":"2002"},
+        "media":[{"tracks":[
+            {"position":1,"title":"No Palco","length":3000,"recording":{"id":"rec-1"}},
+            {"position":2,"title":"Fruto Proibido","length":4000,"recording":{"id":"rec-2"}},
+            {"position":3,"title":"Gato Preto","length":5000,"recording":{"id":"rec-3"}}
+        ]}]}"#;
+
+    fn acoustid_routes(fx: &Fixture, http: FakeHttp) -> FakeHttp {
+        let mut http = http;
+        for i in 1..=3 {
+            let fp =
+                crate::lookup::fingerprint::fingerprint(&fx.music.join(format!("track{i}.wav")))
+                    .unwrap();
+            let body = format!(
+                r#"{{"status":"ok","results":[{{"id":"x","score":0.95,"recordings":[{{"id":"rec-{i}","releasegroups":[{{"id":"g1"}}]}}]}}]}}"#
+            );
+            http = http.on(
+                &crate::lookup::fingerprint::lookup_url("k3y", fp.duration, &fp.compressed),
+                200,
+                body.into_bytes(),
+            );
+        }
+        http
+    }
+
+    #[test]
+    fn untagged_folder_is_identified_by_fingerprint() {
+        let fx = Fixture::tones("Downloads");
+        let candidate = fx.candidate();
+        let http = acoustid_routes(
+            &fx,
+            FakeHttp::new()
+                .on(
+                    "https://musicbrainz.org/ws/2/release/?",
+                    200,
+                    SEARCH.as_bytes().to_vec(),
+                )
+                .on(
+                    "https://musicbrainz.org/ws/2/release/r1",
+                    200,
+                    TONES_RELEASE.as_bytes().to_vec(),
+                )
+                .on("https://coverartarchive.org/release/r1", 200, png(400)),
+        );
+        let row =
+            process_album(&http, &throttle(), &fx.cache, Some("k3y"), &candidate, NOW).unwrap();
+        assert_eq!(row.status, LookupStatus::Matched, "{row:?}");
+        let tracks = fx.tracks();
+        assert_eq!(tracks[0].title, "No Palco");
+        assert_eq!(tracks[1].title, "Fruto Proibido");
+        assert_eq!(tracks[2].title, "Gato Preto");
+        assert_eq!(tracks[0].artist, "Exxótica");
+        assert_eq!(tracks[0].album, "Estranhos no Ninho");
+        assert_eq!(tracks[2].mb_recording, "rec-3");
+        let requests = http.requests();
+        assert!(
+            requests
+                .iter()
+                .take(3)
+                .all(|u| u.starts_with("https://api.acoustid.org/v2/lookup?client=k3y")),
+            "{requests:?}"
+        );
+        assert!(requests[3].contains("rgid%3Ag1"), "{requests:?}");
+    }
+
+    #[test]
+    fn without_a_key_untagged_folders_stay_unmatched_offline() {
+        let fx = Fixture::tones("Downloads");
+        let candidate = fx.candidate();
+        let http = matching_http();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
+        assert_eq!(row.status, LookupStatus::Unmatched);
+        assert!(http.requests().is_empty());
     }
 
     #[test]
@@ -797,7 +1030,7 @@ mod tests {
         let candidate = fx.candidate();
         assert_eq!(candidate.artist, "Various Artists");
         let http = matching_http();
-        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Unmatched);
         assert!(http.requests().is_empty());
     }
@@ -886,7 +1119,7 @@ mod tests {
                 200,
                 release.as_bytes().to_vec(),
             );
-        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Matched);
         let tracks = fx.tracks();
         assert_eq!(tracks[2].title, "Gato Preto");
@@ -901,7 +1134,7 @@ mod tests {
         let fx = Fixture::new("Estranhos no Ninho", Some("Exxótica"));
         let candidate = fx.candidate();
         let http = FakeHttp::new().on("https://musicbrainz.org/ws/2/release/?", 503, b"".to_vec());
-        let err = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap_err();
+        let err = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap_err();
         assert!(err.downcast_ref::<RateLimited>().is_some());
     }
 
@@ -922,7 +1155,7 @@ mod tests {
                 itunes.as_bytes().to_vec(),
             )
             .on("https://x/1200x1200bb.jpg", 200, png(600));
-        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Unmatched);
         assert!(!write::cache_path(&fx.cache, &candidate.album_key).exists());
         assert_eq!(http.requests().len(), 1, "only MusicBrainz was asked");
@@ -946,7 +1179,7 @@ mod tests {
                 itunes.as_bytes().to_vec(),
             )
             .on("https://x/1200x1200bb.jpg", 200, png(600));
-        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let row = process_album(&http, &throttle(), &fx.cache, None, &candidate, NOW).unwrap();
         assert_eq!(
             row.status,
             LookupStatus::Unmatched,

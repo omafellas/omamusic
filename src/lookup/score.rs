@@ -29,6 +29,7 @@ pub struct LocalTrack {
     pub number: u32,
     pub title: Option<String>,
     pub duration: f64,
+    pub recording: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,7 +64,9 @@ pub fn distance(local: &LocalAlbum, release: &Release) -> Match {
         weighted: 0.0,
         weight: 0.0,
     };
-    total.add(WEIGHT_ALBUM, 1.0 - similarity(&local.title, &release.title));
+    if !local.title_from_folder {
+        total.add(WEIGHT_ALBUM, 1.0 - similarity(&local.title, &release.title));
+    }
     if let Some(artist) = local
         .artist
         .as_deref()
@@ -117,6 +120,9 @@ pub fn accept(m: &Match, local: &LocalAlbum) -> bool {
 }
 
 fn pair(local: &LocalAlbum, release: &Release) -> Vec<Option<usize>> {
+    if local.tracks.iter().any(|t| t.recording.is_some()) {
+        return pair_by_recording(local, release);
+    }
     let numbers: Vec<u32> = local.tracks.iter().map(|t| t.number).collect();
     let mut sorted = numbers.clone();
     sorted.sort_unstable();
@@ -129,27 +135,58 @@ fn pair(local: &LocalAlbum, release: &Release) -> Vec<Option<usize>> {
         return numbers.iter().map(|n| Some(*n as usize - 1)).collect();
     }
 
+    let mut pairing = vec![None; local.tracks.len()];
+    let mut taken = vec![false; release.tracks.len()];
+    pair_by_duration(local, release, &mut pairing, &mut taken);
+    pairing
+}
+
+fn pair_by_recording(local: &LocalAlbum, release: &Release) -> Vec<Option<usize>> {
+    let mut pairing = vec![None; local.tracks.len()];
+    let mut taken = vec![false; release.tracks.len()];
+    for (i, track) in local.tracks.iter().enumerate() {
+        let Some(recording) = track.recording.as_deref().filter(|r| !r.is_empty()) else {
+            continue;
+        };
+        if let Some(j) = release
+            .tracks
+            .iter()
+            .position(|other| other.recording == recording)
+        {
+            if !taken[j] {
+                pairing[i] = Some(j);
+                taken[j] = true;
+            }
+        }
+    }
+    pair_by_duration(local, release, &mut pairing, &mut taken);
+    pairing
+}
+
+fn pair_by_duration(
+    local: &LocalAlbum,
+    release: &Release,
+    pairing: &mut [Option<usize>],
+    taken: &mut [bool],
+) {
     let mut candidates: Vec<(f64, usize, usize)> = Vec::new();
     for (i, track) in local.tracks.iter().enumerate() {
-        if track.duration <= 0.0 {
+        if track.duration <= 0.0 || pairing[i].is_some() {
             continue;
         }
         for (j, other) in release.tracks.iter().enumerate() {
-            if let Some(length) = other.length_secs {
+            if let Some(length) = other.length_secs.filter(|_| !taken[j]) {
                 candidates.push(((track.duration - length).abs(), i, j));
             }
         }
     }
     candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut pairing = vec![None; local.tracks.len()];
-    let mut taken = vec![false; release.tracks.len()];
     for (_, i, j) in candidates {
         if pairing[i].is_none() && !taken[j] {
             pairing[i] = Some(j);
             taken[j] = true;
         }
     }
-    pairing
 }
 
 #[cfg(test)]
@@ -193,6 +230,7 @@ mod tests {
                     number: i as u32 + 1,
                     title: title.map(str::to_string),
                     duration: *secs,
+                    recording: None,
                 })
                 .collect(),
         }
@@ -315,6 +353,50 @@ mod tests {
         loc.has_ids = true;
         let m = distance(&loc, &rel);
         assert!(accept(&m, &loc));
+    }
+
+    #[test]
+    fn recording_ids_pair_tracks_before_numbers_or_durations() {
+        let rel = release("Estranhos no Ninho", "Exxótica", 2002, &NINHO);
+        let mut loc = local(
+            "Estranhos no Ninho",
+            None,
+            &[(None, 188.0), (None, 243.0), (None, 201.5)],
+        );
+        for (track, rec) in loc.tracks.iter_mut().zip(["rec-2", "rec-0", "rec-1"]) {
+            track.number = 0;
+            track.recording = Some(rec.into());
+        }
+        loc.has_ids = true;
+        let m = distance(&loc, &rel);
+        assert_eq!(m.pairing, [Some(2), Some(0), Some(1)]);
+        assert!(accept(&m, &loc));
+
+        loc.tracks[0].recording = Some("unknown".into());
+        let m = distance(&loc, &rel);
+        assert_eq!(
+            m.pairing,
+            [Some(2), Some(0), Some(1)],
+            "unknown ids fall back to durations"
+        );
+    }
+
+    #[test]
+    fn folder_name_is_not_held_against_a_candidate() {
+        let rel = release("Estranhos no Ninho", "Exxótica", 2002, &NINHO);
+        let mut loc = local(
+            "Downloads",
+            None,
+            &[(None, 243.0), (None, 201.5), (None, 188.0)],
+        );
+        loc.title_from_folder = true;
+        let m = distance(&loc, &rel);
+        assert!(m.distance < 0.01, "{}", m.distance);
+        loc.title_from_folder = false;
+        assert!(
+            distance(&loc, &rel).distance > ACCEPT_THRESHOLD,
+            "a tagged title that disagrees counts"
+        );
     }
 
     #[test]

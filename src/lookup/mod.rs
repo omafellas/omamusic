@@ -1,4 +1,5 @@
 pub mod covers;
+pub mod fingerprint;
 pub mod http;
 pub mod musicbrainz;
 pub mod score;

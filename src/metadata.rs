@@ -498,6 +498,24 @@ fn id3_text(data: &[u8]) -> String {
 
 #[cfg(test)]
 pub(crate) mod fixtures {
+    /// PCM WAV with a sine tone, for fingerprint tests that need real signal.
+    pub(crate) fn wav_tone(seconds: u32, hz: f64) -> Vec<u8> {
+        let rate = 8000u32;
+        let frames = rate * seconds;
+        let mut out = wav_bytes(0);
+        let data_len = frames * 2;
+        out.truncate(out.len() - 4);
+        out.extend_from_slice(&data_len.to_le_bytes());
+        for i in 0..frames {
+            let t = i as f64 / rate as f64;
+            let sample = ((t * hz * std::f64::consts::TAU).sin() * 12000.0) as i16;
+            out.extend_from_slice(&sample.to_le_bytes());
+        }
+        let riff_len = (out.len() - 8) as u32;
+        out[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        out
+    }
+
     pub(crate) fn mp3_bytes(frames: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
         let mut body = Vec::new();
         for (id, data) in frames {

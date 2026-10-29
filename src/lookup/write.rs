@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use lofty::config::{ParseOptions, ParsingMode, WriteOptions};
 use lofty::file::{AudioFile, FileType};
 use lofty::flac::FlacFile;
+use lofty::id3::v2::{Frame, Id3v2Tag, UniqueFileIdentifierFrame};
 use lofty::iff::aiff::AiffFile;
 use lofty::iff::wav::WavFile;
 use lofty::mp4::Mp4File;
@@ -118,6 +119,27 @@ fn through<T: SplitTag>(
     (remainder.merge_tag(generic), changed)
 }
 
+/// lofty does not create a `UFID` frame from a generic recording id, so ID3
+/// tags get the MusicBrainz identifier frame added by hand.
+/// Workaround for lofty 0.22; the read side already understands the frame.
+fn ensure_recording_frame(tag: &mut Id3v2Tag, recording: Option<&str>) -> bool {
+    let Some(recording) = recording.filter(|r| !r.is_empty() && r.is_ascii()) else {
+        return false;
+    };
+    let owner = "http://musicbrainz.org";
+    let present = (&*tag)
+        .into_iter()
+        .any(|frame| matches!(frame, Frame::UniqueFileIdentifier(ufid) if ufid.owner == owner));
+    if present {
+        return false;
+    }
+    tag.insert(Frame::UniqueFileIdentifier(UniqueFileIdentifierFrame::new(
+        owner.to_string(),
+        recording.as_bytes().to_vec(),
+    )));
+    true
+}
+
 fn edit(path: &Path, fill: &TrackFill, cover: Option<&[u8]>) -> Result<Option<Edited>> {
     let options = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
     let file_type = lofty::probe::Probe::open(path)?
@@ -128,22 +150,25 @@ fn edit(path: &Path, fill: &TrackFill, cover: Option<&[u8]>) -> Result<Option<Ed
     let (edited, changed) = match file_type {
         FileType::Mpeg => {
             let mut audio = MpegFile::read_from(&mut file, options)?;
-            let (tag, changed) =
+            let (mut tag, mut changed) =
                 through(audio.remove_id3v2().unwrap_or_default(), fill, cover, false);
+            changed |= ensure_recording_frame(&mut tag, fill.recording);
             audio.set_id3v2(tag);
             (Edited::Mpeg(audio), changed)
         }
         FileType::Wav => {
             let mut audio = WavFile::read_from(&mut file, options)?;
-            let (tag, changed) =
+            let (mut tag, mut changed) =
                 through(audio.remove_id3v2().unwrap_or_default(), fill, cover, false);
+            changed |= ensure_recording_frame(&mut tag, fill.recording);
             audio.set_id3v2(tag);
             (Edited::Wav(audio), changed)
         }
         FileType::Aiff => {
             let mut audio = AiffFile::read_from(&mut file, options)?;
-            let (tag, changed) =
+            let (mut tag, mut changed) =
                 through(audio.remove_id3v2().unwrap_or_default(), fill, cover, false);
+            changed |= ensure_recording_frame(&mut tag, fill.recording);
             audio.set_id3v2(tag);
             (Edited::Aiff(audio), changed)
         }
@@ -337,7 +362,7 @@ mod tests {
             track_number: Some(7),
             release_group: Some("rg-1"),
             release: Some("rel-1"),
-            recording: None,
+            recording: Some("rec-9"),
         };
         assert_eq!(
             fill_file(&path, &fill, Some(&png())).unwrap(),
@@ -351,6 +376,10 @@ mod tests {
         assert_eq!(meta.track_number, 7);
         assert_eq!(meta.mb_release_group, "rg-1");
         assert_eq!(meta.mb_release, "rel-1");
+        assert_eq!(
+            meta.mb_recording, "rec-9",
+            "new recording ids land in a UFID frame"
+        );
         assert_eq!(meta.artwork, Some(png()));
         assert!(
             (meta.duration - 1.0).abs() < 0.01,

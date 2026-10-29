@@ -21,6 +21,10 @@ pub struct AppConfig {
     /// Music-reactive background strip; on by default, switchable in Settings.
     pub visual_effects: bool,
     pub online_lookup: bool,
+    /// AcoustID application key for identifying untagged files by sound.
+    /// Empty disables fingerprinting; a build-time `OMAMUSIC_ACOUSTID_KEY`
+    /// provides the default.
+    pub acoustid_key: String,
 }
 
 impl Default for AppConfig {
@@ -35,8 +39,15 @@ impl Default for AppConfig {
             ui_scale: 1.0,
             visual_effects: true,
             online_lookup: false,
+            acoustid_key: default_acoustid_key(),
         }
     }
+}
+
+pub fn default_acoustid_key() -> String {
+    option_env!("OMAMUSIC_ACOUSTID_KEY")
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Where the system keeps music, if the platform exposes it.
@@ -143,6 +154,16 @@ mod tests {
         assert!(!cfg.online_lookup);
         let cfg: AppConfig = serde_json::from_str(r#"{"online_lookup": true}"#).unwrap();
         assert!(cfg.online_lookup);
+    }
+
+    #[test]
+    fn acoustid_key_round_trips_and_defaults_to_the_build_key() {
+        let cfg: AppConfig = serde_json::from_str(r#"{"acoustid_key": "abc"}"#).unwrap();
+        assert_eq!(cfg.acoustid_key, "abc");
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.acoustid_key, default_acoustid_key());
+        let back: AppConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.acoustid_key, cfg.acoustid_key);
     }
 
     #[test]

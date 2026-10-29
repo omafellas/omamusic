@@ -2044,10 +2044,25 @@ impl Omamusic {
                                     .text_color(theme.secondary)
                                     .child(
                                         "Sends album and artist names to MusicBrainz, Apple and \
-                                         Deezer. Writes covers and missing tags into your music \
-                                         files.",
+                                         Deezer, and audio fingerprints to AcoustID when a key is \
+                                         set. Writes covers and missing tags into your music files.",
                                     ),
                             )
+                            .when(self.prefs.acoustid_key.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .id("lookup-acoustid-hint")
+                                        .test_support()
+                                        .px(rems(0.3125))
+                                        .text_size(rems(0.6875))
+                                        .text_color(theme.secondary)
+                                        .child(
+                                            "Untagged files can also be identified by sound: get a \
+                                             free AcoustID application key, put it in config.json \
+                                             as \"acoustid_key\" and restart.",
+                                        ),
+                                )
+                            })
                             .children(self.lookup_status(snap, cx))
                             .child(self.text_size_row(cx)),
                     )
