@@ -24,8 +24,8 @@ use gpui_kit::{
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, keycap,
-    keycaps, menu, panel, separator, switch, with_tooltip, ActiveTheme, Button, ButtonVariant,
-    IconName, MenuItem,
+    keycaps, menu, separator, switch, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName,
+    MenuItem,
 };
 use rand::Rng;
 use std::cell::Cell;
@@ -4498,28 +4498,48 @@ impl Omamusic {
             .justify_center()
             .p(rems(1.))
             .child(
-                panel("Settings", cx)
+                div()
                     .id("settings-panel")
                     .w(rems(32.))
                     .max_h_full()
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
+                    .min_w_0()
                     .gap(rems(0.5))
+                    .p(rems(1.125))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .font_family(theme.font.clone())
+                    .text_size(rems(0.75))
+                    .text_color(theme.foreground)
                     .child(
-                        div().flex().items_center().justify_end().child(
-                            icon_button(
-                                "close-settings-x",
-                                IconName::Close,
-                                "Close settings",
-                                ButtonVariant::Secondary,
-                                cx,
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .id("settings-title")
+                                    .test_support()
+                                    .text_size(rems(0.875))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Settings"),
                             )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.show_settings = false;
-                                cx.notify();
-                            })),
-                        ),
+                            .child(
+                                icon_button(
+                                    "close-settings-x",
+                                    IconName::Close,
+                                    "Close settings",
+                                    ButtonVariant::Secondary,
+                                    cx,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_settings = false;
+                                    cx.notify();
+                                })),
+                            ),
                     )
                     .child(separator(cx))
                     .child(

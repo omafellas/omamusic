@@ -317,6 +317,27 @@ async fn settings_buttons_change_text_size(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn settings_close_button_is_aligned_with_title(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    app.click("settings");
+
+    let title = app.bounds("settings-title");
+    let close = app.bounds("close-settings-x");
+    let title_center = title.origin.y.as_f32() + title.size.height.as_f32() / 2.0;
+    let close_center = close.origin.y.as_f32() + close.size.height.as_f32() / 2.0;
+    assert!(
+        (title_center - close_center).abs() <= 1.0,
+        "the close button is vertically centered with the Settings title"
+    );
+
+    app.click("close-settings-x");
+    assert!(
+        !app.has("settings-panel"),
+        "clicking the close button closes Settings"
+    );
+}
+
+#[gpui_kit::test]
 async fn online_lookup_switch_persists_to_config(cx: &mut TestAppContext) {
     let mut app = open(cx);
     app.click("settings");
