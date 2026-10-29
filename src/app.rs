@@ -1329,14 +1329,14 @@ impl Omamusic {
         id: &'static str,
         row: usize,
         list: TrackList,
-        queue: bool,
+        RowRole { queue, current }: RowRole,
         content: Stateful<Div>,
         cx: &mut Context<Self>,
     ) -> Popover {
         let theme = cx.omarchy().clone();
         let click_list = list.clone();
         let content = content
-            .when(self.selection.contains(&row), |d| {
+            .when(!current && self.selection.contains(&row), |d| {
                 d.bg(theme.selected_fill())
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
@@ -2815,8 +2815,19 @@ impl Omamusic {
             .child(heart)
             .child(div().w(rems(1.5)).flex_shrink_0().child(more))
             .child(text_cell(SongColumn::Time, format_time(t.duration)));
-        self.track_row("song", i, row.list.clone(), false, content, cx)
+        let role = RowRole {
+            queue: false,
+            current: is_current,
+        };
+        self.track_row("song", i, row.list.clone(), role, content, cx)
     }
+}
+
+/// Where a track row lives and whether it holds the current track.
+#[derive(Clone, Copy)]
+struct RowRole {
+    queue: bool,
+    current: bool,
 }
 
 struct SongRow<'a> {
@@ -3673,7 +3684,10 @@ impl Omamusic {
                 "album-track-menu",
                 i,
                 TrackList::Loaded(album.tracks.clone()),
-                false,
+                RowRole {
+                    queue: false,
+                    current: is_current,
+                },
                 row,
                 cx,
             )
@@ -4317,7 +4331,10 @@ impl Omamusic {
             "queue-menu",
             i,
             TrackList::Loaded(queue.clone()),
-            true,
+            RowRole {
+                queue: true,
+                current: is_current,
+            },
             row,
             cx,
         )

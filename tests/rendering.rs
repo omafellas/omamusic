@@ -642,6 +642,15 @@ mod pixels {
             !close(playing.color_at(probe), resting.color_at(probe)),
             "the playing row must be filled across its width at {probe:?}"
         );
+        scene.act(|window, cx| window.click(("song", 0usize), cx));
+        scene.act(|window, cx| window.hover("nav-songs", cx));
+        let selected = scene.capture();
+        assert!(
+            close(selected.color_at(probe), playing.color_at(probe)),
+            "selecting the playing row keeps its fill: {:?} vs {:?}",
+            selected.color_at(probe),
+            playing.color_at(probe)
+        );
     }
 
     fn album_rows_have_no_separator_lines() {
