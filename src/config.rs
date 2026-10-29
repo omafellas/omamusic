@@ -1,4 +1,4 @@
-use crate::models::{AlbumSort, AlbumView};
+use crate::models::{AlbumSort, AlbumView, SongSort};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -28,6 +28,7 @@ pub struct AppConfig {
     pub acoustid_key: String,
     pub album_sort: AlbumSort,
     pub album_view: AlbumView,
+    pub song_sort: SongSort,
 }
 
 impl Default for AppConfig {
@@ -45,6 +46,7 @@ impl Default for AppConfig {
             acoustid_key: default_acoustid_key(),
             album_sort: AlbumSort::default(),
             album_view: AlbumView::default(),
+            song_sort: SongSort::default(),
         }
     }
 }

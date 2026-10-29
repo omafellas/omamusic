@@ -7,7 +7,7 @@ use crate::db::{self, Db};
 use crate::index;
 use crate::lookup::http::UreqHttp;
 use crate::lookup::worker::{Wake, Worker, WorkerDeps};
-use crate::models::{Album, AlbumSort, AlbumSummary, ArtistEntry, Track};
+use crate::models::{Album, AlbumSort, AlbumSummary, ArtistEntry, GenreEntry, SongSort, Track};
 use crate::search;
 use anyhow::{Context, Result};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -24,6 +24,14 @@ pub struct Filter {
     pub track_ids: Arc<[i64]>,
     pub album_keys: Arc<[String]>,
     pub artists: Arc<[ArtistEntry]>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SongSource {
+    Search,
+    Library(SongSort),
+    Genre(String, SongSort),
+    Paths(Arc<[PathBuf]>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -204,6 +212,45 @@ impl Library {
             }
             if summary.unmatched {
                 s.lookup_unmatched.push(summary.clone());
+            }
+        });
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_song(&self, track: &Track, added_ns: i64) {
+        let dir = track
+            .path
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.db
+            .read(|conn| {
+                conn.execute(
+                    "INSERT INTO tracks(path, dir, title, artist, album, album_key, genre, \
+                     track_number, year, duration, mtime_ns, size) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
+                    rusqlite::params![
+                        track.path.to_string_lossy(),
+                        dir,
+                        track.title,
+                        track.artist,
+                        track.album,
+                        track.album_id,
+                        track.genre,
+                        track.track_number,
+                        track.year,
+                        track.duration,
+                        added_ns
+                    ],
+                )?;
+                conn.execute_batch(index::REBUILD_ALBUMS)?;
+                Ok(())
+            })
+            .expect("insert song");
+        Self::reload(&self.state, &self.db);
+        update(&self.state, |s| {
+            if s.folders.is_empty() {
+                s.folders.push(PathBuf::from("/music"));
             }
         });
     }
@@ -449,6 +496,69 @@ impl Library {
             None => self.db.read(db::all_tracks),
         };
         result.unwrap_or_default()
+    }
+
+    pub fn song_total(&self, source: &SongSource) -> usize {
+        match source {
+            SongSource::Search => self.track_total(),
+            SongSource::Library(_) => self.snapshot().track_count,
+            SongSource::Genre(..) => self.song_stats(source).0,
+            SongSource::Paths(_) => self.songs(source).len(),
+        }
+    }
+
+    pub fn song_stats(&self, source: &SongSource) -> (usize, f64) {
+        let genre = match source {
+            SongSource::Library(_) => None,
+            SongSource::Genre(name, _) => Some(name.as_str()),
+            SongSource::Search | SongSource::Paths(_) => {
+                let songs = self.songs(source);
+                return (songs.len(), songs.iter().map(|t| t.duration).sum());
+            }
+        };
+        self.db
+            .read(|conn| db::songs_stats(conn, genre))
+            .unwrap_or_default()
+    }
+
+    pub fn song_page(&self, source: &SongSource, offset: usize, limit: usize) -> Vec<Track> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        match source {
+            SongSource::Search => self.track_page(offset, limit),
+            SongSource::Library(sort) => self
+                .db
+                .read(|conn| db::songs_page(conn, *sort, None, offset, limit))
+                .unwrap_or_default(),
+            SongSource::Genre(name, sort) => self
+                .db
+                .read(|conn| db::songs_page(conn, *sort, Some(name), offset, limit))
+                .unwrap_or_default(),
+            SongSource::Paths(_) => self
+                .songs(source)
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect(),
+        }
+    }
+
+    pub fn songs(&self, source: &SongSource) -> Vec<Track> {
+        match source {
+            SongSource::Search => self.tracks_for_play(),
+            SongSource::Paths(paths) => self
+                .db
+                .read(|conn| db::tracks_by_paths(conn, paths))
+                .unwrap_or_default(),
+            SongSource::Library(_) | SongSource::Genre(..) => {
+                self.song_page(source, 0, i64::MAX as usize)
+            }
+        }
+    }
+
+    pub fn genres(&self) -> Vec<GenreEntry> {
+        self.db.read(db::genres).unwrap_or_default()
     }
 
     pub fn album_total(&self) -> usize {

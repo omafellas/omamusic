@@ -11,7 +11,7 @@ use std::io::BufReader;
 use std::num::NonZero;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -56,6 +56,8 @@ struct Shared {
     /// Loudness meter (f32 bits, 0.0..=1.0) of the most recent output block,
     /// written by the audio callback and read by the visual effects.
     level: AtomicU32,
+    pending: AtomicUsize,
+    loaded: Mutex<Option<Track>>,
     channels: usize,
     sample_rate: u32,
 }
@@ -270,6 +272,7 @@ fn apply_command(
         Command::Shutdown => return false,
     }
     shared.changed();
+    shared.pending.fetch_sub(1, Ordering::AcqRel);
     true
 }
 
@@ -413,6 +416,8 @@ impl Player {
                 ..Default::default()
             }),
             audio: Mutex::new(AudioBuffer::default()),
+            pending: AtomicUsize::new(0),
+            loaded: Mutex::new(None),
             listeners: Mutex::new(Vec::new()),
             level: AtomicU32::new(0),
             channels: channels as usize,
@@ -453,8 +458,8 @@ impl Player {
             p.queue = queue.into();
             select(&mut p, index)
         };
-        self.load(track);
         self.shared.changed();
+        self.load(track);
     }
 
     pub fn subscribe(&self) -> async_channel::Receiver<()> {
@@ -493,8 +498,8 @@ impl Player {
 
     pub fn jump(&self, index: usize) {
         let track = select(&mut self.shared.playback.lock(), index);
-        self.load(track);
         self.shared.changed();
+        self.load(track);
     }
 
     pub fn queue(&self) -> (Arc<[Track]>, Option<usize>) {
@@ -506,8 +511,16 @@ impl Player {
         let Some(track) = track else {
             return false;
         };
-        let _ = self.commands.send(Command::Load(track));
+        *self.shared.loaded.lock() = Some(track.clone());
+        self.send(Command::Load(track));
         true
+    }
+
+    fn send(&self, command: Command) {
+        self.shared.pending.fetch_add(1, Ordering::AcqRel);
+        if self.commands.send(command).is_err() {
+            self.shared.pending.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     pub fn toggle(&self) {
@@ -541,7 +554,7 @@ impl Player {
         stop(&mut p);
         p.queue = Arc::new([]);
         p.order.clear();
-        let _ = self.commands.send(Command::Clear);
+        self.send(Command::Clear);
         drop(p);
         self.shared.changed();
     }
@@ -578,7 +591,7 @@ impl Player {
     pub fn seek(&self, secs: f64) {
         if self.current().is_some() && secs.is_finite() {
             let secs = secs.max(0.0);
-            let _ = self.commands.send(Command::Seek(secs));
+            self.send(Command::Seek(secs));
         }
     }
 
@@ -695,6 +708,21 @@ impl Drop for Player {
 
 #[cfg(any(test, feature = "test-support"))]
 impl Player {
+    pub fn settle(&self) {
+        let start = std::time::Instant::now();
+        while self.shared.pending.load(Ordering::Acquire) > 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "player commands did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub fn last_loaded(&self) -> Option<Track> {
+        self.shared.loaded.lock().clone()
+    }
+
     pub fn new_test() -> Self {
         let mut player = Self::create(2, 48_000, 1.0);
         player.test_running.store(true, Ordering::Relaxed);
@@ -735,6 +763,7 @@ mod tests {
             year: 0,
             duration: 0.0,
             album_id: String::new(),
+            genre: String::new(),
         }
     }
 

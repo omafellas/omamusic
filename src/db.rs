@@ -5,7 +5,9 @@
 //! `tracks` is the source of truth; `albums` is a materialized roll-up used for
 //! album-level search; the two FTS5 tables back BM25 search.
 
-use crate::models::{Album, AlbumSort, AlbumSummary, ArtistEntry, Track};
+use crate::models::{
+    Album, AlbumSort, AlbumSummary, ArtistEntry, GenreEntry, SongColumn, SongSort, Track,
+};
 use anyhow::Result;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -124,7 +126,7 @@ DROP TABLE IF EXISTS lookup;
 
 /// Columns of `tracks`, aliased as `t`, in the order [`track_from_row`] reads.
 const TRACK_COLS: &str =
-    "t.path, t.title, t.artist, t.album, t.album_key, t.track_number, t.year, t.duration";
+    "t.path, t.title, t.artist, t.album, t.album_key, t.track_number, t.year, t.duration, t.genre";
 
 /// Order of tracks inside an album. Numbered tracks sort by number first, the
 /// rest by path, matching the ordering the player used before SQLite.
@@ -255,6 +257,7 @@ fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Track> {
         year: row.get::<_, i64>("year")?.max(0) as u32,
         duration: row.get("duration")?,
         album_id: row.get("album_key")?,
+        genre: row.get("genre")?,
     })
 }
 
@@ -306,6 +309,90 @@ pub fn tracks_page(conn: &Connection, offset: usize, limit: usize) -> Result<Vec
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![limit as i64, offset as i64], track_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn song_order(sort: SongSort) -> String {
+    let dir = if sort.descending { "DESC" } else { "ASC" };
+    match sort.column {
+        SongColumn::Album => format!(
+            "a.artist COLLATE NOCASE {dir}, a.year {dir}, a.title COLLATE NOCASE {dir}, {TRACK_ORDER}"
+        ),
+        SongColumn::Title => {
+            format!("t.title COLLATE NOCASE {dir}, t.artist COLLATE NOCASE, t.path")
+        }
+        SongColumn::Artist => format!(
+            "t.artist COLLATE NOCASE {dir}, a.year, a.title COLLATE NOCASE, {TRACK_ORDER}"
+        ),
+        SongColumn::Genre => format!(
+            "(t.genre = ''), t.genre COLLATE NOCASE {dir}, {ALBUM_ORDER}, {TRACK_ORDER}"
+        ),
+        SongColumn::Time => format!("t.duration {dir}, t.title COLLATE NOCASE, t.path"),
+        SongColumn::Added => format!("t.mtime_ns {dir}, {ALBUM_ORDER}, {TRACK_ORDER}"),
+    }
+}
+
+fn genre_clause(genre: Option<&str>) -> &'static str {
+    if genre.is_some() {
+        "WHERE t.genre = ?3"
+    } else {
+        "WHERE ?3 IS NULL"
+    }
+}
+
+pub fn songs_page(
+    conn: &Connection,
+    sort: SongSort,
+    genre: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<Track>> {
+    let sql = format!(
+        "SELECT {TRACK_COLS} FROM tracks t JOIN albums a ON a.key = t.album_key {} \
+         ORDER BY {} LIMIT ?1 OFFSET ?2",
+        genre_clause(genre),
+        song_order(sort)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![limit as i64, offset as i64, genre], track_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn songs_stats(conn: &Connection, genre: Option<&str>) -> Result<(usize, f64)> {
+    let sql = "SELECT COUNT(*), COALESCE(SUM(t.duration), 0) FROM tracks t \
+               WHERE (?1 IS NULL OR t.genre = ?1)";
+    Ok(conn.query_row(sql, params![genre], |row| {
+        Ok((row.get::<_, i64>(0)?.max(0) as usize, row.get::<_, f64>(1)?))
+    })?)
+}
+
+pub fn genres(conn: &Connection) -> Result<Vec<GenreEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT genre, COUNT(*) FROM tracks WHERE genre != '' \
+         GROUP BY genre ORDER BY genre COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(GenreEntry {
+            name: row.get(0)?,
+            song_count: row.get::<_, i64>(1)?.max(0) as usize,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn tracks_by_paths(conn: &Connection, paths: &[PathBuf]) -> Result<Vec<Track>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {TRACK_COLS} FROM tracks t WHERE t.path = ?1"
+    ))?;
+    let mut tracks = Vec::with_capacity(paths.len());
+    for path in paths {
+        if let Some(track) = stmt
+            .query_row(params![path.to_string_lossy()], track_from_row)
+            .optional()?
+        {
+            tracks.push(track);
+        }
+    }
+    Ok(tracks)
 }
 
 pub fn all_tracks(conn: &Connection) -> Result<Vec<Track>> {
@@ -1059,6 +1146,72 @@ mod tests {
         assert_eq!(titles(AlbumSort::Title), ["Alef", "Beta", "Gamma"]);
         assert_eq!(titles(AlbumSort::Year), ["Gamma", "Beta", "Alef"]);
         assert_eq!(titles(AlbumSort::RecentlyAdded), ["Beta", "Alef", "Gamma"]);
+    }
+
+    #[test]
+    fn songs_follow_the_chosen_column_and_direction() {
+        let conn = memory();
+        insert_track(&conn, "/m/a/1.mp3", "Bravo", "Zeta", "One", 1);
+        insert_track(&conn, "/m/b/1.mp3", "Alpha", "Mid", "Two", 1);
+        insert_track(&conn, "/m/c/1.mp3", "Charlie", "Alpha", "Three", 1);
+        conn.execute_batch(
+            "UPDATE tracks SET duration = 30, mtime_ns = 5, genre = 'Rock' WHERE title = 'Bravo';
+             UPDATE tracks SET duration = 10, mtime_ns = 9, genre = 'Jazz' WHERE title = 'Alpha';
+             UPDATE tracks SET duration = 20, mtime_ns = 1 WHERE title = 'Charlie';",
+        )
+        .unwrap();
+        rebuild_albums(&conn);
+        let titles = |column, descending, genre: Option<&str>| -> Vec<String> {
+            songs_page(&conn, SongSort { column, descending }, genre, 0, 10)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.title)
+                .collect()
+        };
+        assert_eq!(
+            titles(SongColumn::Album, false, None),
+            ["Charlie", "Alpha", "Bravo"]
+        );
+        assert_eq!(
+            titles(SongColumn::Title, false, None),
+            ["Alpha", "Bravo", "Charlie"]
+        );
+        assert_eq!(
+            titles(SongColumn::Title, true, None),
+            ["Charlie", "Bravo", "Alpha"]
+        );
+        assert_eq!(
+            titles(SongColumn::Time, false, None),
+            ["Alpha", "Charlie", "Bravo"]
+        );
+        assert_eq!(
+            titles(SongColumn::Added, true, None),
+            ["Alpha", "Bravo", "Charlie"]
+        );
+        assert_eq!(
+            titles(SongColumn::Genre, false, None),
+            ["Alpha", "Bravo", "Charlie"]
+        );
+        assert_eq!(titles(SongColumn::Title, false, Some("Rock")), ["Bravo"]);
+        assert_eq!(songs_stats(&conn, None).unwrap(), (3, 60.0));
+        assert_eq!(songs_stats(&conn, Some("Jazz")).unwrap(), (1, 10.0));
+        let genres: Vec<(String, usize)> = genres(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.name, g.song_count))
+            .collect();
+        assert_eq!(genres, [("Jazz".to_string(), 1), ("Rock".to_string(), 1)]);
+        let paths = [
+            PathBuf::from("/m/c/1.mp3"),
+            PathBuf::from("/gone.mp3"),
+            PathBuf::from("/m/a/1.mp3"),
+        ];
+        let found: Vec<String> = tracks_by_paths(&conn, &paths)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+        assert_eq!(found, ["Charlie", "Bravo"]);
     }
 
     #[test]

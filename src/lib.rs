@@ -11,6 +11,7 @@ pub mod models;
 pub mod mpris;
 pub mod player;
 pub mod player_bar;
+pub mod playlists;
 pub mod search;
 pub mod tray;
 
@@ -36,6 +37,7 @@ actions!(
         Rescan,
         FocusSearch,
         GoBack,
+        GoForward,
         IncreaseFontSize,
         DecreaseFontSize,
         ResetFontSize,
@@ -51,6 +53,7 @@ pub fn key_bindings() -> Vec<gpui_kit::KeyBinding> {
         gpui_kit::KeyBinding::new("ctrl-r", Rescan, None),
         gpui_kit::KeyBinding::new("ctrl-f", FocusSearch, None),
         gpui_kit::KeyBinding::new("alt-left", GoBack, None),
+        gpui_kit::KeyBinding::new("alt-right", GoForward, None),
         gpui_kit::KeyBinding::new("ctrl-=", IncreaseFontSize, None),
         gpui_kit::KeyBinding::new("ctrl--", DecreaseFontSize, None),
         gpui_kit::KeyBinding::new("ctrl-0", ResetFontSize, None),
@@ -141,6 +144,6 @@ mod tests {
     fn key_bindings_parse() {
         // `KeyBinding::new` panics on an invalid keystroke, so building the
         // real list validates every shortcut, including ctrl-= / ctrl--.
-        assert_eq!(key_bindings().len(), 10);
+        assert_eq!(key_bindings().len(), 11);
     }
 }

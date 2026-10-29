@@ -3,7 +3,7 @@
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{px, ElementId, Entity, Pixels, TestAppContext, VisualTestContext};
 use omamusic::lookup::http::FakeHttp;
-use omamusic::models::AlbumSummary;
+use omamusic::models::{AlbumSummary, Track};
 use omamusic::{AppConfig, Library, Omamusic, Player, Root};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -100,8 +100,30 @@ impl Smoke<'_> {
             window.render_frame(cx);
             act(window, cx)
         });
-        std::thread::sleep(Duration::from_millis(200));
+        self.view
+            .read_with(self.cx, |view, _| view.player.clone())
+            .settle();
         self.cx.run_until_parked();
+    }
+
+    fn right_click_on(&mut self, id: impl Into<ElementId>) {
+        let id = id.into();
+        self.cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.right_click(id, cx)
+        });
+        self.cx.run_until_parked();
+    }
+
+    fn typing(&mut self, text: &str) {
+        self.cx.update(|window, cx| window.input(text, cx));
+        self.cx.run_until_parked();
+    }
+
+    fn playlists_file(&self) -> serde_json::Value {
+        let text =
+            std::fs::read_to_string(self.config_dir.join("playlists.json")).unwrap_or_default();
+        serde_json::from_str(&text).unwrap_or_default()
     }
 
     fn hover_on(&mut self, id: impl Into<ElementId>) {
@@ -566,7 +588,13 @@ async fn album_page_links_to_the_artist_and_other_albums(cx: &mut TestAppContext
     ]);
     let mut app = open_with(cx, library);
     app.click("nav-albums");
-    assert!(!app.has("nav-back"), "no history on a top-level view");
+    assert_eq!(app.label("view-title").as_deref(), Some("Albums"));
+    app.click("nav-back");
+    assert_eq!(
+        app.label("view-title").as_deref(),
+        Some("Albums"),
+        "no history on a top-level view"
+    );
 
     app.click_on(("album", 0usize));
     assert_eq!(app.label("album-title").as_deref(), Some("Arquivo"));
@@ -574,7 +602,6 @@ async fn album_page_links_to_the_artist_and_other_albums(cx: &mut TestAppContext
         app.label("album-meta").as_deref(),
         Some("2002 · 1 song · 3 min")
     );
-    assert!(app.has("nav-back"));
     assert_eq!(
         app.label_of(("more-by", 0usize)).as_deref(),
         Some("Estranhos no Ninho")
@@ -587,7 +614,7 @@ async fn album_page_links_to_the_artist_and_other_albums(cx: &mut TestAppContext
     );
 
     app.click("album-artist");
-    assert_eq!(app.label("artist-title").as_deref(), Some("Exxótica"));
+    assert_eq!(app.label("view-title").as_deref(), Some("Exxótica"));
 
     app.press("alt-left");
     assert_eq!(
@@ -602,7 +629,7 @@ async fn album_page_links_to_the_artist_and_other_albums(cx: &mut TestAppContext
     assert_eq!(app.queued(), [("k2".to_string(), "Exxótica".to_string())]);
 
     app.click("nav-back");
-    assert!(!app.has("nav-back"));
+    assert_eq!(app.label("view-title").as_deref(), Some("Albums"));
     assert!(app.has(("album", 0usize)), "back lands on the grid");
 }
 
@@ -660,7 +687,7 @@ async fn search_scopes_and_top_result_navigate_and_come_back(cx: &mut TestAppCon
 
     app.click("search-scope-all");
     app.click("search-top-result");
-    assert_eq!(app.label("artist-title").as_deref(), Some("Exxótica"));
+    assert_eq!(app.label("view-title").as_deref(), Some("Exxótica"));
 
     app.click("nav-back");
     assert!(app.has("search-top-result"), "back returns to the results");
@@ -670,5 +697,206 @@ async fn search_scopes_and_top_result_navigate_and_come_back(cx: &mut TestAppCon
     assert!(
         !app.has("search-summary"),
         "a section click ends the search"
+    );
+}
+
+fn song(title: &str, artist: &str, album: &str, genre: &str) -> Track {
+    Track {
+        path: PathBuf::from(format!("/music/{album}/{title}.flac")),
+        title: title.to_string(),
+        artist: artist.to_string(),
+        album: album.to_string(),
+        track_number: 1,
+        year: 2001,
+        duration: 200.0,
+        album_id: format!("{album}-key"),
+        genre: genre.to_string(),
+    }
+}
+
+fn songs_library() -> Arc<Library> {
+    let library = Arc::new(Library::empty());
+    library.insert_song(&song("Alpha", "Zeta", "Zed", "Jazz"), 10);
+    library.insert_song(&song("Bravo", "Mid", "Mod", "Rock"), 30);
+    library.insert_song(&song("Charlie", "Mid", "Mod", "Rock"), 20);
+    library
+}
+
+#[gpui_kit::test]
+async fn sidebar_sections_show_their_title_and_counts(cx: &mut TestAppContext) {
+    let mut app = open_with(cx, songs_library());
+    assert_eq!(app.label("view-title").as_deref(), Some("Songs"));
+    assert_eq!(
+        app.label("view-detail").as_deref(),
+        Some("3 songs · 10 min")
+    );
+
+    app.click("nav-recent");
+    assert_eq!(app.label("view-title").as_deref(), Some("Recently Added"));
+    assert_eq!(
+        app.label_of(("song-play", 0usize)).as_deref(),
+        Some("Play Bravo"),
+        "newest file first"
+    );
+
+    app.click("nav-genres");
+    assert_eq!(app.label("view-detail").as_deref(), Some("2 genres"));
+    assert_eq!(app.label_of(("genre", 1usize)).as_deref(), Some("Rock"));
+    app.click_on(("genre", 1usize));
+    assert_eq!(app.label("view-title").as_deref(), Some("Rock"));
+    assert_eq!(app.label("view-detail").as_deref(), Some("2 songs · 7 min"));
+    assert_eq!(
+        app.label_of(("song-play", 0usize)).as_deref(),
+        Some("Play Bravo")
+    );
+    assert!(!app.has(("song-play", 2usize)), "only the genre's songs");
+    assert_eq!(app.label("library-status").as_deref(), Some("Up to date"));
+}
+
+#[gpui_kit::test]
+async fn song_column_headers_sort_and_persist(cx: &mut TestAppContext) {
+    let mut app = open_with(cx, songs_library());
+    assert_eq!(
+        app.label_of(("song-play", 0usize)).as_deref(),
+        Some("Play Bravo"),
+        "album order by default"
+    );
+
+    app.click("song-col-title");
+    assert_eq!(
+        app.label_of(("song-play", 0usize)).as_deref(),
+        Some("Play Alpha")
+    );
+    assert_eq!(app.saved("song_sort")["column"], "title");
+    assert_eq!(app.saved("song_sort")["descending"], false);
+
+    app.click("song-col-title");
+    assert_eq!(
+        app.label_of(("song-play", 0usize)).as_deref(),
+        Some("Play Charlie")
+    );
+    assert_eq!(app.saved("song_sort")["descending"], true);
+
+    app.click("song-col-time");
+    assert_eq!(app.saved("song_sort")["column"], "time");
+}
+
+#[gpui_kit::test]
+async fn song_row_play_button_plays_the_list_from_that_song(cx: &mut TestAppContext) {
+    let mut app = open_with(cx, songs_library());
+    app.click("song-col-title");
+    app.hover_on(("song", 1usize));
+    app.play_with(|window, cx| window.click(("song-play", 1usize), cx));
+    let player = app.view.read_with(app.cx, |view, _| view.player.clone());
+    let titles: Vec<String> = player.queue().0.iter().map(|t| t.title.clone()).collect();
+    assert_eq!(titles, ["Alpha", "Bravo", "Charlie"]);
+    assert_eq!(
+        player.last_loaded().map(|t| t.title).as_deref(),
+        Some("Bravo"),
+        "playback starts at the clicked song"
+    );
+}
+
+#[gpui_kit::test]
+async fn playlists_are_created_filled_renamed_and_deleted(cx: &mut TestAppContext) {
+    let mut app = open_with(cx, songs_library());
+    app.click("playlist-new");
+    app.typing("Road");
+    app.press("space");
+    app.typing("Trip");
+    app.press("enter");
+    assert_eq!(app.label("view-title").as_deref(), Some("Road Trip"));
+    assert_eq!(app.label("view-detail").as_deref(), Some("No songs"));
+    assert_eq!(app.playlists_file()["items"][0]["name"], "Road Trip");
+    let id = app.playlists_file()["items"][0]["id"].as_u64().unwrap();
+    let sidebar_item = format!("playlist-{id}");
+
+    app.click("nav-songs");
+    app.right_click_on(("song", 0usize));
+    for _ in 0..3 {
+        app.press("down");
+    }
+    app.press("enter");
+    app.press("down");
+    app.press("enter");
+    let tracks = &app.playlists_file()["items"][0]["tracks"];
+    assert_eq!(tracks.as_array().map(Vec::len), Some(1), "{tracks}");
+
+    app.click_on(ElementId::Name(sidebar_item.clone().into()));
+    assert_eq!(app.label("view-title").as_deref(), Some("Road Trip"));
+    assert_eq!(app.label("view-detail").as_deref(), Some("1 song · 3 min"));
+
+    app.click("playlist-rename");
+    app.press("ctrl-a");
+    app.typing("Chill");
+    app.press("enter");
+    assert_eq!(app.label("view-title").as_deref(), Some("Chill"));
+    assert_eq!(app.playlists_file()["items"][0]["name"], "Chill");
+
+    app.right_click_on(("song", 0usize));
+    for _ in 0..6 {
+        app.press("down");
+    }
+    app.press("enter");
+    assert_eq!(app.label("view-detail").as_deref(), Some("No songs"));
+
+    app.click("playlist-delete");
+    assert_eq!(
+        app.label("playlist-confirm").as_deref(),
+        Some("Delete “Chill”?")
+    );
+    app.click("playlist-delete-cancel");
+    assert!(!app.has("playlist-confirm"));
+    assert!(app.has(ElementId::Name(sidebar_item.clone().into())));
+
+    app.click("playlist-delete");
+    app.click("playlist-delete-confirm");
+    assert_eq!(app.label("view-title").as_deref(), Some("Songs"));
+    assert!(!app.has(ElementId::Name(sidebar_item.clone().into())));
+    assert_eq!(app.playlists_file()["items"], serde_json::json!([]));
+}
+
+#[gpui_kit::test]
+async fn escape_cancels_a_new_playlist(cx: &mut TestAppContext) {
+    let mut app = open_with(cx, songs_library());
+    app.click("playlist-new");
+    assert!(app.has("playlist-name-row"));
+    app.typing("Nope");
+    app.press("escape");
+    assert!(!app.has("playlist-name-row"));
+    assert_eq!(app.label("view-title").as_deref(), Some("Songs"));
+    assert_eq!(
+        app.playlists_file()["items"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        0
+    );
+}
+
+#[gpui_kit::test]
+async fn forward_returns_to_the_page_left_with_back(cx: &mut TestAppContext) {
+    let library = library_of(&[release("k", "Estranhos no Ninho", "Exxótica", 2002)]);
+    let mut app = open_with(cx, library);
+    app.click("nav-albums");
+    app.click_on(("album", 0usize));
+    assert!(app.has("album-title"));
+
+    app.press("alt-left");
+    assert_eq!(app.label("view-title").as_deref(), Some("Albums"));
+    app.press("alt-right");
+    assert!(app.has("album-title"), "Alt+Right goes forward");
+
+    app.click("nav-back");
+    app.click("nav-forward");
+    assert!(app.has("album-title"), "the toolbar button goes forward");
+
+    app.click("nav-back");
+    app.click("nav-songs");
+    app.click("nav-forward");
+    assert_eq!(
+        app.label("view-title").as_deref(),
+        Some("Songs"),
+        "switching sections drops the forward history"
     );
 }

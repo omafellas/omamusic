@@ -13,6 +13,8 @@ pub struct Track {
     pub year: u32,
     pub duration: f64,
     pub album_id: String,
+    #[serde(default)]
+    pub genre: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,10 +98,59 @@ mod arc_vec_serde {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
+    RecentlyAdded,
+    Songs,
     Albums,
     Artists,
-    Songs,
+    Genres,
     Queue,
+    Playlist(u64),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GenreEntry {
+    pub name: String,
+    pub song_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SongColumn {
+    #[default]
+    Album,
+    Title,
+    Artist,
+    Genre,
+    Time,
+    Added,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SongSort {
+    pub column: SongColumn,
+    pub descending: bool,
+}
+
+impl SongSort {
+    pub const RECENT: SongSort = SongSort {
+        column: SongColumn::Added,
+        descending: true,
+    };
+
+    pub fn toggled(self, column: SongColumn) -> Self {
+        if self.column == column {
+            Self {
+                column,
+                descending: !self.descending,
+            }
+        } else {
+            Self {
+                column,
+                descending: column == SongColumn::Added,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -167,6 +218,26 @@ pub enum PlayerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clicking_a_column_sorts_by_it_then_flips_direction() {
+        let sort = SongSort::default().toggled(SongColumn::Title);
+        assert_eq!(
+            sort,
+            SongSort {
+                column: SongColumn::Title,
+                descending: false
+            }
+        );
+        assert!(sort.toggled(SongColumn::Title).descending);
+        assert!(
+            !sort
+                .toggled(SongColumn::Title)
+                .toggled(SongColumn::Title)
+                .descending
+        );
+        assert_eq!(sort.toggled(SongColumn::Added), SongSort::RECENT);
+    }
 
     #[test]
     fn repeat_mode_cycles_off_all_one() {

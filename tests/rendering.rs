@@ -312,6 +312,38 @@ mod pixels {
         );
     }
 
+    fn hovering_a_song_reveals_its_play_button() {
+        let library = Arc::new(Library::empty());
+        library.insert_song(
+            &omamusic::models::Track {
+                path: "/m/Afterglow/Low Tide.flac".into(),
+                title: "Low Tide".into(),
+                artist: "Neon Harbor".into(),
+                album: "Afterglow".into(),
+                track_number: 1,
+                year: 2020,
+                duration: 230.0,
+                album_id: "afterglow".into(),
+                genre: "Synth-pop".into(),
+            },
+            1,
+        );
+        let mut scene = Scene::open_with(library);
+        let resting = scene.capture();
+        let play = scene
+            .cx
+            .update_window(scene.handle, |_, window, _| {
+                window.find(("song-play", 0usize)).bounds()
+            })
+            .unwrap();
+        scene.act(|window, cx| window.hover(("song", 0usize), cx));
+        let hovered = scene.capture();
+        assert!(
+            hovered.changed_in(&resting, play) > 0,
+            "hovering the row must draw the play button at {play:?}"
+        );
+    }
+
     pub fn run() {
         match renderer_available() {
             Ok(true) => {}
@@ -325,7 +357,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 5] = [
+        let tests: [(&str, fn()); 6] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -339,6 +371,10 @@ mod pixels {
             (
                 "hovering_an_album_paints_its_play_button",
                 hovering_an_album_paints_its_play_button,
+            ),
+            (
+                "hovering_a_song_reveals_its_play_button",
+                hovering_a_song_reveals_its_play_button,
             ),
         ];
         for (name, test) in tests {
