@@ -20,6 +20,10 @@ pub struct AppConfig {
     pub ui_scale: f64,
     /// Music-reactive background strip; on by default, switchable in Settings.
     pub visual_effects: bool,
+    /// Identify albums online and write missing covers and tags into the
+    /// files. Off by default: it sends album and artist names to third
+    /// parties and modifies the user's music.
+    pub online_lookup: bool,
 }
 
 impl Default for AppConfig {
@@ -33,6 +37,7 @@ impl Default for AppConfig {
             tray_hint_shown: false,
             ui_scale: 1.0,
             visual_effects: true,
+            online_lookup: false,
         }
     }
 }
@@ -132,6 +137,15 @@ mod tests {
         let other = std::thread::spawn(AppConfig::path).join().unwrap();
         assert_ne!(other, dir.join("config.json"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn online_lookup_defaults_off_and_round_trips() {
+        assert!(!AppConfig::default().online_lookup);
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.online_lookup);
+        let cfg: AppConfig = serde_json::from_str(r#"{"online_lookup": true}"#).unwrap();
+        assert!(cfg.online_lookup);
     }
 
     #[test]

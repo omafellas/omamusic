@@ -197,6 +197,20 @@ async fn settings_buttons_change_text_size(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn online_lookup_switch_persists_to_config(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    app.click("settings");
+    app.click("pref-online-lookup");
+    let text = std::fs::read_to_string(app.config_dir.join("config.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["online_lookup"], serde_json::Value::Bool(true));
+    app.click("pref-online-lookup");
+    let text = std::fs::read_to_string(app.config_dir.join("config.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["online_lookup"], serde_json::Value::Bool(false));
+}
+
+#[gpui_kit::test]
 async fn saved_text_size_is_applied_on_start(cx: &mut TestAppContext) {
     let dir = isolated_config_dir();
     std::fs::write(dir.join("config.json"), r#"{"ui_scale": 1.5}"#).unwrap();

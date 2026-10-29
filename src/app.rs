@@ -1843,7 +1843,7 @@ impl Omamusic {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.omarchy();
+        let theme = cx.omarchy().clone();
         // Overlay backdrop
         div()
             .absolute()
@@ -1911,6 +1911,24 @@ impl Omamusic {
                                 |c, on| c.visual_effects = on,
                                 cx,
                             ))
+                            .child(self.pref_switch(
+                                "pref-online-lookup",
+                                "Complete missing tags and covers online",
+                                self.prefs.online_lookup,
+                                |c, on| c.online_lookup = on,
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .px(rems(0.3125))
+                                    .text_size(rems(0.6875))
+                                    .text_color(theme.secondary)
+                                    .child(
+                                        "Sends album and artist names to MusicBrainz, Apple and \
+                                         Deezer. Writes covers and missing tags into your music \
+                                         files.",
+                                    ),
+                            )
                             .child(self.text_size_row(cx)),
                     )
                     .child(separator(cx))
