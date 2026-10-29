@@ -69,10 +69,16 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install flatpak tooling
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang ffmpeg \
+            libasound2-dev libpulse-dev libdbus-1-dev \
+            libfontconfig-dev libfreetype-dev libssl-dev libzstd-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libvulkan-dev mesa-vulkan-drivers \
+            flatpak flatpak-builder
 
       - name: Add Flathub remote
         run: flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
