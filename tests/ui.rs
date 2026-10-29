@@ -1185,3 +1185,28 @@ async fn the_sidebar_collapses_to_icons_and_remembers_it(cx: &mut TestAppContext
     assert!(app.bounds("nav-albums").size.width > rem * 8.);
     assert_eq!(app.saved("sidebar_collapsed"), false);
 }
+
+#[gpui_kit::test]
+async fn search_shrinks_with_the_window_then_folds_into_a_button(cx: &mut TestAppContext) {
+    let mut app = open_with(cx, songs_library());
+    let rem = app.rem();
+    assert!(app.bounds("search").size.width >= rem * 15. - px(1.));
+
+    app.cx.simulate_resize(gpui_kit::size(px(820.), px(600.)));
+    app.cx.run_until_parked();
+    let search = app.bounds("search");
+    let rescan = app.bounds("rescan");
+    assert!(
+        search.size.width < rem * 15. && search.size.width >= rem * 6. - px(1.),
+        "the field gives up width first: {search:?}"
+    );
+    assert!(search.right() <= rescan.left(), "{search:?} vs {rescan:?}");
+
+    app.cx.simulate_resize(gpui_kit::size(px(640.), px(600.)));
+    app.cx.run_until_parked();
+    assert!(!app.has("search"), "too narrow for a field");
+    app.click("search-open");
+    assert!(app.has("search"), "the button opens the field");
+    app.typing("Bra");
+    assert_eq!(app.search_text(), "Bra");
+}

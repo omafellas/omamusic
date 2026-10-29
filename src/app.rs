@@ -207,6 +207,10 @@ const ALBUM_MORE_ACTIONS: &[RowAction] = &[
 ];
 const SIDEBAR_REMS: f32 = 13.75;
 const SIDEBAR_COMPACT_REMS: f32 = 3.25;
+/// Toolbar widths, in rems, below which the search field drops its
+/// shortcut hint and then folds into a button.
+const SEARCH_KEYCAPS_REMS: f32 = 44.;
+const SEARCH_FOLD_REMS: f32 = 30.;
 const QUEUE_REMS: f32 = 17.5;
 const SONG_COLUMNS: [(SongColumn, &str); 5] = [
     (SongColumn::Title, "Title"),
@@ -2051,6 +2055,9 @@ impl Omamusic {
         let controls = self.toolbar_controls(cx);
         let search_empty = self.query.read(cx).text().to_string().is_empty();
         let search_focused = self.query.read(cx).focus_handle(cx).is_focused(window);
+        let toolbar_rems = window.viewport_size().width / window.rem_size() - self.sidebar_rems();
+        let folded =
+            toolbar_rems < SEARCH_FOLD_REMS && search_empty && !search_focused && !self.searching;
         let field = input("search", &self.query, window, cx);
         let field = if self.searching {
             field.suffix(
@@ -2063,7 +2070,7 @@ impl Omamusic {
                         |this, delta| this.opacity(0.4 + 0.6 * delta),
                     ),
             )
-        } else if search_empty && !search_focused {
+        } else if search_empty && !search_focused && toolbar_rems >= SEARCH_KEYCAPS_REMS {
             field.suffix(keycaps(["Ctrl", "F"], cx))
         } else {
             field
@@ -2176,13 +2183,23 @@ impl Omamusic {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_queue(cx))),
                 "Up Next",
             ))
-            .child(
-                div()
-                    .w(rems(15.))
-                    .flex_shrink_1()
-                    .min_w(rems(8.))
-                    .child(field),
-            )
+            .map(|d| {
+                if folded {
+                    d.child(with_tooltip(
+                        icon_button(
+                            "search-open",
+                            IconName::Search,
+                            "Search",
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.focus_search(window, cx))),
+                        "Search (Ctrl+F)",
+                    ))
+                } else {
+                    d.child(div().flex_1().min_w(rems(6.)).max_w(rems(15.)).child(field))
+                }
+            })
             .child(with_tooltip(
                 icon_button(
                     "rescan",
