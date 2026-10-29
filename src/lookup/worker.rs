@@ -259,15 +259,12 @@ fn identify_and_write(
             row.release_group = Some(release.release_group);
         }
         _ => {
-            if album.needs_cover && !local.title_from_folder {
+            if album.needs_cover && album.tags_missing == 0 {
                 if let Some(artist) = &local.artist {
                     if let Some(cover) =
                         fetch_cover(http, throttle, None, None, artist, &local.title)
                     {
                         write::save_cache_cover(cache_dir, &album.album_key, &cover)?;
-                        for track in &album.tracks {
-                            write_one(&track.path, &TrackFill::default(), Some(&cover));
-                        }
                     }
                 }
             }
@@ -379,6 +376,9 @@ fn write_one(path: &Path, fill: &TrackFill, cover: Option<&[u8]>) {
         Ok(WriteOutcome::ReadOnly) => {
             eprintln!("online lookup: read-only, skipped {}", path.display())
         }
+        Ok(WriteOutcome::Linked) => {
+            eprintln!("online lookup: linked file, skipped {}", path.display())
+        }
         Err(err) => eprintln!("online lookup: write {}: {err:#}", path.display()),
     }
 }
@@ -407,9 +407,18 @@ mod tests {
     }
 
     impl Fixture {
-        /// Three untagged tracks of 1, 2 and 3 seconds in a folder named
-        /// after the album; `artist` is written as the only tag when given.
         fn new(folder: &str, artist: Option<&str>) -> Self {
+            Self::build(folder, artist, false)
+        }
+
+        fn complete(folder: &str, artist: &str) -> Self {
+            Self::build(folder, Some(artist), true)
+        }
+
+        /// Three tracks of 1, 2 and 3 seconds in a folder named after the
+        /// album; `artist` and album are written when given, title and year
+        /// too when `full`.
+        fn build(folder: &str, artist: Option<&str>, full: bool) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let root =
                 std::env::temp_dir().join(format!("omamusic-worker-{}-{n}", std::process::id()));
@@ -425,6 +434,10 @@ mod tests {
                     let mut tag = Tag::new(TagType::Id3v2);
                     tag.set_artist(artist.into());
                     tag.set_album(folder.into());
+                    if full {
+                        tag.set_title(format!("Song {}", i + 1));
+                        tag.set_year(2002);
+                    }
                     tag.save_to_path(&path, WriteOptions::default()).unwrap();
                 }
             }
@@ -657,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_tags_without_cover_fetch_cover_by_name_when_musicbrainz_has_nothing() {
+    fn incomplete_tags_never_take_a_cover_by_name() {
         let fx = Fixture::new("Estranhos no Ninho", Some("Exxótica"));
         let candidate = fx.candidate();
         let itunes = r#"{"results":[{"artistName":"Exxótica","collectionName":"Estranhos no Ninho","artworkUrl100":"https://x/100x100bb.jpg"}]}"#;
@@ -674,12 +687,43 @@ mod tests {
             )
             .on("https://x/1200x1200bb.jpg", 200, png(600));
         let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
-        assert_eq!(row.status, LookupStatus::Unmatched, "tags stay unknown");
+        assert_eq!(row.status, LookupStatus::Unmatched);
+        assert!(!write::cache_path(&fx.cache, &candidate.album_key).exists());
+        assert_eq!(http.requests().len(), 1, "only MusicBrainz was asked");
+    }
+
+    #[test]
+    fn complete_tags_without_cover_fetch_cover_by_name_when_musicbrainz_has_nothing() {
+        let fx = Fixture::complete("Estranhos no Ninho", "Exxótica");
+        let candidate = fx.candidate();
+        assert_eq!(candidate.tags_missing, 0);
+        let itunes = r#"{"results":[{"artistName":"Exxótica","collectionName":"Estranhos no Ninho","artworkUrl100":"https://x/100x100bb.jpg"}]}"#;
+        let http = FakeHttp::new()
+            .on(
+                "https://musicbrainz.org/ws/2/release/?",
+                200,
+                br#"{"releases":[]}"#.to_vec(),
+            )
+            .on(
+                "https://itunes.apple.com/search",
+                200,
+                itunes.as_bytes().to_vec(),
+            )
+            .on("https://x/1200x1200bb.jpg", 200, png(600));
+        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        assert_eq!(
+            row.status,
+            LookupStatus::Unmatched,
+            "no MusicBrainz identity"
+        );
         assert!(
             write::cache_path(&fx.cache, &candidate.album_key).exists(),
-            "but the cover is kept"
+            "but the cover is cached"
         );
-        assert!(fx.tracks()[0].artwork.is_some(), "and embedded");
-        assert_eq!(fx.tracks()[0].title, "");
+        assert!(
+            fx.tracks()[0].artwork.is_none(),
+            "a name-only cover is never written into files"
+        );
+        assert_eq!(fx.tracks()[0].title, "Song 1");
     }
 }

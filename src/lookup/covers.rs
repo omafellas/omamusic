@@ -3,13 +3,12 @@
 //! before it is accepted.
 
 use crate::lookup::http::{Http, Throttle};
-use crate::lookup::text::similarity;
+use crate::lookup::text::same_name;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::Value;
 
 const MIN_SIDE: u32 = 300;
 const MAX_ASPECT_DEVIATION: f64 = 0.10;
-const NAME_MATCH: f64 = 0.9;
 const JPEG_QUALITY: u8 = 90;
 
 pub fn caa_release_url(release: &str) -> String {
@@ -68,7 +67,7 @@ pub fn deezer_pick(body: &[u8], artist: &str, album: &str) -> Option<String> {
 }
 
 fn names_match(found_artist: &str, found_album: &str, artist: &str, album: &str) -> bool {
-    similarity(found_artist, artist) >= NAME_MATCH && similarity(found_album, album) >= NAME_MATCH
+    same_name(found_artist, artist) && same_name(found_album, album)
 }
 
 /// Accept only images that decode, are at least 300 px on the short side and
@@ -165,6 +164,13 @@ mod tests {
             Some("https://x/ninho/1200x1200bb.jpg")
         );
         assert_eq!(itunes_pick(body.as_bytes(), "Exxótica", "Arquivo"), None);
+        let numbered = r#"{"results":[{"artistName":"Led Zeppelin","collectionName":"Led Zeppelin III","artworkUrl100":"https://x/iii/100x100bb.jpg"}]}"#;
+        assert_eq!(
+            itunes_pick(numbered.as_bytes(), "Led Zeppelin", "Led Zeppelin II"),
+            None
+        );
+        let live = r#"{"results":[{"artistName":"A","collectionName":"Unplugged (Live)","artworkUrl100":"https://x/u/100x100bb.jpg"}]}"#;
+        assert_eq!(itunes_pick(live.as_bytes(), "A", "Unplugged"), None);
         assert_eq!(
             itunes_pick(body.as_bytes(), "Someone Else", "Estranhos no Ninho"),
             None

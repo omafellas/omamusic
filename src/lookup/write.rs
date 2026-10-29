@@ -1,14 +1,21 @@
 //! Writing fetched covers and tags: into the cache directory, and into the
 //! audio files themselves.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use lofty::config::{ParseOptions, ParsingMode, WriteOptions};
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::file::{AudioFile, FileType};
+use lofty::flac::FlacFile;
+use lofty::iff::aiff::AiffFile;
+use lofty::iff::wav::WavFile;
+use lofty::mp4::Mp4File;
+use lofty::mpeg::MpegFile;
+use lofty::ogg::{OggPictureStorage, OpusFile, VorbisFile};
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::ItemKey;
-use lofty::tag::{Accessor, Tag};
+use lofty::tag::{Accessor, MergeTag, SplitTag, Tag};
 use sha2::{Digest, Sha256};
 use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const TEMP_SUFFIX: &str = ".omamusic-tmp";
@@ -34,6 +41,8 @@ pub enum WriteOutcome {
     Unchanged,
     /// The file or its directory is not writable; the file was not touched.
     ReadOnly,
+    /// A symlink or hard link; replacing it would break the link, so it was skipped.
+    Linked,
 }
 
 /// Where a fetched cover for `album_key` is kept. The cache survives database
@@ -61,26 +70,21 @@ pub fn save_cache_cover(cache_dir: &Path, album_key: &str, bytes: &[u8]) -> Resu
 /// rewrite goes through a temporary copy in the same directory that is
 /// renamed over the original, so a crash leaves the original intact.
 pub fn fill_file(path: &Path, fill: &TrackFill, cover: Option<&[u8]>) -> Result<WriteOutcome> {
-    let options = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
-    let mut tagged = lofty::probe::Probe::open(path)?.options(options).read()?;
-    if tagged.primary_tag().is_none() {
-        let tag_type = tagged.primary_tag_type();
-        tagged.insert_tag(Tag::new(tag_type));
+    let link_info = std::fs::symlink_metadata(path)?;
+    if link_info.file_type().is_symlink() || link_info.nlink() > 1 {
+        return Ok(WriteOutcome::Linked);
     }
-    let Some(tag) = tagged.primary_tag_mut() else {
+    let Some(edited) = edit(path, fill, cover)? else {
         return Ok(WriteOutcome::Unchanged);
     };
-    if !apply(tag, fill, cover) {
-        return Ok(WriteOutcome::Unchanged);
-    }
 
     let temp = temp_path(path);
-    let permissions = std::fs::metadata(path)?.permissions();
+    let permissions = link_info.permissions();
     if let Err(err) = std::fs::copy(path, &temp) {
         return read_only_or(err, &temp);
     }
-    let saved = tagged
-        .save_to_path(&temp, WriteOptions::default())
+    let saved = edited
+        .save(&temp)
         .map_err(std::io::Error::other)
         .and_then(|()| std::fs::File::open(&temp)?.sync_all())
         .and_then(|()| std::fs::set_permissions(&temp, permissions))
@@ -89,6 +93,121 @@ pub fn fill_file(path: &Path, fill: &TrackFill, cover: Option<&[u8]>) -> Result<
         Ok(()) => Ok(WriteOutcome::Written),
         Err(err) => read_only_or(err, &temp),
     }
+}
+
+/// A file read through its concrete lofty type so frames the generic tag
+/// cannot represent survive the rewrite.
+enum Edited {
+    Mpeg(MpegFile),
+    Flac(FlacFile),
+    Mp4(Mp4File),
+    Vorbis(VorbisFile),
+    Opus(OpusFile),
+    Wav(WavFile),
+    Aiff(AiffFile),
+}
+
+impl Edited {
+    fn save(&self, path: &Path) -> lofty::error::Result<()> {
+        let options = WriteOptions::default();
+        match self {
+            Edited::Mpeg(f) => f.save_to_path(path, options),
+            Edited::Flac(f) => f.save_to_path(path, options),
+            Edited::Mp4(f) => f.save_to_path(path, options),
+            Edited::Vorbis(f) => f.save_to_path(path, options),
+            Edited::Opus(f) => f.save_to_path(path, options),
+            Edited::Wav(f) => f.save_to_path(path, options),
+            Edited::Aiff(f) => f.save_to_path(path, options),
+        }
+    }
+}
+
+/// Split the concrete tag into the part lofty can map and a remainder,
+/// change only the mapped part, and merge the remainder back.
+fn through<T: SplitTag>(
+    tag: T,
+    fill: &TrackFill,
+    cover: Option<&[u8]>,
+    has_picture: bool,
+) -> (<T::Remainder as MergeTag>::Merged, bool) {
+    let (remainder, mut generic) = tag.split_tag();
+    let changed = apply(&mut generic, fill, cover, has_picture);
+    (remainder.merge_tag(generic), changed)
+}
+
+fn edit(path: &Path, fill: &TrackFill, cover: Option<&[u8]>) -> Result<Option<Edited>> {
+    let options = ParseOptions::new().parsing_mode(ParsingMode::Relaxed);
+    let file_type = lofty::probe::Probe::open(path)?
+        .guess_file_type()?
+        .file_type()
+        .ok_or_else(|| anyhow!("unsupported audio format"))?;
+    let mut file = std::fs::File::open(path)?;
+    let (edited, changed) = match file_type {
+        FileType::Mpeg => {
+            let mut audio = MpegFile::read_from(&mut file, options)?;
+            let (tag, changed) =
+                through(audio.remove_id3v2().unwrap_or_default(), fill, cover, false);
+            audio.set_id3v2(tag);
+            (Edited::Mpeg(audio), changed)
+        }
+        FileType::Wav => {
+            let mut audio = WavFile::read_from(&mut file, options)?;
+            let (tag, changed) =
+                through(audio.remove_id3v2().unwrap_or_default(), fill, cover, false);
+            audio.set_id3v2(tag);
+            (Edited::Wav(audio), changed)
+        }
+        FileType::Aiff => {
+            let mut audio = AiffFile::read_from(&mut file, options)?;
+            let (tag, changed) =
+                through(audio.remove_id3v2().unwrap_or_default(), fill, cover, false);
+            audio.set_id3v2(tag);
+            (Edited::Aiff(audio), changed)
+        }
+        FileType::Flac => {
+            let mut audio = FlacFile::read_from(&mut file, options)?;
+            let has_picture = !audio.pictures().is_empty();
+            let (tag, changed) = through(
+                audio.remove_vorbis_comments().unwrap_or_default(),
+                fill,
+                cover,
+                has_picture,
+            );
+            audio.set_vorbis_comments(tag);
+            (Edited::Flac(audio), changed)
+        }
+        FileType::Mp4 => {
+            let mut audio = Mp4File::read_from(&mut file, options)?;
+            let (tag, changed) =
+                through(audio.remove_ilst().unwrap_or_default(), fill, cover, false);
+            audio.set_ilst(tag);
+            (Edited::Mp4(audio), changed)
+        }
+        FileType::Vorbis => {
+            let mut audio = VorbisFile::read_from(&mut file, options)?;
+            let (tag, changed) = through(
+                std::mem::take(audio.vorbis_comments_mut()),
+                fill,
+                cover,
+                false,
+            );
+            *audio.vorbis_comments_mut() = tag;
+            (Edited::Vorbis(audio), changed)
+        }
+        FileType::Opus => {
+            let mut audio = OpusFile::read_from(&mut file, options)?;
+            let (tag, changed) = through(
+                std::mem::take(audio.vorbis_comments_mut()),
+                fill,
+                cover,
+                false,
+            );
+            *audio.vorbis_comments_mut() = tag;
+            (Edited::Opus(audio), changed)
+        }
+        other => return Err(anyhow!("unsupported audio format {other:?}")),
+    };
+    Ok(changed.then_some(edited))
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -109,7 +228,7 @@ fn read_only_or(err: std::io::Error, temp: &Path) -> Result<WriteOutcome> {
 }
 
 /// Set each `Some` value whose slot is empty. Returns whether anything changed.
-fn apply(tag: &mut Tag, fill: &TrackFill, cover: Option<&[u8]>) -> bool {
+fn apply(tag: &mut Tag, fill: &TrackFill, cover: Option<&[u8]>, has_picture: bool) -> bool {
     let mut changed = false;
     let texts = [
         (ItemKey::TrackTitle, fill.title),
@@ -144,7 +263,7 @@ fn apply(tag: &mut Tag, fill: &TrackFill, cover: Option<&[u8]>) -> bool {
         }
     }
     if let Some(cover) = cover.filter(|c| !c.is_empty()) {
-        if tag.pictures().is_empty() {
+        if tag.pictures().is_empty() && !has_picture {
             let mime = match image::guess_format(cover) {
                 Ok(image::ImageFormat::Png) => Some(MimeType::Png),
                 Ok(image::ImageFormat::Jpeg) => Some(MimeType::Jpeg),
@@ -294,6 +413,79 @@ mod tests {
         assert_eq!(outcome, WriteOutcome::ReadOnly);
         assert_eq!(std::fs::read(&path).unwrap(), bytes, "file untouched");
         assert_eq!(std::fs::read_dir(&temp.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn keeps_frames_lofty_cannot_map() {
+        let temp = TempDir::new("frames");
+        let path = temp.0.join("song.mp3");
+        std::fs::write(
+            &path,
+            fixtures::mp3_bytes(&[
+                (b"TIT2", b"\x00Keep"),
+                (b"UFID", b"http://musicbrainz.org\x00rec-1"),
+                (b"TIPL", b"\x00producer\x00Someone\x00"),
+                (b"PRIV", b"owner\x00payload"),
+            ]),
+        )
+        .unwrap();
+        let fill = TrackFill {
+            artist: Some("Exxótica"),
+            release_group: Some("rg-1"),
+            ..TrackFill::default()
+        };
+        assert_eq!(
+            fill_file(&path, &fill, Some(&png())).unwrap(),
+            WriteOutcome::Written
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        for frame in [&b"TIPL"[..], b"PRIV", b"UFID", b"APIC"] {
+            assert!(
+                bytes.windows(4).any(|w| w == frame),
+                "{} frame must survive the rewrite",
+                String::from_utf8_lossy(frame)
+            );
+        }
+        let meta = metadata::read(&path);
+        assert_eq!(meta.title, "Keep");
+        assert_eq!(meta.artist, "Exxótica");
+        assert_eq!(meta.mb_recording, "rec-1");
+        assert_eq!(meta.mb_release_group, "rg-1");
+        assert_eq!(meta.artwork, Some(png()));
+    }
+
+    #[test]
+    fn symlinked_file_is_left_alone() {
+        let temp = TempDir::new("symlink");
+        let target = temp.0.join("real.wav");
+        std::fs::write(&target, fixtures::wav_bytes(1)).unwrap();
+        let link = temp.0.join("link.wav");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let fill = TrackFill {
+            title: Some("New"),
+            ..TrackFill::default()
+        };
+        assert_eq!(fill_file(&link, &fill, None).unwrap(), WriteOutcome::Linked);
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(metadata::read(&target).title, "");
+    }
+
+    #[test]
+    fn hard_linked_file_is_left_alone() {
+        let temp = TempDir::new("hardlink");
+        let one = temp.0.join("one.wav");
+        std::fs::write(&one, fixtures::wav_bytes(1)).unwrap();
+        let two = temp.0.join("two.wav");
+        std::fs::hard_link(&one, &two).unwrap();
+        let fill = TrackFill {
+            title: Some("New"),
+            ..TrackFill::default()
+        };
+        assert_eq!(fill_file(&one, &fill, None).unwrap(), WriteOutcome::Linked);
+        assert_eq!(metadata::read(&two).title, "");
     }
 
     #[test]

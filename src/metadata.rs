@@ -502,6 +502,32 @@ fn id3_text(data: &[u8]) -> String {
 /// Synthetic audio files for tests across the crate.
 #[cfg(test)]
 pub(crate) mod fixtures {
+    /// ID3v2.3 header plus the given frames, followed by four silent MPEG-1
+    /// Layer III frames (128 kbit/s, 44.1 kHz, 417 bytes each).
+    pub(crate) fn mp3_bytes(frames: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, data) in frames {
+            body.extend_from_slice(*id);
+            body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(data);
+        }
+        let size = body.len() as u32;
+        let mut out = b"ID3\x03\x00\x00".to_vec();
+        out.extend_from_slice(&[
+            ((size >> 21) & 0x7F) as u8,
+            ((size >> 14) & 0x7F) as u8,
+            ((size >> 7) & 0x7F) as u8,
+            (size & 0x7F) as u8,
+        ]);
+        out.extend_from_slice(&body);
+        for _ in 0..4 {
+            out.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+            out.resize(out.len() + 413, 0);
+        }
+        out
+    }
+
     /// Minimal PCM WAV: `seconds` of silence at 8 kHz mono, 16-bit.
     pub(crate) fn wav_bytes(seconds: u32) -> Vec<u8> {
         let samples = 8000u32 * 2 * seconds;
@@ -561,32 +587,6 @@ mod tests {
         }
     }
 
-    /// ID3v2.3 header plus the given frames, followed by four silent MPEG-1
-    /// Layer III frames (128 kbit/s, 44.1 kHz, 417 bytes each).
-    fn mp3_bytes(frames: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
-        let mut body = Vec::new();
-        for (id, data) in frames {
-            body.extend_from_slice(*id);
-            body.extend_from_slice(&(data.len() as u32).to_be_bytes());
-            body.extend_from_slice(&[0, 0]);
-            body.extend_from_slice(data);
-        }
-        let size = body.len() as u32;
-        let mut out = b"ID3\x03\x00\x00".to_vec();
-        out.extend_from_slice(&[
-            ((size >> 21) & 0x7F) as u8,
-            ((size >> 14) & 0x7F) as u8,
-            ((size >> 7) & 0x7F) as u8,
-            (size & 0x7F) as u8,
-        ]);
-        out.extend_from_slice(&body);
-        for _ in 0..4 {
-            out.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
-            out.resize(out.len() + 413, 0);
-        }
-        out
-    }
-
     #[test]
     fn reads_tags_and_cover_written_by_a_tagger() {
         use lofty::config::WriteOptions;
@@ -631,7 +631,7 @@ mod tests {
         let file = TempFile::new("tyer.mp3");
         std::fs::write(
             &file.0,
-            mp3_bytes(&[
+            fixtures::mp3_bytes(&[
                 (b"TIT2", b"\x00No Palco"),
                 (b"TYER", b"\x002002\x002002\x00"),
                 (b"UFID", b"http://musicbrainz.org\x00rec-1"),

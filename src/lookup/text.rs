@@ -35,7 +35,7 @@ pub fn normalize(s: &str) -> String {
         for suffix in EDITION_SUFFIXES {
             if let Some(rest) = text.strip_suffix(suffix) {
                 let rest = rest.trim_end();
-                if !rest.is_empty() {
+                if !rest.is_empty() && rest.len() < text.len() - suffix.len() {
                     text = rest.to_string();
                 }
             }
@@ -45,6 +45,22 @@ pub fn normalize(s: &str) -> String {
         }
     }
     text
+}
+
+/// Equal after lowercasing and dropping punctuation, nothing more. Used
+/// where a near miss would fetch the wrong album's cover.
+pub fn same_name(a: &str, b: &str) -> bool {
+    let strict = |s: &str| {
+        s.chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let (a, b) = (strict(a), strict(b));
+    !a.is_empty() && a == b
 }
 
 /// Normalized Levenshtein similarity in `[0, 1]`; 1.0 means equal after
@@ -90,6 +106,26 @@ mod tests {
         );
         assert_eq!(normalize("The The"), "the");
         assert_eq!(normalize(""), "");
+        assert_eq!(
+            normalize("Expedition"),
+            "expedition",
+            "suffixes strip whole words only"
+        );
+        assert_eq!(normalize("Deluxe"), "deluxe");
+    }
+
+    #[test]
+    fn same_name_ignores_case_and_punctuation_but_nothing_else() {
+        assert!(same_name("OK Computer", "Ok Computer!"));
+        assert!(same_name(
+            "Jogos de Azar: 6ª Rodada",
+            "Jogos de Azar 6ª Rodada"
+        ));
+        assert!(!same_name("Led Zeppelin II", "Led Zeppelin III"));
+        assert!(!same_name("Greatest Hits Vol. 2", "Greatest Hits Vol. 1"));
+        assert!(!same_name("Unplugged (Live)", "Unplugged"));
+        assert!(!same_name("The Wall", "Wall"));
+        assert!(!same_name("", "Wall"));
     }
 
     #[test]
