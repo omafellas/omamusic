@@ -2059,7 +2059,8 @@ impl Omamusic {
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
+                    .min_w(rems(6.))
+                    .overflow_hidden()
                     .flex()
                     .items_baseline()
                     .gap(rems(0.5))
@@ -2081,7 +2082,8 @@ impl Omamusic {
                                 .id("view-detail")
                                 .test_support()
                                 .aria_label(detail.clone())
-                                .flex_none()
+                                .min_w_0()
+                                .truncate()
                                 .text_size(rems(0.6875))
                                 .text_color(theme.secondary)
                                 .child(detail),

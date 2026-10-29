@@ -1128,3 +1128,27 @@ async fn the_playing_album_is_marked_in_the_grid_and_the_list(cx: &mut TestAppCo
     assert!(app.has("album-row-now-afterglow"));
     assert!(!app.has("album-row-now-backwater"));
 }
+
+#[gpui_kit::test]
+async fn a_narrow_toolbar_never_overlaps_its_title_and_controls(cx: &mut TestAppContext) {
+    let library = library_of(&[release("k", "Estranhos no Ninho", "Exxótica", 2002)]);
+    let mut app = open_with(cx, library);
+    app.click("nav-albums");
+    app.cx.simulate_resize(gpui_kit::size(px(820.), px(600.)));
+    app.cx.run_until_parked();
+    let title = app.bounds("view-title");
+    let detail = app.bounds("view-detail");
+    let sort = app.bounds("album-sort");
+    assert!(
+        title.right() <= detail.left() + px(0.5),
+        "the count sits after the title: {title:?} {detail:?}"
+    );
+    assert!(
+        detail.right() <= sort.left(),
+        "the count must not run under the sort button: {detail:?} vs {sort:?}"
+    );
+    assert!(
+        title.size.width > px(0.),
+        "the title keeps some room: {title:?}"
+    );
+}
