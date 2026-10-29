@@ -64,7 +64,9 @@ mod pixels {
             let player = Arc::new(Player::new_test());
             cx.update(|cx| {
                 gpui_omarchy::init(cx);
+                gpui_omarchy::Theme::tokyo_night().apply(cx);
                 omamusic::init_actions(&library, &player, cx);
+                cx.set_reduce_motion(true);
             });
             let root = cx
                 .open_window(size(px(WINDOW.0), px(WINDOW.1)), |window, cx| {
@@ -85,8 +87,21 @@ mod pixels {
                 .unwrap();
             self.cx.run_until_parked();
             self.cx
-                .update_window(self.handle, |_, window, cx| window.render_frame(cx))
+                .update_window(self.handle, |_, window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.render_frame(cx)
+                })
                 .unwrap();
+        }
+
+        /// Let animations run: the test clock moves and the next frame is drawn.
+        fn elapse(&mut self, ms: u64) {
+            self.cx.advance_clock(std::time::Duration::from_millis(ms));
+            self.act(|_, _| {});
+        }
+
+        fn allow_motion(&mut self) {
+            self.cx.update(|cx| cx.set_reduce_motion(false));
         }
 
         fn bounds(&mut self, id: &'static str) -> Bounds<Pixels> {
@@ -190,6 +205,27 @@ mod pixels {
                 }
             }
             count
+        }
+
+        /// How far the pixels inside `bounds` are from the window background,
+        /// summed over channels; a half-faded region scores about half.
+        fn ink_mass(&self, bounds: Bounds<Pixels>) -> u64 {
+            let bg = self.background();
+            let (x0, y0) = (self.device(bounds.left()), self.device(bounds.top()));
+            let (x1, y1) = (
+                self.device(bounds.right()).min(self.width),
+                self.device(bounds.bottom()).min(self.height),
+            );
+            let mut mass = 0u64;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = self.pixel(x, y);
+                    for c in 0..3 {
+                        mass += (p[c] as i64 - bg[c] as i64).unsigned_abs();
+                    }
+                }
+            }
+            mass
         }
 
         fn color_at(&self, p: gpui_kit::Point<Pixels>) -> [u8; 4] {
@@ -392,6 +428,36 @@ mod pixels {
         }
     }
 
+    fn page_fades_in_after_navigation() {
+        let library = Arc::new(Library::empty());
+        library.insert_album(&AlbumSummary {
+            id: "k".to_string(),
+            title: "Estranhos no Ninho".to_string(),
+            artist: "Exxótica".to_string(),
+            year: 2002,
+            track_count: 1,
+            unmatched: false,
+        });
+        let mut scene = Scene::open_with(library);
+        scene.allow_motion();
+        scene.act(|window, cx| window.click("nav-albums", cx));
+        let first = scene.capture();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        scene.elapse(400);
+        let settled = scene.capture();
+        let card = scene.bounds_of(("album", 0usize));
+        assert!(
+            settled.ink_mass(card) > first.ink_mass(card) * 6 / 5,
+            "the page must fade in: the card at {card:?} is fainter right after navigating"
+        );
+        let sidebar = scene.bounds("nav-songs");
+        assert_eq!(
+            settled.changed_in(&first, sidebar),
+            0,
+            "the fade must not touch the sidebar"
+        );
+    }
+
     fn hovering_a_song_reveals_its_play_button() {
         let library = Arc::new(Library::empty());
         library.insert_song(
@@ -437,7 +503,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 7] = [
+        let tests: [(&str, fn()); 8] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -453,6 +519,10 @@ mod pixels {
                 hovering_an_album_paints_its_play_button,
             ),
             ("genre_tile_paints_its_art", genre_tile_paints_its_art),
+            (
+                "page_fades_in_after_navigation",
+                page_fades_in_after_navigation,
+            ),
             (
                 "hovering_a_song_reveals_its_play_button",
                 hovering_a_song_reveals_its_play_button,

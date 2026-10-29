@@ -176,6 +176,7 @@ fn open_with(cx: &mut TestAppContext, library: Arc<Library>) -> Smoke<'_> {
     let player = Arc::new(Player::new_test());
     cx.update(|cx| {
         gpui_omarchy::init(cx);
+        gpui_omarchy::Theme::tokyo_night().apply(cx);
         omamusic::init_actions(&library, &player, cx);
     });
     let (root, cx) = cx.add_window_view(|window, cx| Root::new(library, player, window, cx));
@@ -450,6 +451,7 @@ async fn settings_hint_at_missing_acoustid_key(cx: &mut TestAppContext) {
     let player = Arc::new(Player::new_test());
     cx.update(|cx| {
         gpui_omarchy::init(cx);
+        gpui_omarchy::Theme::tokyo_night().apply(cx);
         omamusic::init_actions(&library, &player, cx);
     });
     let (root, cx) = cx.add_window_view(|window, cx| Root::new(library, player, window, cx));
@@ -475,6 +477,7 @@ async fn no_acoustid_hint_once_a_key_is_configured(cx: &mut TestAppContext) {
     let player = Arc::new(Player::new_test());
     cx.update(|cx| {
         gpui_omarchy::init(cx);
+        gpui_omarchy::Theme::tokyo_night().apply(cx);
         omamusic::init_actions(&library, &player, cx);
     });
     let (root, cx) = cx.add_window_view(|window, cx| Root::new(library, player, window, cx));
@@ -497,6 +500,7 @@ async fn saved_text_size_is_applied_on_start(cx: &mut TestAppContext) {
     let player = Arc::new(Player::new_test());
     cx.update(|cx| {
         gpui_omarchy::init(cx);
+        gpui_omarchy::Theme::tokyo_night().apply(cx);
         omamusic::init_actions(&library, &player, cx);
     });
     let (root, cx) = cx.add_window_view(|window, cx| Root::new(library, player, window, cx));

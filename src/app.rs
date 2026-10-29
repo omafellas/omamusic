@@ -13,12 +13,12 @@ use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::TestSupportExt;
 use gpui_kit::{
-    div, img, px, rems, uniform_list, Animation, AnimationExt as _, AnyElement, App, AppContext,
-    ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler, FocusHandle, Focusable,
-    FontWeight, HighlightStyle, ImageSource, InteractiveElement, IntoElement, MouseButton,
-    NavigationDirection, ObjectFit, ParentElement, PathPromptOptions, Render, SharedString,
-    Stateful, StatefulInteractiveElement, StyleRefinement, Styled, StyledImage as _, StyledText,
-    Window,
+    div, ease_out_quint, img, px, rems, uniform_list, Animation, AnimationExt as _, AnyElement,
+    App, AppContext, ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler, FocusHandle,
+    Focusable, FontWeight, HighlightStyle, ImageSource, InteractiveElement, IntoElement,
+    MouseButton, NavigationDirection, ObjectFit, ParentElement, PathPromptOptions, Render,
+    SharedString, Stateful, StatefulInteractiveElement, StyleRefinement, Styled, StyledImage as _,
+    StyledText, Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, keycap,
@@ -50,6 +50,8 @@ pub struct Omamusic {
     /// Bumped for every toast; makes an older fade task ignore a replaced toast.
     notify_seq: u64,
     cover_poll: CoverPoll,
+    /// Bumped on every navigation so the content area fades in afresh.
+    nav_seq: u64,
     prev_scanning: bool,
     /// Music-reactive bottom strip; see `Visualizer`.
     visualizer: Entity<Visualizer>,
@@ -311,6 +313,20 @@ impl Selectable for MenuTrigger {
     }
 }
 
+const PAGE_ENTER: Duration = Duration::from_millis(220);
+const COVER_ENTER: Duration = Duration::from_millis(240);
+
+/// The marker for the current track in a list.
+fn now_playing(playing: bool, cx: &App) -> AnyElement {
+    icon(if playing {
+        IconName::Volume2
+    } else {
+        IconName::Volume
+    })
+    .size(rems(0.875))
+    .text_color(cx.omarchy().accent)
+    .into_any_element()
+}
 /// Re-renders a view while cover thumbnails it asked for are still being
 /// decoded. Polling a timer keeps the wake-up on the foreground executor,
 /// where GPUI's deterministic test scheduler can see it.
@@ -341,11 +357,21 @@ pub fn cover(
     size: f32,
     name: &str,
     cx: &App,
-) -> impl IntoElement {
+) -> AnyElement {
     let cover = avatar(initials(name), cx).size(px(size));
     match album_id.and_then(|id| library.covers().cached(id, size as u32 * 2)) {
-        Some(thumb) => cover.image(avatar_image(ImageSource::Render(thumb.image))),
-        None => cover,
+        Some(thumb) if thumb.fresh => cover
+            .image(avatar_image(ImageSource::Render(thumb.image)))
+            .with_animation(
+                ElementId::Name(format!("cover-in-{}", album_id.unwrap_or_default()).into()),
+                Animation::new(COVER_ENTER).with_easing(ease_out_quint()),
+                |cover, t| cover.opacity(t),
+            )
+            .into_any_element(),
+        Some(thumb) => cover
+            .image(avatar_image(ImageSource::Render(thumb.image)))
+            .into_any_element(),
+        None => cover.into_any_element(),
     }
 }
 
@@ -612,6 +638,7 @@ impl Omamusic {
             rescan_notify: None,
             notify_seq: 0,
             cover_poll: CoverPoll::default(),
+            nav_seq: 0,
             prev_scanning: false,
             visualizer,
             pending_query: String::new(),
@@ -888,6 +915,7 @@ impl Omamusic {
         if self.pages.last() != Some(&page) {
             self.pages.push(page);
             self.forward.clear();
+            self.nav_seq += 1;
         }
         self.clear_selection();
         cx.notify();
@@ -896,6 +924,7 @@ impl Omamusic {
     fn back(&mut self, cx: &mut Context<Self>) {
         if let Some(page) = self.pages.pop() {
             self.forward.push(page);
+            self.nav_seq += 1;
         }
         self.clear_selection();
         cx.notify();
@@ -904,12 +933,16 @@ impl Omamusic {
     fn go_forward(&mut self, cx: &mut Context<Self>) {
         if let Some(page) = self.forward.pop() {
             self.pages.push(page);
+            self.nav_seq += 1;
         }
         self.clear_selection();
         cx.notify();
     }
 
     fn set_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        if self.section != section || !self.pages.is_empty() {
+            self.nav_seq += 1;
+        }
         self.section = section;
         self.confirm_delete = None;
         self.pages.clear();
@@ -1480,7 +1513,10 @@ impl Render for Omamusic {
                                             )
                                             .into_any_element()
                                         } else {
-                                            self.render_content(window, cx)
+                                            {
+                                                let content = self.render_content(window, cx);
+                                                self.page_enter(content)
+                                            }
                                         },
                                     ),
                             ),
@@ -2476,14 +2512,7 @@ impl Omamusic {
             theme.hover_fill()
         };
         let number = if is_current {
-            icon(if row.playing {
-                IconName::Volume2
-            } else {
-                IconName::Volume
-            })
-            .size(rems(0.875))
-            .text_color(theme.accent)
-            .into_any_element()
+            now_playing(row.playing, cx)
         } else {
             (i + 1).to_string().into_any_element()
         };
@@ -2716,6 +2745,22 @@ impl Omamusic {
             Section::Queue => self.render_queue(cx),
             Section::Playlist(id) => self.render_playlist(id, cx),
         }
+    }
+
+    /// Fades and settles freshly navigated content into place.
+    fn page_enter(&self, content: AnyElement) -> AnyElement {
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(content)
+            .with_animation(
+                ElementId::NamedInteger("page".into(), self.nav_seq),
+                Animation::new(PAGE_ENTER).with_easing(ease_out_quint()),
+                |page, t| page.opacity(t).mt(px(6. * (1. - t))),
+            )
+            .into_any_element()
     }
 
     fn section_heading(title: impl Into<SharedString>, see_all: Option<Button>, cx: &App) -> Div {
@@ -3281,14 +3326,7 @@ impl Omamusic {
         let rows = album.tracks.iter().enumerate().map(|(i, t)| {
             let is_current = current.as_ref().is_some_and(|c| c.path == t.path);
             let number = if is_current {
-                icon(if playing {
-                    IconName::Volume2
-                } else {
-                    IconName::Volume
-                })
-                .size(rems(0.875))
-                .text_color(theme.accent)
-                .into_any_element()
+                now_playing(playing, cx)
             } else if t.track_number > 0 {
                 t.track_number.to_string().into_any_element()
             } else {
@@ -3891,14 +3929,7 @@ impl Omamusic {
         let is_current = index == Some(i);
         let past = index.is_some_and(|current| i < current);
         let number = if is_current {
-            icon(if playing {
-                IconName::Volume2
-            } else {
-                IconName::Volume
-            })
-            .size(rems(0.875))
-            .text_color(theme.accent)
-            .into_any_element()
+            now_playing(playing, cx)
         } else {
             (i + 1).to_string().into_any_element()
         };
@@ -4134,6 +4165,7 @@ mod tests {
     ) -> (Entity<Omamusic>, &'a mut VisualTestContext) {
         cx.update(|cx| {
             gpui_omarchy::init(cx);
+            gpui_omarchy::Theme::tokyo_night().apply(cx);
             cx.bind_keys(crate::key_bindings());
             let toggles = toggles.clone();
             cx.on_action(move |_: &TogglePlay, cx| {

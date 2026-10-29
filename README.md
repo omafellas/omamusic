@@ -27,6 +27,8 @@ Run `omamusic`: on first launch it picks up `~/Music` automatically, no setup ne
 - BM25 full-text search (SQLite FTS5) with partial-word matching, and album detail views inspired by Overdrive.
 - Background incremental rescan on filesystem changes: only new or changed files are re-read, and folders added in Settings are picked up.
 - Music-reactive visualizer strip along the bottom edge that follows the live Omarchy theme (toggle in Settings).
+- Genres as a grid of cover mosaics, with play and queue actions on each tile.
+- Short transitions: pages fade in and covers fade in as they decode. The desktop's reduced-motion setting (XDG portal) turns them off.
 - Omarchy theme following through `gpui-omarchy`.
 
 Space toggles playback, Left/Right changes tracks, Ctrl+F jumps to the search field, and Ctrl+R rescans the library. Ctrl+= / Ctrl+- adjust the text size (Ctrl+0 resets it); the setting is also in Settings and persists across restarts. A folder picker uses `zenity` or `kdialog` if available.
