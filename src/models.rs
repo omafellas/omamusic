@@ -103,6 +103,7 @@ pub enum Section {
     Albums,
     Artists,
     Genres,
+    Liked,
     Playlist(u64),
 }
 

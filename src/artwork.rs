@@ -16,12 +16,16 @@ const FRESH_FOR: Duration = Duration::from_millis(400);
 pub struct Thumbnail {
     pub image: Arc<RenderImage>,
     pub fresh: bool,
+    /// The cover's characteristic color as RGB, see [`tint`].
+    pub tint: [u8; 3],
 }
+
+type Rendered = (Arc<RenderImage>, Instant, [u8; 3]);
 
 #[derive(Default)]
 struct Covers {
     raw: HashMap<String, Arc<[u8]>>,
-    rendered: HashMap<Key, (Arc<RenderImage>, Instant)>,
+    rendered: HashMap<Key, Rendered>,
     pending: HashSet<Key>,
     working: HashSet<Key>,
     /// Albums the store reported as having no cover, so the store is not
@@ -61,12 +65,34 @@ fn decode(raw: &[u8], size: u32) -> Option<RgbaImage> {
     Some(reader.decode().ok()?.thumbnail(size, size).into_rgba8())
 }
 
-fn render(raw: &[u8], size: u32) -> Option<Arc<RenderImage>> {
+/// The color a cover reads as at a glance: the mean of its pixels, weighted
+/// toward saturated ones so a vivid detail on a gray sleeve still shows.
+pub fn tint(image: &RgbaImage) -> [u8; 3] {
+    let mut sum = [0f64; 3];
+    let mut total = 0f64;
+    for pixel in image.pixels() {
+        let [r, g, b, a] = pixel.0;
+        let max = r.max(g).max(b) as f64;
+        let min = r.min(g).min(b) as f64;
+        let weight = (0.1 + (max - min) / 255.) * a as f64 / 255.;
+        for (s, c) in sum.iter_mut().zip([r, g, b]) {
+            *s += c as f64 * weight;
+        }
+        total += weight;
+    }
+    if total == 0. {
+        return [0; 3];
+    }
+    sum.map(|s| (s / total).round() as u8)
+}
+
+fn render(raw: &[u8], size: u32) -> Option<(Arc<RenderImage>, [u8; 3])> {
     let mut data = decode(raw, size)?;
+    let tint = tint(&data);
     for pixel in data.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
-    Some(Arc::new(RenderImage::new(vec![Frame::new(data)])))
+    Some((Arc::new(RenderImage::new(vec![Frame::new(data)])), tint))
 }
 
 fn load_raw(
@@ -116,8 +142,8 @@ fn work(inner: &Mutex<Covers>, provider: &Mutex<Option<Provider>>, key: Key) {
         return;
     }
     covers.pending.remove(&key);
-    if let Some(image) = image {
-        covers.rendered.insert(key, (image, Instant::now()));
+    if let Some((image, tint)) = image {
+        covers.rendered.insert(key, (image, Instant::now(), tint));
     }
 }
 
@@ -199,10 +225,11 @@ impl ArtworkCache {
     pub fn cached(&self, album_id: &str, size: u32) -> Option<Thumbnail> {
         let key = (album_id.to_string(), size);
         let mut covers = self.inner.lock();
-        if let Some((image, since)) = covers.rendered.get(&key) {
+        if let Some((image, since, tint)) = covers.rendered.get(&key) {
             return Some(Thumbnail {
                 image: image.clone(),
                 fresh: since.elapsed() < FRESH_FOR,
+                tint: *tint,
             });
         }
         if covers.missing.contains(album_id) {
@@ -230,6 +257,24 @@ mod tests {
     use super::*;
     use std::thread::ThreadId;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn tint_follows_the_vivid_part_of_a_cover() {
+        let red = image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 30, 30, 255]));
+        assert_eq!(tint(&red), [200, 30, 30]);
+
+        let mut sleeve = image::RgbaImage::from_pixel(8, 8, image::Rgba([120, 120, 120, 255]));
+        for x in 0..8 {
+            for y in 0..2 {
+                sleeve.put_pixel(x, y, image::Rgba([230, 20, 20, 255]));
+            }
+        }
+        let [r, g, b] = tint(&sleeve);
+        assert!(
+            r > 160 && g < 80 && b < 80,
+            "a quarter red strip outweighs the gray: {r} {g} {b}"
+        );
+    }
 
     fn png(seed: u8) -> Vec<u8> {
         let mut bytes = Vec::new();

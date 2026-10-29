@@ -644,6 +644,73 @@ mod pixels {
         );
     }
 
+    fn album_rows_have_no_separator_lines() {
+        let library = Arc::new(Library::empty());
+        for (id, title) in [("a", "Afterglow"), ("b", "Backwater")] {
+            library.insert_album(&AlbumSummary {
+                id: id.to_string(),
+                title: title.to_string(),
+                artist: "Neon Harbor".to_string(),
+                year: 2020,
+                track_count: 1,
+                unmatched: false,
+            });
+        }
+        let mut scene = Scene::open_with(library);
+        scene.act(|window, cx| window.click("nav-albums", cx));
+        scene.act(|window, cx| window.click("albums-view-list", cx));
+        let capture = scene.capture();
+        let row = scene.bounds_of(("album-row", 0usize));
+        let edge = gpui_kit::point(row.center().x, row.bottom() - px(0.5));
+        assert!(
+            close(capture.color_at(edge), capture.background()),
+            "no line under the row at {edge:?}: {:?}",
+            capture.color_at(edge)
+        );
+    }
+
+    fn album_page_takes_its_tint_from_the_cover() {
+        let open = |rgb: [u8; 3]| {
+            let library = Arc::new(Library::empty());
+            library.insert_song(
+                &omamusic::models::Track {
+                    path: "/m/Afterglow/One.flac".into(),
+                    title: "One".into(),
+                    artist: "Neon Harbor".into(),
+                    album: "Afterglow".into(),
+                    track_number: 1,
+                    year: 2020,
+                    duration: 230.0,
+                    album_id: "afterglow".into(),
+                    genre: "Synth-pop".into(),
+                },
+                1,
+            );
+            library.insert_cover("afterglow", &solid_png(rgb));
+            let mut scene = Scene::open_with(library);
+            scene.act(|window, cx| window.click("nav-albums", cx));
+            scene.act(|window, cx| window.click(("album", 0usize), cx));
+            let title = scene.bounds("album-title");
+            let probe = gpui_kit::point(px(WINDOW.0 - 24.), title.center().y);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                scene.elapse(50);
+                let capture = scene.capture();
+                if !close(capture.color_at(probe), capture.background()) {
+                    return capture.color_at(probe);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the {rgb:?} cover must tint the page at {probe:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let red = open([220, 40, 40]);
+        let blue = open([40, 60, 220]);
+        assert!(red[0] > blue[0] && blue[2] > red[2], "{red:?} vs {blue:?}");
+    }
+
     fn up_next_panel_slides_in() {
         let mut scene = Scene::open();
         scene.allow_motion();
@@ -674,7 +741,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 13] = [
+        let tests: [(&str, fn()); 15] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -715,6 +782,14 @@ mod pixels {
                 the_playing_song_row_is_filled,
             ),
             ("up_next_panel_slides_in", up_next_panel_slides_in),
+            (
+                "album_rows_have_no_separator_lines",
+                album_rows_have_no_separator_lines,
+            ),
+            (
+                "album_page_takes_its_tint_from_the_cover",
+                album_page_takes_its_tint_from_the_cover,
+            ),
         ];
         for (name, test) in tests {
             println!("running {name}");

@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::library::{Library, LibrarySnapshot, SongSource};
+use crate::liked::Liked;
 use crate::models::{
     Album, AlbumSort, AlbumSummary, AlbumView, ArtistEntry, GenreEntry, PlayerState, Section,
     SongColumn, SongSort, Track,
@@ -14,12 +15,12 @@ use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::TestSupportExt;
 use gpui_kit::{
-    div, ease_out_quint, img, px, rems, uniform_list, Animation, AnimationExt as _, AnyElement,
-    App, AppContext, BoxShadow, ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler,
-    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, ImageSource, InteractiveElement,
-    IntoElement, MouseButton, NavigationDirection, ObjectFit, ParentElement, PathPromptOptions,
-    Pixels, Render, SharedString, Stateful, StatefulInteractiveElement, StyleRefinement, Styled,
-    StyledImage as _, StyledText, Window,
+    div, ease_out_quint, img, linear_color_stop, linear_gradient, px, rems, uniform_list,
+    Animation, AnimationExt as _, AnyElement, App, AppContext, BoxShadow, ClickEvent, Context, Div,
+    ElementId, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight, HighlightStyle,
+    Hsla, ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection,
+    ObjectFit, ParentElement, PathPromptOptions, Pixels, Render, Rgba, SharedString, Stateful,
+    StatefulInteractiveElement, StyleRefinement, Styled, StyledImage as _, StyledText, Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, keycap,
@@ -46,6 +47,7 @@ pub struct Omamusic {
     show_settings: bool,
     /// The Up Next panel beside the page.
     show_queue: bool,
+    liked: Liked,
     /// Bumped each time the Up Next panel opens so it slides in afresh.
     queue_seq: u64,
     lib_version: u64,
@@ -323,6 +325,18 @@ const COVER_ENTER: Duration = Duration::from_millis(240);
 const PANEL_ENTER: Duration = Duration::from_millis(200);
 pub(crate) const ROW_FILL: Duration = Duration::from_millis(120);
 pub(crate) const LIFT: Duration = Duration::from_millis(120);
+pub(crate) const TINT_ENTER: Duration = Duration::from_millis(400);
+
+/// A cover tint as a translucent wash.
+pub(crate) fn tint_color(tint: [u8; 3], alpha: f32) -> Hsla {
+    Rgba {
+        r: tint[0] as f32 / 255.,
+        g: tint[1] as f32 / 255.,
+        b: tint[2] as f32 / 255.,
+        a: alpha,
+    }
+    .into()
+}
 
 /// The marker for the current track in a list.
 fn now_playing(playing: bool, color: Hsla) -> AnyElement {
@@ -360,9 +374,11 @@ pub(crate) fn hover_progress(
     (progress, listener)
 }
 
-/// A row fill that eases toward the hover color the way kit buttons do.
-pub(crate) fn row_fill(rest: Hsla, hover: Hsla, progress: f32) -> Hsla {
-    rest.blend(hover.opacity(hover.a * progress))
+/// A translucent row fill: a faint stripe on alternate rows that eases up to
+/// the full hover color, so whatever is behind the list shows through.
+pub(crate) fn row_fill(hover: Hsla, stripe: bool, progress: f32) -> Hsla {
+    let rest = if stripe { 0.5 } else { 0. };
+    hover.opacity(rest + (1. - rest) * progress)
 }
 
 /// Corner radius for a cover of `size` pixels: tighter on small thumbnails.
@@ -406,7 +422,17 @@ pub fn cover(
     name: &str,
     cx: &App,
 ) -> AnyElement {
-    let radius = cover_radius(size);
+    rounded_cover(library, album_id, size, name, cover_radius(size), cx)
+}
+
+pub fn rounded_cover(
+    library: &Library,
+    album_id: Option<&str>,
+    size: f32,
+    name: &str,
+    radius: Pixels,
+    cx: &App,
+) -> AnyElement {
     let cover = avatar(initials(name), cx)
         .size(px(size))
         .rounded(radius)
@@ -724,6 +750,7 @@ impl Omamusic {
             anchor: None,
             show_settings,
             show_queue,
+            liked: Liked::load(),
             queue_seq: 0,
             lib_version: 0,
             prefs: AppConfig::load(),
@@ -893,6 +920,23 @@ impl Omamusic {
             self.queue_seq += 1;
         }
         cx.notify();
+    }
+
+    pub fn is_liked(&self, path: &std::path::Path) -> bool {
+        self.liked.contains(path)
+    }
+
+    pub fn toggle_like(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.liked.toggle(path);
+        self.liked.save();
+        if self.section == Section::Liked {
+            self.clear_selection();
+        }
+        cx.notify();
+    }
+
+    fn liked_source(&self) -> SongSource {
+        SongSource::Paths(self.liked.paths().into())
     }
 
     pub fn queue_open(&self) -> bool {
@@ -1718,6 +1762,7 @@ impl Omamusic {
                 IconName::Clock,
                 Section::RecentlyAdded,
             ),
+            ("nav-liked", "Liked Songs", IconName::Heart, Section::Liked),
             ("nav-songs", "Songs", IconName::Music, Section::Songs),
             ("nav-albums", "Albums", IconName::Disc3, Section::Albums),
             ("nav-artists", "Artists", IconName::Mic, Section::Artists),
@@ -1919,6 +1964,10 @@ impl Omamusic {
             Section::Songs => (
                 "Songs".into(),
                 self.songs_detail(&SongSource::Library(self.prefs.song_sort)),
+            ),
+            Section::Liked => (
+                "Liked Songs".into(),
+                self.songs_detail(&self.liked_source()),
             ),
             Section::Albums => (
                 "Albums".into(),
@@ -2602,6 +2651,7 @@ impl Omamusic {
             .text_color(theme.secondary)
             .child(div().w(rems(2.)).flex_shrink_0().child("#"))
             .children(cells.by_ref().take(4))
+            .child(div().w(rems(1.25)).flex_shrink_0())
             .child(div().w(rems(1.5)).flex_shrink_0())
             .children(cells)
     }
@@ -2623,16 +2673,11 @@ impl Omamusic {
             window,
             cx,
         );
-        let zebra = if i.is_multiple_of(2) {
-            theme.background
-        } else {
-            theme.background.blend(theme.hover_fill().opacity(0.5))
-        };
         let (bg, ink, muted) = if is_current {
             (theme.accent, theme.on_accent, theme.on_accent.opacity(0.8))
         } else {
             (
-                row_fill(zebra, theme.hover_fill(), hover),
+                row_fill(theme.hover_fill(), !i.is_multiple_of(2), hover),
                 theme.foreground,
                 theme.secondary,
             )
@@ -2644,6 +2689,34 @@ impl Omamusic {
         };
         let play_list = row.list.clone();
         let more_list = row.list.clone();
+        let liked = self.liked.contains(&t.path);
+        let like_path = t.path.clone();
+        let heart = div()
+            .id(("song-like", i))
+            .test_support()
+            .aria_label(if liked { "Unlike" } else { "Like" })
+            .w(rems(1.25))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(if is_current {
+                ink
+            } else if liked {
+                theme.accent
+            } else {
+                muted
+            })
+            .when(!liked, |d| {
+                d.opacity(0.).group_hover(group.clone(), |s| s.opacity(1.))
+            })
+            .hover(|s| s.text_color(if is_current { ink } else { theme.accent }))
+            .cursor_pointer()
+            .child(icon(IconName::Heart).size(rems(0.8125)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_like(&like_path, cx);
+            }));
         let actions = match row.list {
             TrackList::Playlist(..) => PLAYLIST_TRACK_ACTIONS,
             _ => TRACK_ACTIONS,
@@ -2739,6 +2812,7 @@ impl Omamusic {
             .child(text_cell(SongColumn::Artist, t.artist.clone()))
             .child(text_cell(SongColumn::Album, t.album.clone()))
             .child(text_cell(SongColumn::Genre, t.genre.clone()))
+            .child(heart)
             .child(div().w(rems(1.5)).flex_shrink_0().child(more))
             .child(text_cell(SongColumn::Time, format_time(t.duration)));
         self.track_row("song", i, row.list.clone(), false, content, cx)
@@ -2850,6 +2924,12 @@ impl Omamusic {
                     cx,
                 )
             }
+            Section::Liked => self.render_song_table(
+                "liked-songs",
+                TrackList::Source(self.liked_source()),
+                None,
+                cx,
+            ),
             Section::Albums => self.render_albums_section(window, cx),
             Section::Artists => self.render_artist_list(cx),
             Section::Genres => self.render_genre_list(window, cx),
@@ -3148,13 +3228,13 @@ impl Omamusic {
         uniform_list(
             "album-rows",
             total,
-            cx.processor(move |this, range: Range<usize>, _, cx| {
+            cx.processor(move |this, range: Range<usize>, window, cx| {
                 let start = range.start;
                 let albums = this.library.album_page(start, range.len(), sort);
                 range
                     .map(|idx| {
                         let album = albums.get(idx - start).cloned().unwrap_or_default();
-                        this.album_row(&album, idx, cx)
+                        this.album_row(&album, idx, window, cx)
                     })
                     .collect::<Vec<_>>()
             }),
@@ -3164,8 +3244,15 @@ impl Omamusic {
         .into_any_element()
     }
 
-    fn album_row(&self, a: &AlbumSummary, idx: usize, cx: &mut Context<Self>) -> Popover {
+    fn album_row(
+        &self,
+        a: &AlbumSummary,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Popover {
         let theme = cx.omarchy().clone();
+        let bg = self.list_row_fill(("album-row-hover", idx), idx, window, cx);
         let key = a.id.clone();
         let year = if a.year > 0 {
             a.year.to_string()
@@ -3188,11 +3275,12 @@ impl Omamusic {
             .flex()
             .items_center()
             .gap(rems(0.75))
-            .px(rems(0.75))
-            .py(rems(0.375))
-            .border_b_1()
-            .border_color(theme.border)
-            .hover(|s| s.bg(theme.hover_fill()))
+            .mx(rems(0.375))
+            .px(rems(0.5))
+            .py(rems(0.3125))
+            .rounded(rems(0.375))
+            .bg(bg.0)
+            .on_hover(bg.1)
             .cursor_pointer()
             .child(self.badged_cover(&a.id, a.unmatched, 36., &a.title, cx))
             .child(
@@ -3229,18 +3317,39 @@ impl Omamusic {
         .w_full()
     }
 
+    /// The striped, hover-eased fill of a plain list row and its hover listener.
+    fn list_row_fill(
+        &self,
+        key: impl Into<ElementId>,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (Hsla, impl Fn(&bool, &mut Window, &mut App) + 'static) {
+        let theme = cx.omarchy().clone();
+        let (hover, on_hover) = hover_progress(
+            key,
+            Transition::new(ROW_FILL).ease(gpui_kit::linear),
+            window,
+            cx,
+        );
+        (
+            row_fill(theme.hover_fill(), !idx.is_multiple_of(2), hover),
+            on_hover,
+        )
+    }
+
     fn render_artist_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let total = self.library.artist_total();
         uniform_list(
             "artists",
             total,
-            cx.processor(move |this, range: Range<usize>, _, cx| {
+            cx.processor(move |this, range: Range<usize>, window, cx| {
                 let start = range.start;
                 let artists = this.library.artist_page(start, range.len());
                 range
                     .map(|idx| {
                         let entry = artists.get(idx - start).cloned().unwrap_or_default();
-                        this.artist_row(idx, &entry, cx)
+                        this.artist_row(idx, &entry, window, cx)
                     })
                     .collect::<Vec<_>>()
             }),
@@ -3249,8 +3358,15 @@ impl Omamusic {
         .min_h_0()
         .into_any_element()
     }
-    fn artist_row(&self, idx: usize, entry: &ArtistEntry, cx: &mut Context<Self>) -> Popover {
+    fn artist_row(
+        &self,
+        idx: usize,
+        entry: &ArtistEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Popover {
         let theme = cx.omarchy().clone();
+        let bg = self.list_row_fill(("artist-hover", idx), idx, window, cx);
         let an = entry.album_count;
         let label = format!(
             "{} · {an} album{} · {} songs",
@@ -3264,14 +3380,22 @@ impl Omamusic {
             .id(("artist", idx))
             .flex()
             .items_center()
-            .gap(rems(0.5))
-            .px(rems(0.75))
-            .py(rems(0.5))
-            .border_b_1()
-            .border_color(theme.border)
-            .hover(|s| s.bg(theme.hover_fill()))
+            .gap(rems(0.75))
+            .mx(rems(0.375))
+            .px(rems(0.5))
+            .py(rems(0.3125))
+            .rounded(rems(0.375))
+            .bg(bg.0)
+            .on_hover(bg.1)
             .cursor_pointer()
-            .child(self.cover(entry.cover_album_id.as_deref(), 40., &entry.name, cx))
+            .child(rounded_cover(
+                &self.library,
+                entry.cover_album_id.as_deref(),
+                40.,
+                &entry.name,
+                px(20.),
+                cx,
+            ))
             .on_click(
                 cx.listener(move |this, _, _, cx| this.navigate(Page::Artist(aname.clone()), cx)),
             )
@@ -3320,6 +3444,11 @@ impl Omamusic {
         .join(" · ");
         let current = self.player.current();
         let playing = self.player.state() == PlayerState::Playing;
+        let tint = self
+            .library
+            .covers()
+            .cached(&album.id, 400)
+            .map(|thumb| thumb.tint);
         let play = |shuffle: bool, tracks: Arc<[Track]>| {
             move |this: &mut Omamusic, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
                 let start = if shuffle {
@@ -3452,16 +3581,11 @@ impl Omamusic {
                 window,
                 cx,
             );
-            let zebra = if i.is_multiple_of(2) {
-                theme.background
-            } else {
-                theme.background.blend(theme.hover_fill().opacity(0.5))
-            };
             let (bg, ink, muted) = if is_current {
                 (theme.accent, theme.on_accent, theme.on_accent.opacity(0.8))
             } else {
                 (
-                    row_fill(zebra, theme.hover_fill(), hover),
+                    row_fill(theme.hover_fill(), !i.is_multiple_of(2), hover),
                     theme.foreground,
                     theme.secondary,
                 )
@@ -3584,12 +3708,34 @@ impl Omamusic {
             });
         div()
             .id("album-detail-scroll")
+            .relative()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .p(rems(1.5))
+            .when_some(tint, |d, tint| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(rems(22.))
+                        .bg(linear_gradient(
+                            180.,
+                            linear_color_stop(tint_color(tint, 0.3), 0.),
+                            linear_color_stop(tint_color(tint, 0.), 1.),
+                        ))
+                        .with_animation(
+                            ElementId::Name(format!("album-tint-{}", album.id).into()),
+                            Animation::new(TINT_ENTER).with_easing(ease_out_quint()),
+                            |wash, t| wash.opacity(t),
+                        ),
+                )
+            })
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_col()
                     .gap(rems(1.5))
@@ -3853,7 +3999,7 @@ impl Omamusic {
             let rows: Vec<Popover> = artists
                 .iter()
                 .enumerate()
-                .map(|(i, entry)| self.artist_row(i, entry, cx))
+                .map(|(i, entry)| self.artist_row(i, entry, window, cx))
                 .collect();
             sections.push(
                 div()
@@ -4122,7 +4268,7 @@ impl Omamusic {
             .bg(if is_current {
                 rest
             } else {
-                row_fill(rest, theme.hover_fill(), hover)
+                row_fill(theme.hover_fill(), false, hover)
             })
             .on_hover(on_hover)
             .cursor_pointer()

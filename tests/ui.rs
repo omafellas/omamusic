@@ -144,6 +144,11 @@ impl Smoke<'_> {
         })
     }
 
+    fn liked_file(&self) -> serde_json::Value {
+        let text = std::fs::read_to_string(self.config_dir.join("liked.json")).unwrap_or_default();
+        serde_json::from_str(&text).unwrap_or_default()
+    }
+
     fn search(&mut self, text: &str) {
         self.press("ctrl-f");
         self.cx.update(|window, cx| window.input(text, cx));
@@ -985,4 +990,87 @@ async fn transport_is_centered_above_the_progress_line(cx: &mut TestAppContext) 
         offset < rem * 0.5,
         "play is centered in the bar: {play:?} in a window {width:?} wide"
     );
+}
+
+fn silent_wav(path: &std::path::Path) {
+    let samples = 44_100u32;
+    let mut wav = Vec::with_capacity(44 + samples as usize * 2);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + samples * 2).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&samples.to_le_bytes());
+    wav.extend_from_slice(&(samples * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(samples * 2).to_le_bytes());
+    wav.resize(wav.len() + samples as usize * 2, 0);
+    std::fs::write(path, wav).unwrap();
+}
+
+#[gpui_kit::test]
+async fn liked_songs_fill_their_section_and_persist(cx: &mut TestAppContext) {
+    let mut app = open_with(cx, songs_library());
+    app.hover_on(("song", 0usize));
+    app.click_on(("song-like", 0usize));
+    assert_eq!(
+        app.liked_file(),
+        serde_json::json!(["/music/Mod/Bravo.flac"])
+    );
+
+    app.click("nav-liked");
+    assert_eq!(app.label("view-title").as_deref(), Some("Liked Songs"));
+    assert_eq!(app.label("view-detail").as_deref(), Some("1 song · 3 min"));
+    assert_eq!(
+        app.label_of(("song-play", 0usize)).as_deref(),
+        Some("Play Bravo")
+    );
+
+    app.hover_on(("song", 0usize));
+    app.click_on(("song-like", 0usize));
+    assert_eq!(app.label("view-detail").as_deref(), Some("No songs"));
+    assert_eq!(app.liked_file(), serde_json::json!([]));
+}
+
+#[gpui_kit::test]
+async fn the_bar_heart_likes_the_playing_song(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "omamusic-like-{}-{}",
+        std::process::id(),
+        NEXT_CONFIG_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Low Tide.wav");
+    silent_wav(&path);
+    let library = Arc::new(Library::empty());
+    library.insert_song(
+        &Track {
+            path: path.clone(),
+            title: "Low Tide".into(),
+            artist: "Neon Harbor".into(),
+            album: "Afterglow".into(),
+            track_number: 1,
+            year: 2020,
+            duration: 1.0,
+            album_id: "afterglow".into(),
+            genre: "Synth-pop".into(),
+        },
+        1,
+    );
+    let mut app = open_with(cx, library);
+    app.hover_on(("song", 0usize));
+    app.play_with(|window, cx| window.click(("song-play", 0usize), cx));
+    let player = app.view.read_with(app.cx, |view, _| view.player.clone());
+    wait_until("the song to load", || player.current().is_some());
+    player.pause();
+    app.click_on("like");
+    assert_eq!(
+        app.liked_file(),
+        serde_json::json!([path.to_string_lossy()])
+    );
+    app.click_on("like");
+    assert_eq!(app.liked_file(), serde_json::json!([]));
 }

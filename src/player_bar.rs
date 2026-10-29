@@ -1,4 +1,6 @@
-use crate::app::{cover, format_time, hover_progress, CoverPoll, Omamusic, LIFT};
+use crate::app::{
+    cover, format_time, hover_progress, tint_color, CoverPoll, Omamusic, LIFT, TINT_ENTER,
+};
 use crate::config::AppConfig;
 use crate::library::Library;
 use crate::models::{PlayerState, RepeatMode};
@@ -9,9 +11,9 @@ use gpui_kit::base::{Slider, SliderIndicator, SliderThumb, SliderTrack};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::TestSupportExt;
 use gpui_kit::{
-    div, ease_out_quint, px, relative, rems, Animation, AnimationExt as _, App, AppContext,
-    Context, ElementId, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, Render,
-    StatefulInteractiveElement, Styled, WeakEntity, Window,
+    div, ease_out_quint, linear_color_stop, linear_gradient, px, relative, rems, Animation,
+    AnimationExt as _, App, AppContext, Context, ElementId, Entity, FontWeight, InteractiveElement,
+    IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled, WeakEntity, Window,
 };
 use gpui_omarchy::{
     button, icon, icon_button, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName,
@@ -236,10 +238,12 @@ impl Render for PlayerBar {
         let shuffle = self.player.shuffle();
         let repeat = self.player.repeat();
         let muted = self.player.is_muted();
-        let queue_open = self
-            .main
-            .upgrade()
-            .is_some_and(|main| main.read(cx).queue_open());
+        let main = self.main.upgrade();
+        let queue_open = main.as_ref().is_some_and(|main| main.read(cx).queue_open());
+        let liked = main
+            .as_ref()
+            .zip(current)
+            .is_some_and(|(main, track)| main.read(cx).is_liked(&track.path));
         let wide = window.viewport_size().width >= window.rem_size() * WIDE_REMS;
         let (seek_hover, on_seek_hover) =
             hover_progress("progress", Transition::new(LIFT), window, cx);
@@ -438,7 +442,15 @@ impl Render for PlayerBar {
             if muted { "Unmute" } else { "Mute" },
         );
 
+        let tint = current.and_then(|track| {
+            self.library
+                .covers()
+                .cached(&track.album_id, 80)
+                .map(|thumb| (track.album_id.clone(), thumb.tint))
+        });
+
         div()
+            .relative()
             .flex()
             .items_center()
             .gap(rems(0.75))
@@ -447,6 +459,23 @@ impl Render for PlayerBar {
             .border_t_1()
             .border_color(theme.border)
             .bg(theme.background)
+            .when_some(tint, |d, (album_id, tint)| {
+                d.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(linear_gradient(
+                            90.,
+                            linear_color_stop(tint_color(tint, 0.22), 0.),
+                            linear_color_stop(tint_color(tint, 0.), 0.6),
+                        ))
+                        .with_animation(
+                            ElementId::Name(format!("bar-tint-{album_id}").into()),
+                            Animation::new(TINT_ENTER).with_easing(ease_out_quint()),
+                            |wash, t| wash.opacity(t),
+                        ),
+                )
+            })
             .child(lane().child(now_playing))
             .child(
                 div()
@@ -463,6 +492,27 @@ impl Render for PlayerBar {
                 lane()
                     .justify_end()
                     .gap(rems(0.25))
+                    .child(with_tooltip(
+                        icon_button(
+                            "like",
+                            IconName::Heart,
+                            if liked { "Unlike" } else { "Like" },
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .rounded(rems(0.375))
+                        .disabled(!has_track)
+                        .when(liked, |b| b.text_color(theme.accent))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(track) = this.player.current() {
+                                let _ = this
+                                    .main
+                                    .update(cx, |main, cx| main.toggle_like(&track.path, cx));
+                            }
+                            cx.notify();
+                        })),
+                        if liked { "Unlike" } else { "Like" },
+                    ))
                     .child(with_tooltip(
                         icon_button(
                             "bar-queue",
