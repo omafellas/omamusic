@@ -17,6 +17,9 @@ pub struct AudioMetadata {
     pub year: u32,
     pub duration: f64,
     pub artwork: Option<Vec<u8>>,
+    pub mb_release_group: String,
+    pub mb_release: String,
+    pub mb_recording: String,
 }
 
 /// macOS leaves AppleDouble metadata files (`._*`) and `__MACOSX` folders
@@ -80,6 +83,9 @@ fn read_tagged(path: &Path) -> Result<AudioMetadata> {
     meta.title = text(ItemKey::TrackTitle);
     meta.artist = text(ItemKey::TrackArtist);
     meta.album = text(ItemKey::AlbumTitle);
+    meta.mb_release_group = text(ItemKey::MusicBrainzReleaseGroupId);
+    meta.mb_release = text(ItemKey::MusicBrainzReleaseId);
+    meta.mb_recording = text(ItemKey::MusicBrainzRecordingId);
     meta.genre = parse_genre(
         &tag.get_strings(&ItemKey::Genre)
             .collect::<Vec<_>>()
@@ -593,6 +599,8 @@ mod tests {
         tag.insert_text(ItemKey::Genre, "(22)".into());
         tag.insert_text(ItemKey::TrackNumber, "12/14".into());
         tag.insert_text(ItemKey::RecordingDate, "2002-06-01".into());
+        tag.insert_text(ItemKey::MusicBrainzReleaseGroupId, "rg-1".into());
+        tag.insert_text(ItemKey::MusicBrainzReleaseId, "rel-1".into());
         tag.push_picture(Picture::new_unchecked(
             PictureType::CoverFront,
             Some(MimeType::Png),
@@ -610,6 +618,8 @@ mod tests {
         assert_eq!(meta.year, 2002);
         assert_eq!(meta.artwork, Some(vec![1, 2, 3]));
         assert!((meta.duration - 1.0).abs() < 0.01, "{}", meta.duration);
+        assert_eq!(meta.mb_release_group, "rg-1");
+        assert_eq!(meta.mb_release, "rel-1");
     }
 
     #[test]
@@ -620,12 +630,17 @@ mod tests {
             mp3_bytes(&[
                 (b"TIT2", b"\x00No Palco"),
                 (b"TYER", b"\x002002\x002002\x00"),
+                (b"UFID", b"http://musicbrainz.org\x00rec-1"),
             ]),
         )
         .unwrap();
         let meta = read(&file.0);
         assert_eq!(meta.title, "No Palco");
         assert_eq!(meta.year, 2002);
+        assert_eq!(
+            meta.mb_recording, "rec-1",
+            "Picard stores the recording id in UFID"
+        );
         assert!(meta.duration > 0.0);
     }
 

@@ -27,6 +27,7 @@ async-channel = "2"
 futures-lite = "2"
 resvg = "0.46"
 lofty = "0.22"
+sha2 = "0.10"
 
 [features]
 test-support = []

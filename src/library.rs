@@ -78,6 +78,7 @@ impl Library {
         let thread_state = state.clone();
         let thread_db = db.clone();
         let thread_covers = covers.clone();
+        let cache_dir = Self::cache_dir()?;
         std::thread::spawn(move || {
             let mut writer = match Db::open_writer(&thread_db.path) {
                 Ok(writer) => writer,
@@ -89,7 +90,7 @@ impl Library {
             loop {
                 let folders = thread_state.read().folders.clone();
                 update(&thread_state, |s| s.scanning = true);
-                match index::reconcile(&mut writer, &folders) {
+                match index::reconcile(&mut writer, &folders, &cache_dir) {
                     Ok(stats) => {
                         for key in &stats.changed_albums {
                             thread_covers.remove(key);
@@ -120,9 +121,13 @@ impl Library {
         })
     }
 
-    fn db_path() -> Result<PathBuf> {
+    fn cache_dir() -> Result<PathBuf> {
         let dir = dirs::cache_dir().context("no cache directory")?;
-        Ok(dir.join("omamusic").join("library.db"))
+        Ok(dir.join("omamusic"))
+    }
+
+    fn db_path() -> Result<PathBuf> {
+        Ok(Self::cache_dir()?.join("library.db"))
     }
 
     fn load_snapshot(db: &Db, folders: Vec<PathBuf>) -> Result<LibrarySnapshot> {

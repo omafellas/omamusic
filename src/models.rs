@@ -34,6 +34,9 @@ pub struct AlbumSummary {
     pub artist: String,
     pub year: u32,
     pub track_count: usize,
+    /// Online lookup ran and found no confident match.
+    #[serde(default)]
+    pub unmatched: bool,
 }
 
 /// A row in the Artists view: aggregate counts plus a representative album
