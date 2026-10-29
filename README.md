@@ -19,7 +19,7 @@ Run `omamusic`: on first launch it picks up `~/Music` automatically, no setup ne
 ## Features
 
 - Local, read-only library indexed into a SQLite database at `~/.cache/omamusic/library.db`; album, artist and song views; no accounts or network services.
-- Embedded metadata (title, artist, album, genre, track number, year) and cover art for MP3, FLAC, MP4/M4A and Vorbis comments, with folder cover art fallback.
+- Embedded metadata (title, artist, album, genre, track number, year) and cover art for MP3, FLAC, MP4/M4A, Ogg Vorbis, WAV and AIFF, with folder cover art fallback.
 - In-process decoding through Rodio/Symphonia and output through CPAL. Supports MP3, FLAC, Vorbis, AAC/ALAC, WAV and AIFF without installed codecs.
 - Play/pause, seek, previous/next, mute, shuffle, repeat and saved volume.
 - BM25 full-text search (SQLite FTS5) with partial-word matching, and album detail views inspired by Overdrive.
