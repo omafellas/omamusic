@@ -353,7 +353,22 @@ async fn lookup_progress_is_shown_while_working(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 async fn settings_hint_at_missing_acoustid_key(cx: &mut TestAppContext) {
-    let mut app = open(cx);
+    let dir = isolated_config_dir();
+    std::fs::write(dir.join("config.json"), r#"{"acoustid_key": ""}"#).unwrap();
+    let library = Arc::new(Library::empty());
+    let player = Arc::new(Player::new_test());
+    cx.update(|cx| {
+        gpui_omarchy::init(cx);
+        omamusic::init_actions(&library, &player, cx);
+    });
+    let (root, cx) = cx.add_window_view(|window, cx| Root::new(library, player, window, cx));
+    cx.run_until_parked();
+    let view = root.read_with(cx, |root, _| root.main().clone());
+    let mut app = Smoke {
+        view,
+        cx,
+        config_dir: dir,
+    };
     app.click("settings");
     assert!(
         app.exists("lookup-acoustid-hint"),

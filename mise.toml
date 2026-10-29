@@ -2,6 +2,9 @@ wrappers = { cargo = { command = "mbx", env = { MBX_CARGO_SHIM_MODE = "1" } } }
 [settings]
 activate_aggressive = true
 
+[env]
+OMAMUSIC_ACOUSTID_KEY = "4dYTkZ5T3E"
+
 [tools]
 rust = { version = "stable", components = "clippy,rustfmt,rust-analyzer" }
 mr-boxington = "latest"
