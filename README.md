@@ -18,7 +18,8 @@ Run `omamusic`: on first launch it picks up `~/Music` automatically, no setup ne
 
 ## Features
 
-- Local, read-only library indexed into a SQLite database at `~/.cache/omamusic/library.db`; album, artist and song views; no accounts or network services.
+- Local library indexed into a SQLite database at `~/.cache/omamusic/library.db`; album, artist and song views; no accounts, and no network use unless you turn it on.
+- Optional online lookup, off by default: identifies albums on MusicBrainz, fetches missing covers from Cover Art Archive, iTunes or Deezer, and writes covers and missing tags into your files. Only empty fields are filled; existing tags are never changed. Sends only album title, artist name and track count. Albums it cannot identify get a badge and are listed in Settings with a retry button.
 - Embedded metadata (title, artist, album, genre, track number, year) and cover art for MP3, FLAC, MP4/M4A, Ogg Vorbis, WAV and AIFF, with folder cover art fallback.
 - In-process decoding through Rodio/Symphonia and output through CPAL. Supports MP3, FLAC, Vorbis, AAC/ALAC, WAV and AIFF without installed codecs.
 - Play/pause, seek, previous/next, mute, shuffle, repeat and saved volume.
@@ -55,8 +56,9 @@ The bundle asks for only the permissions the player actually uses:
 | `--talk-name=org.freedesktop.Notifications` | the "still running in tray" hint |
 | `--filesystem=xdg-music:ro` | scanning the default `~/Music` library (read-only) |
 | `--filesystem=~/.local/state/omarchy:ro` | following the live Omarchy theme colors |
+| `--share=network` | the optional online lookup (MusicBrainz, Cover Art Archive, iTunes, Deezer) |
 
-No network access is requested at runtime — the app is fully local. Folders beyond `~/Music` are added through the system file chooser portal; if you type a path in Settings instead, grant the sandbox read access to it:
+The network is used only while the online lookup setting is on. The music folder stays read-only inside the sandbox, so fetched covers are kept in the cache and tags are not written into files there. Folders beyond `~/Music` are added through the system file chooser portal; if you type a path in Settings instead, grant the sandbox read access to it:
 
 ```sh
 flatpak override --user --filesystem=/path/to/Music:ro io.github.omafellas.omamusic
