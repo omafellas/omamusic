@@ -213,6 +213,27 @@ fn build_output<T: cpal::SizedSample + cpal::FromSample<f32>>(
     )?)
 }
 
+#[cfg(target_os = "linux")]
+const PULSE_FRAMES: u32 = 1024;
+
+/// PulseAudio, and PipeWire's Pulse server, queue one to two seconds of audio
+/// when the stream leaves the buffer size to them, so pause, skip and stop
+/// would only be heard once that queue drains. Ask for about 20 ms instead.
+#[cfg(target_os = "linux")]
+fn output_buffer(host: cpal::HostId, supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    match supported {
+        cpal::SupportedBufferSize::Range { min, max } if host == cpal::HostId::PulseAudio => {
+            cpal::BufferSize::Fixed(PULSE_FRAMES.clamp(*min, *max))
+        }
+        _ => cpal::BufferSize::Default,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn output_buffer(_: cpal::HostId, _: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    cpal::BufferSize::Default
+}
+
 fn open_source(track: &Track, channels: usize, rate: u32) -> Result<(AudioSource, f64)> {
     let file = File::open(&track.path).with_context(|| format!("open {}", track.path.display()))?;
     let decoder =
@@ -366,7 +387,7 @@ impl Player {
         anyhow::bail!("no usable audio output: {}", failures.join("; "))
     }
 
-    fn from_device(device: &cpal::Device, _host: cpal::HostId, volume: f64) -> Result<Self> {
+    fn from_device(device: &cpal::Device, host: cpal::HostId, volume: f64) -> Result<Self> {
         let mut supported = device
             .default_output_config()
             .context("query audio output")?;
@@ -383,8 +404,8 @@ impl Player {
                 .context("no supported PCM audio format")?
                 .with_sample_rate(48_000);
         }
-        let config = supported.config();
-        // PulseAudio-specific buffer size handling is not applicable on macOS (CoreAudio).
+        let mut config = supported.config();
+        config.buffer_size = output_buffer(host, supported.buffer_size());
         if config.channels == 0 || config.sample_rate == 0 {
             anyhow::bail!("audio device reported an invalid stream configuration");
         }
@@ -843,6 +864,30 @@ mod tests {
 
     fn write_silent_wav(path: &std::path::Path) {
         write_wav(path, |_| 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pulse_output_asks_for_a_short_buffer() {
+        use cpal::{BufferSize, HostId, SupportedBufferSize};
+        let range = |min, max| SupportedBufferSize::Range { min, max };
+        assert_eq!(
+            output_buffer(HostId::PulseAudio, &range(64, 8192)),
+            BufferSize::Fixed(1024)
+        );
+        assert_eq!(
+            output_buffer(HostId::PulseAudio, &range(2048, 8192)),
+            BufferSize::Fixed(2048),
+            "never below what the device accepts"
+        );
+        assert_eq!(
+            output_buffer(HostId::PulseAudio, &SupportedBufferSize::Unknown),
+            BufferSize::Default
+        );
+        assert_eq!(
+            output_buffer(HostId::Alsa, &range(64, 8192)),
+            BufferSize::Default
+        );
     }
 
     #[test]
