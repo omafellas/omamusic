@@ -185,23 +185,31 @@ async fn sync(
 
 fn cover(library: &Library, album_id: &str) -> Option<Cover> {
     let covers = library.covers();
-    let large = covers.thumbnail(album_id, 512)?;
     let dir = dirs::cache_dir()?.join("omamusic").join("covers");
     std::fs::create_dir_all(&dir).ok()?;
     let file: PathBuf = dir.join(format!("{:016x}.png", hash(album_id)));
     if !file.exists() {
-        std::fs::write(&file, large.bytes()).ok()?;
+        std::fs::write(&file, png_bytes(&covers.thumbnail(album_id, 512)?)?).ok()?;
     }
-    let menu_png = covers.thumbnail(album_id, 32)?.bytes().to_vec();
-    let small = image::load_from_memory(covers.thumbnail(album_id, 64)?.bytes())
-        .ok()?
-        .to_rgba8();
+    let menu_png = png_bytes(&covers.thumbnail(album_id, 32)?)?;
+    let small = covers.thumbnail(album_id, 64)?;
     Some(Cover {
         url: format!("file://{}", file.display()),
         menu_png,
         icon: argb(&small, 1.0),
         dimmed: argb(&small, 0.45),
     })
+}
+
+fn png_bytes(image: &image::RgbaImage) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .ok()?;
+    Some(bytes)
 }
 
 fn argb(image: &image::RgbaImage, alpha: f32) -> ksni::Icon {

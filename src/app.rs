@@ -316,7 +316,7 @@ pub fn cover(
 ) -> impl IntoElement {
     let cover = avatar(initials(name), cx).size(px(size));
     match album_id.and_then(|id| library.covers().cached(id, size as u32 * 2)) {
-        Some(image) => cover.image(avatar_image(ImageSource::Image(image))),
+        Some(thumb) => cover.image(avatar_image(ImageSource::Render(thumb.image))),
         None => cover,
     }
 }
