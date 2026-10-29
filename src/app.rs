@@ -3167,6 +3167,7 @@ impl Omamusic {
         } else {
             a.artist.clone()
         };
+        let now = self.album_state(&a.id);
         let card = div()
             .id((id, idx))
             .test_support()
@@ -3184,6 +3185,25 @@ impl Omamusic {
             .child(
                 lifted(size, lift)
                     .child(self.badged_cover(&a.id, a.unmatched, size, &a.title, cx))
+                    .when_some(now, |d, playing| {
+                        d.child(
+                            div()
+                                .id(ElementId::Name(format!("album-now-{}", a.id).into()))
+                                .test_support()
+                                .aria_label(if playing { "Now Playing" } else { "Paused" })
+                                .absolute()
+                                .left(rems(0.5))
+                                .bottom(rems(0.5))
+                                .size(rems(1.75))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(theme.accent)
+                                .shadow_md()
+                                .child(now_playing(playing, theme.on_accent)),
+                        )
+                    })
                     .child(
                         div()
                             .id(ElementId::Name(format!("album-play-{}", a.id).into()))
@@ -3215,7 +3235,11 @@ impl Omamusic {
             .child(
                 div()
                     .text_size(rems(0.75))
-                    .text_color(theme.foreground)
+                    .text_color(if now.is_some() {
+                        theme.accent
+                    } else {
+                        theme.foreground
+                    })
                     .truncate()
                     .child(a.title.clone()),
             )
@@ -3232,6 +3256,13 @@ impl Omamusic {
             a,
             cx,
         )
+    }
+
+    /// Whether the album holds the current track: `Some(true)` while it
+    /// plays, `Some(false)` while paused.
+    fn album_state(&self, album_id: &str) -> Option<bool> {
+        let current = self.player.current()?;
+        (current.album_id == album_id).then(|| self.player.state() == PlayerState::Playing)
     }
 
     fn render_album_rows(&mut self, sort: AlbumSort, cx: &mut Context<Self>) -> AnyElement {
@@ -3264,6 +3295,7 @@ impl Omamusic {
     ) -> Popover {
         let theme = cx.omarchy().clone();
         let bg = self.list_row_fill(("album-row-hover", idx), idx, window, cx);
+        let now = self.album_state(&a.id);
         let key = a.id.clone();
         let year = if a.year > 0 {
             a.year.to_string()
@@ -3299,10 +3331,26 @@ impl Omamusic {
                     .flex_1()
                     .flex_grow(TITLE_GROW)
                     .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(rems(0.375))
                     .text_size(rems(0.75))
-                    .text_color(theme.foreground)
-                    .truncate()
-                    .child(a.title.clone()),
+                    .text_color(if now.is_some() {
+                        theme.accent
+                    } else {
+                        theme.foreground
+                    })
+                    .when_some(now, |d, playing| {
+                        d.child(
+                            div()
+                                .id(ElementId::Name(format!("album-row-now-{}", a.id).into()))
+                                .test_support()
+                                .aria_label(if playing { "Now Playing" } else { "Paused" })
+                                .flex_none()
+                                .child(now_playing(playing, theme.accent)),
+                        )
+                    })
+                    .child(div().min_w_0().truncate().child(a.title.clone())),
             )
             .child(
                 div()

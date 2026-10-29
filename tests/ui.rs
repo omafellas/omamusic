@@ -1074,3 +1074,57 @@ async fn the_bar_heart_likes_the_playing_song(cx: &mut TestAppContext) {
     app.click_on("like");
     assert_eq!(app.liked_file(), serde_json::json!([]));
 }
+
+#[gpui_kit::test]
+async fn the_playing_album_is_marked_in_the_grid_and_the_list(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "omamusic-now-{}-{}",
+        std::process::id(),
+        NEXT_CONFIG_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Low Tide.wav");
+    silent_wav(&path);
+    let library = Arc::new(Library::empty());
+    for (path, album) in [
+        (path.clone(), "Afterglow"),
+        (dir.join("x.wav"), "Backwater"),
+    ] {
+        library.insert_song(
+            &Track {
+                path,
+                title: "Low Tide".into(),
+                artist: "Neon Harbor".into(),
+                album: album.into(),
+                track_number: 1,
+                year: 2020,
+                duration: 1.0,
+                album_id: album.to_lowercase(),
+                genre: "Synth-pop".into(),
+            },
+            1,
+        );
+    }
+    let mut app = open_with(cx, library);
+    app.click("nav-albums");
+    assert!(!app.has("album-now-afterglow"));
+
+    app.hover_on(("album", 0usize));
+    app.play_with(|window, cx| window.click("album-play-afterglow", cx));
+    let player = app.view.read_with(app.cx, |view, _| view.player.clone());
+    wait_until("the album to play", || player.current().is_some());
+    app.hover_on("nav-songs");
+    assert_eq!(
+        app.label("album-now-afterglow").as_deref(),
+        Some("Now Playing")
+    );
+    assert!(!app.has("album-now-backwater"));
+
+    player.pause();
+    player.settle();
+    assert_eq!(app.label("album-now-afterglow").as_deref(), Some("Paused"));
+
+    app.click("albums-view-list");
+    assert!(app.has("album-row-now-afterglow"));
+    assert!(!app.has("album-row-now-backwater"));
+}

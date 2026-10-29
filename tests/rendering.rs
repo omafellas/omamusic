@@ -720,6 +720,54 @@ mod pixels {
         assert!(red[0] > blue[0] && blue[2] > red[2], "{red:?} vs {blue:?}");
     }
 
+    fn the_playing_album_tile_wears_a_badge() {
+        let dir = isolated_config_dir();
+        let path = dir.join("Low Tide.wav");
+        silent_wav(&path);
+        let library = Arc::new(Library::empty());
+        library.insert_song(
+            &omamusic::models::Track {
+                path,
+                title: "Low Tide".into(),
+                artist: "Neon Harbor".into(),
+                album: "Afterglow".into(),
+                track_number: 1,
+                year: 2020,
+                duration: 1.0,
+                album_id: "afterglow".into(),
+                genre: "Synth-pop".into(),
+            },
+            1,
+        );
+        let mut scene = Scene::open_with(library);
+        scene.act(|window, cx| window.click("nav-albums", cx));
+        let card = scene.bounds_of(("album", 0usize));
+        let resting = scene.capture();
+        scene.act(|window, cx| window.hover(("album", 0usize), cx));
+        scene.act(|window, cx| window.click("album-play-afterglow", cx));
+        let player = scene.cx.update(|cx| scene.view.read(cx).player.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while player.current().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the album must start playing"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        player.pause();
+        scene.act(|window, cx| window.hover("nav-songs", cx));
+        let playing = scene.capture();
+        let badge = scene.bounds("album-now-afterglow");
+        assert!(
+            card.contains(&badge.center()),
+            "the badge sits on the cover: {badge:?} in {card:?}"
+        );
+        assert!(
+            playing.changed_in(&resting, badge) > 0,
+            "the badge must paint over the cover at {badge:?}"
+        );
+    }
+
     fn up_next_panel_slides_in() {
         let mut scene = Scene::open();
         scene.allow_motion();
@@ -750,7 +798,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 15] = [
+        let tests: [(&str, fn()); 16] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -791,6 +839,10 @@ mod pixels {
                 the_playing_song_row_is_filled,
             ),
             ("up_next_panel_slides_in", up_next_panel_slides_in),
+            (
+                "the_playing_album_tile_wears_a_badge",
+                the_playing_album_tile_wears_a_badge,
+            ),
             (
                 "album_rows_have_no_separator_lines",
                 album_rows_have_no_separator_lines,
