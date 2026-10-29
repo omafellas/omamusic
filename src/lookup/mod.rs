@@ -3,4 +3,6 @@
 //! here runs unless `AppConfig::online_lookup` is on.
 
 pub mod http;
+pub mod musicbrainz;
+pub mod text;
 pub mod write;
