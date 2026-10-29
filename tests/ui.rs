@@ -2,11 +2,13 @@
 //! window with the real key bindings and asserts the visible outcome.
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{px, Entity, Pixels, TestAppContext, VisualTestContext};
+use omamusic::lookup::http::FakeHttp;
 use omamusic::models::AlbumSummary;
 use omamusic::{AppConfig, Library, Omamusic, Player, Root};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 static NEXT_CONFIG_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -222,21 +224,33 @@ async fn online_lookup_switch_persists_to_config(cx: &mut TestAppContext) {
     assert_eq!(v["online_lookup"], serde_json::Value::Bool(false));
 }
 
-fn unmatched_summary(key: &str) -> AlbumSummary {
+fn album(key: &str, title: &str, unmatched: bool) -> AlbumSummary {
     AlbumSummary {
         id: key.to_string(),
-        title: "Estranhos no Ninho".to_string(),
+        title: title.to_string(),
         artist: "Exxótica".to_string(),
         year: 2002,
         track_count: 1,
-        unmatched: true,
+        unmatched,
+    }
+}
+
+/// Wait for the background lookup thread, which `run_until_parked` cannot see.
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 #[gpui_kit::test]
 async fn unmatched_album_shows_badge_and_settings_count(cx: &mut TestAppContext) {
     let library = Arc::new(Library::empty());
-    library.insert_unmatched_album(&unmatched_summary("k"));
+    library.insert_album(&album("k", "Estranhos no Ninho", true));
     let mut app = open_with(cx, library);
     app.click("nav-albums");
     assert!(
@@ -259,19 +273,82 @@ async fn unmatched_album_shows_badge_and_settings_count(cx: &mut TestAppContext)
 }
 
 #[gpui_kit::test]
-async fn lookup_progress_is_shown_while_working(cx: &mut TestAppContext) {
-    let library = Arc::new(Library::empty());
-    library.set_lookup_progress(3, 12);
+async fn switching_lookup_on_runs_the_worker_through_the_real_wiring(cx: &mut TestAppContext) {
+    let config_dir = isolated_config_dir();
+    let http = Arc::new(FakeHttp::new().on(
+        "https://musicbrainz.org/ws/2/release/?",
+        200,
+        br#"{"releases":[]}"#.to_vec(),
+    ));
+    let library = Arc::new(Library::with_lookup(&config_dir, http.clone()).unwrap());
+    library.insert_album(&album("k", "Estranhos no Ninho", false));
     let mut app = open_with(cx, library.clone());
+    app.click("nav-albums");
+    assert!(!app.exists("album-unmatched-k"));
+
     app.click("settings");
+    app.click("pref-online-lookup");
+    wait_until("the first pass", || {
+        library.snapshot().lookup_unmatched.len() == 1
+    });
     assert_eq!(
         app.label("lookup-status").as_deref(),
-        Some("Looking up albums… 3 of 12")
+        Some("1 album could not be identified")
     );
-    library.set_lookup_progress(12, 12);
+    assert!(app.exists("album-unmatched-k"));
     assert!(
-        !app.exists("lookup-status"),
-        "nothing to say once the pass is over"
+        http.requests()[0].starts_with("https://musicbrainz.org/ws/2/release/?"),
+        "{:?}",
+        http.requests()
+    );
+
+    let asked = http.requests().len();
+    app.click("lookup-retry");
+    wait_until("the retry pass", || http.requests().len() > asked);
+    wait_until("the retry result", || {
+        library.snapshot().lookup_unmatched.len() == 1
+    });
+    assert!(
+        app.exists("album-unmatched-k"),
+        "still unidentified after the retry"
+    );
+
+    app.click("pref-online-lookup");
+    wait_until("the switch to settle", || {
+        !library.snapshot().folders.is_empty()
+    });
+}
+
+#[gpui_kit::test]
+async fn lookup_progress_is_shown_while_working(cx: &mut TestAppContext) {
+    let config_dir = isolated_config_dir();
+    let http = Arc::new(FakeHttp::new().with_delay(Duration::from_millis(200)).on(
+        "https://musicbrainz.org/ws/2/release/?",
+        200,
+        br#"{"releases":[]}"#.to_vec(),
+    ));
+    let library = Arc::new(Library::with_lookup(&config_dir, http).unwrap());
+    for (i, title) in ["Arquivo", "Capítulo II", "IV"].into_iter().enumerate() {
+        library.insert_album(&album(&format!("k{i}"), title, false));
+    }
+    let mut app = open_with(cx, library.clone());
+    app.click("settings");
+    app.click("pref-online-lookup");
+    wait_until("the pass to start", || {
+        let snap = library.snapshot();
+        snap.lookup_total == 3 && snap.lookup_pending < 3 && snap.lookup_pending > 0
+    });
+    let label = app.label("lookup-status").unwrap_or_default();
+    assert!(
+        label.starts_with("Looking up albums… ") && label.ends_with(" of 3"),
+        "{label:?}"
+    );
+    wait_until("the pass to finish", || {
+        library.snapshot().lookup_total == 0
+    });
+    assert_eq!(
+        app.label("lookup-status").as_deref(),
+        Some("3 albums could not be identified")
     );
 }
 

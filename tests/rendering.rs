@@ -241,28 +241,31 @@ mod pixels {
     }
 
     fn unmatched_badge_paints_ink() {
-        let library = Arc::new(Library::empty());
-        library.insert_unmatched_album(&AlbumSummary {
+        let summary = |unmatched: bool| AlbumSummary {
             id: "k".to_string(),
             title: "Estranhos no Ninho".to_string(),
             artist: "Exxótica".to_string(),
             year: 2002,
             track_count: 1,
-            unmatched: true,
-        });
+            unmatched,
+        };
+        let library = Arc::new(Library::empty());
+        library.insert_album(&summary(true));
         let mut scene = Scene::open_with(library);
         scene.act(|window, cx| window.click("nav-albums", cx));
         let capture = scene.capture();
         let bounds = scene.bounds("album-unmatched-k");
-        assert!(
-            capture.ink_in(bounds) > 0,
-            "the badge has bounds {bounds:?} but nothing painted inside them"
-        );
-        let mut plain = Scene::open();
+
+        let library = Arc::new(Library::empty());
+        library.insert_album(&summary(false));
+        let mut plain = Scene::open_with(library);
         plain.act(|window, cx| window.click("nav-albums", cx));
+        let plain = plain.capture();
         assert!(
-            plain.capture().raw != capture.raw,
-            "an unmatched album paints differently"
+            capture.ink_in(bounds) > plain.ink_in(bounds),
+            "the badge must add ink at {bounds:?}: {} vs {} without it",
+            capture.ink_in(bounds),
+            plain.ink_in(bounds)
         );
     }
 

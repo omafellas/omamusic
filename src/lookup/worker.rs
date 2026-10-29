@@ -10,6 +10,7 @@ use crate::lookup::covers::fetch_cover;
 use crate::lookup::http::{Http, Response, Throttle};
 use crate::lookup::musicbrainz::{self, Release};
 use crate::lookup::score::{self, LocalAlbum, LocalTrack, Match};
+use crate::lookup::text::normalize;
 use crate::lookup::write::{self, TrackFill, WriteOutcome};
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
@@ -35,6 +36,19 @@ impl std::fmt::Display for RateLimited {
 }
 
 impl std::error::Error for RateLimited {}
+
+/// The network is unreachable: the pass stops and resumes on the next wake
+/// instead of marking every album as failed.
+#[derive(Debug)]
+pub struct Offline;
+
+impl std::fmt::Display for Offline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("network unreachable")
+    }
+}
+
+impl std::error::Error for Offline {}
 
 pub enum Wake {
     ScanFinished,
@@ -101,13 +115,29 @@ fn run_pass(
     throttle: &Throttle,
     rx: &Receiver<Wake>,
 ) -> bool {
+    loop {
+        let (enabled, rerun) = run_once(deps, conn, throttle, rx);
+        if !enabled || !rerun {
+            return enabled;
+        }
+    }
+}
+
+/// One pass over everything that needs work. Returns the enabled flag and
+/// whether a wake received mid-pass asks for another pass.
+fn run_once(
+    deps: &WorkerDeps,
+    conn: &rusqlite::Connection,
+    throttle: &Throttle,
+    rx: &Receiver<Wake>,
+) -> (bool, bool) {
     let mut enabled = true;
-    let now = unix_now();
-    let albums = match db::albums_needing_lookup(conn, now, RETRY_AFTER_SECS) {
+    let mut rerun = false;
+    let albums = match db::albums_needing_lookup(conn, unix_now(), RETRY_AFTER_SECS) {
         Ok(albums) => albums,
         Err(err) => {
             eprintln!("online lookup: list albums: {err:#}");
-            return enabled;
+            return (enabled, false);
         }
     };
     let total = albums.len();
@@ -115,42 +145,41 @@ fn run_pass(
         s.lookup_total = total;
         s.lookup_pending = total;
     });
-    let mut backoff = BACKOFFS.iter();
     for (done, album) in albums.into_iter().enumerate() {
         loop {
-            match rx.try_recv() {
-                Ok(Wake::SettingChanged(on)) => enabled = on,
-                Ok(_) | Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => return false,
+            let drained = drain(rx);
+            if drained.disconnected {
+                return (false, false);
             }
-            if !enabled {
+            if let Some(on) = drained.enabled {
+                enabled = on;
+            }
+            rerun |= drained.rerun;
+            if !enabled || !deps.state.read().scanning {
                 break;
             }
-            if deps.state.read().scanning {
-                std::thread::sleep(SCAN_POLL);
-                continue;
-            }
-            break;
+            std::thread::sleep(SCAN_POLL);
         }
         if !enabled {
             break;
         }
-        let row = match process_album(&*deps.http, throttle, &deps.cache_dir, &album, unix_now()) {
-            Ok(row) => row,
-            Err(err) if err.downcast_ref::<RateLimited>().is_some() => match backoff.next() {
-                Some(wait) => {
-                    std::thread::sleep(*wait);
-                    continue;
-                }
-                None => break,
-            },
+        let attempt = || process_album(&*deps.http, throttle, &deps.cache_dir, &album, unix_now());
+        let row = match with_backoff(attempt, std::thread::sleep) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                eprintln!("online lookup: MusicBrainz keeps rate limiting, stopping for now");
+                break;
+            }
             Err(err) => {
-                eprintln!("online lookup: {}: {err:#}", album.title);
-                error_row(&album.album_key, unix_now())
+                eprintln!("online lookup: {err:#}, stopping for now");
+                break;
             }
         };
         if let Err(err) = db::record_lookup(conn, &row) {
             eprintln!("online lookup: record: {err:#}");
+        }
+        if let Err(err) = store_cover(conn, &deps.cache_dir, &album.album_key) {
+            eprintln!("online lookup: store cover: {err:#}");
         }
         deps.covers.remove(&album.album_key);
         library::update(&deps.state, |s| s.lookup_pending = total - done - 1);
@@ -160,7 +189,64 @@ fn run_pass(
         s.lookup_total = 0;
         s.lookup_pending = 0;
     });
-    enabled
+    (enabled, rerun)
+}
+
+struct Drained {
+    enabled: Option<bool>,
+    rerun: bool,
+    disconnected: bool,
+}
+
+/// Take every pending wake without blocking. The last setting change wins;
+/// any scan or retry asks for another pass.
+fn drain(rx: &Receiver<Wake>) -> Drained {
+    let mut drained = Drained {
+        enabled: None,
+        rerun: false,
+        disconnected: false,
+    };
+    loop {
+        match rx.try_recv() {
+            Ok(Wake::SettingChanged(on)) => drained.enabled = Some(on),
+            Ok(Wake::ScanFinished | Wake::Retry) => drained.rerun = true,
+            Err(TryRecvError::Empty) => return drained,
+            Err(TryRecvError::Disconnected) => {
+                drained.disconnected = true;
+                return drained;
+            }
+        }
+    }
+}
+
+/// Run `attempt`, sleeping through [`BACKOFFS`] on rate limits. `None` means
+/// the limit held through every backoff; other errors pass through.
+fn with_backoff(
+    mut attempt: impl FnMut() -> Result<LookupRow>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<Option<LookupRow>> {
+    let mut backoffs = BACKOFFS.iter();
+    loop {
+        match attempt() {
+            Ok(row) => return Ok(Some(row)),
+            Err(err) if err.downcast_ref::<RateLimited>().is_some() => match backoffs.next() {
+                Some(wait) => sleep(*wait),
+                None => return Ok(None),
+            },
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Copy a cached cover into the index so it shows without waiting for a
+/// rescan, which never comes when the files could not be written.
+fn store_cover(conn: &rusqlite::Connection, cache_dir: &Path, album_key: &str) -> Result<bool> {
+    let bytes = match std::fs::read(write::cache_path(cache_dir, album_key)) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        _ => return Ok(false),
+    };
+    db::set_artwork(conn, album_key, &bytes)?;
+    Ok(true)
 }
 
 fn publish_unmatched(deps: &WorkerDeps, conn: &rusqlite::Connection) {
@@ -200,7 +286,12 @@ pub fn process_album(
 ) -> Result<LookupRow> {
     match identify_and_write(http, throttle, cache_dir, album, now) {
         Ok(row) => Ok(row),
-        Err(err) if err.downcast_ref::<RateLimited>().is_some() => Err(err),
+        Err(err)
+            if err.downcast_ref::<RateLimited>().is_some()
+                || err.downcast_ref::<Offline>().is_some() =>
+        {
+            Err(err)
+        }
         Err(err) => {
             eprintln!("online lookup: {}: {err:#}", album.title);
             Ok(error_row(&album.album_key, now))
@@ -274,12 +365,14 @@ fn identify_and_write(
 }
 
 fn local_album(album: &LookupCandidate) -> LocalAlbum {
+    let title_from_folder = album.tags_missing & MISSING_ALBUM != 0;
     let artist_known = album.tags_missing & MISSING_ARTIST == 0
         && album.artist != UNKNOWN_ARTIST
-        && !album.artist.is_empty();
+        && !album.artist.is_empty()
+        && !(title_from_folder && normalize(&album.artist) == "various artists");
     LocalAlbum {
         title: album.title.clone(),
-        title_from_folder: album.tags_missing & MISSING_ALBUM != 0,
+        title_from_folder,
         artist: artist_known.then(|| album.artist.clone()),
         year: album.year,
         has_ids: !album.mb_release_group.is_empty(),
@@ -329,7 +422,10 @@ fn best_candidate(
 
 fn musicbrainz_get(http: &dyn Http, throttle: &Throttle, url: &str) -> Result<Vec<u8>> {
     throttle.wait();
-    let Response { status, body } = http.get(url)?;
+    let Response { status, body } = http.get(url).map_err(|err| {
+        eprintln!("online lookup: {url}: {err:#}");
+        anyhow::Error::from(Offline)
+    })?;
     match status {
         200 => Ok(body),
         503 => Err(RateLimited.into()),
@@ -361,7 +457,7 @@ fn write_tracks(
             artist: local.artist.is_none().then_some(other.artist.as_str()),
             album: local.title_from_folder.then_some(release.title.as_str()),
             year: (album.tags_missing & MISSING_YEAR != 0).then_some(release.year),
-            track_number: (local_track.number == 0).then_some(other.number),
+            track_number: (local_track.number == 0 && release.media == 1).then_some(other.number),
             release_group: Some(release.release_group.as_str()),
             release: Some(release.id.as_str()),
             recording: Some(other.recording.as_str()),
@@ -413,6 +509,19 @@ mod tests {
 
         fn complete(folder: &str, artist: &str) -> Self {
             Self::build(folder, Some(artist), true)
+        }
+
+        /// Loose files by three different artists with no album tag.
+        fn loose(folder: &str) -> Self {
+            let mut fx = Self::build(folder, None, false);
+            for (i, artist) in ["A", "B", "C"].into_iter().enumerate() {
+                let path = fx.music.join(format!("track{}.wav", i + 1));
+                let mut tag = Tag::new(TagType::Id3v2);
+                tag.set_artist(artist.into());
+                tag.save_to_path(&path, WriteOptions::default()).unwrap();
+            }
+            index::reconcile(&mut fx.conn, std::slice::from_ref(&fx.music), &fx.cache).unwrap();
+            fx
         }
 
         /// Three tracks of 1, 2 and 3 seconds in a folder named after the
@@ -646,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_error_is_recorded_as_error() {
+    fn transport_error_aborts_without_a_row() {
         struct Broken;
         impl Http for Broken {
             fn get(&self, _url: &str) -> anyhow::Result<Response> {
@@ -655,9 +764,127 @@ mod tests {
         }
         let fx = Fixture::new("Estranhos no Ninho", Some("Exxótica"));
         let candidate = fx.candidate();
-        let row = process_album(&Broken, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        let err = process_album(&Broken, &throttle(), &fx.cache, &candidate, NOW).unwrap_err();
+        assert!(err.downcast_ref::<Offline>().is_some());
+    }
+
+    #[test]
+    fn bad_server_answer_is_recorded_as_error() {
+        let fx = Fixture::new("Estranhos no Ninho", Some("Exxótica"));
+        let candidate = fx.candidate();
+        let http = FakeHttp::new().on(
+            "https://musicbrainz.org/ws/2/release/?",
+            200,
+            b"<html>".to_vec(),
+        );
+        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Error);
         assert_eq!(row.attempted_at, NOW);
+    }
+
+    #[test]
+    fn loose_various_artists_folder_makes_no_request() {
+        let fx = Fixture::loose("Downloads");
+        let candidate = fx.candidate();
+        assert_eq!(candidate.artist, "Various Artists");
+        let http = matching_http();
+        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        assert_eq!(row.status, LookupStatus::Unmatched);
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn store_cover_fills_the_artwork_row_from_the_cache() {
+        let fx = Fixture::new("Estranhos no Ninho", Some("Exxótica"));
+        let candidate = fx.candidate();
+        assert!(!store_cover(&fx.conn, &fx.cache, &candidate.album_key).unwrap());
+        write::save_cache_cover(&fx.cache, &candidate.album_key, &png(400)).unwrap();
+        assert!(store_cover(&fx.conn, &fx.cache, &candidate.album_key).unwrap());
+        assert_eq!(
+            db::artwork(&fx.conn, &candidate.album_key).unwrap(),
+            Some(png(400))
+        );
+    }
+
+    #[test]
+    fn drain_collects_setting_changes_and_reruns() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Wake::ScanFinished).unwrap();
+        tx.send(Wake::SettingChanged(false)).unwrap();
+        tx.send(Wake::Retry).unwrap();
+        let drained = drain(&rx);
+        assert_eq!(drained.enabled, Some(false));
+        assert!(drained.rerun);
+        assert!(!drained.disconnected);
+        assert!(!drain(&rx).rerun);
+        drop(tx);
+        assert!(drain(&rx).disconnected);
+    }
+
+    #[test]
+    fn backoff_retries_the_same_album_then_gives_up() {
+        let mut calls = 0;
+        let mut sleeps = Vec::new();
+        let row = with_backoff(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(RateLimited.into())
+                } else {
+                    Ok(error_row("k", NOW))
+                }
+            },
+            |d| sleeps.push(d),
+        );
+        assert!(row.unwrap().is_some());
+        assert_eq!(calls, 3);
+        assert_eq!(sleeps, BACKOFFS);
+
+        let mut sleeps = Vec::new();
+        let row = with_backoff(|| Err(RateLimited.into()), |d| sleeps.push(d));
+        assert!(row.unwrap().is_none(), "three rate limits abandon the pass");
+        assert_eq!(sleeps, BACKOFFS);
+
+        let row = with_backoff(|| Err(Offline.into()), |_| {});
+        assert!(row.unwrap_err().downcast_ref::<Offline>().is_some());
+    }
+
+    #[test]
+    fn multi_disc_release_leaves_track_numbers_alone() {
+        let fx = Fixture::new("Estranhos no Ninho", Some("Exxótica"));
+        let candidate = fx.candidate();
+        let release = r#"{
+            "id":"r1","title":"Estranhos no Ninho","date":"2002-06-01",
+            "artist-credit":[{"name":"Exxótica","joinphrase":""}],
+            "release-group":{"id":"g1"},
+            "media":[
+                {"tracks":[
+                    {"position":1,"title":"No Palco","length":1000,"recording":{"id":"rec-1"}},
+                    {"position":2,"title":"Fruto Proibido","length":2000,"recording":{"id":"rec-2"}}
+                ]},
+                {"tracks":[
+                    {"position":1,"title":"Gato Preto","length":3000,"recording":{"id":"rec-3"}}
+                ]}
+            ]}"#;
+        let http = FakeHttp::new()
+            .on(
+                "https://musicbrainz.org/ws/2/release/?",
+                200,
+                SEARCH.as_bytes().to_vec(),
+            )
+            .on(
+                "https://musicbrainz.org/ws/2/release/r1",
+                200,
+                release.as_bytes().to_vec(),
+            );
+        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        assert_eq!(row.status, LookupStatus::Matched);
+        let tracks = fx.tracks();
+        assert_eq!(tracks[2].title, "Gato Preto");
+        assert_eq!(
+            tracks[2].track_number, 0,
+            "position 3 would be wrong for disc 2 track 1"
+        );
     }
 
     #[test]

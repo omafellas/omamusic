@@ -36,7 +36,7 @@ SELECT album_key,
        COUNT(*),
        GROUP_CONCAT(title, ' '),
        COALESCE(GROUP_CONCAT(DISTINCT NULLIF(genre, '')), ''),
-       MAX(tags_missing),
+       MAX(tags_missing & 1) | MAX(tags_missing & 2) | MAX(tags_missing & 4) | MAX(tags_missing & 8),
        MAX(mb_release_group)
 FROM tracks
 GROUP BY album_key;
@@ -385,6 +385,38 @@ mod tests {
             .query_row("SELECT tags_missing FROM albums", [], |row| row.get(0))
             .unwrap();
         assert_eq!(album_bits, bits);
+    }
+
+    #[test]
+    fn album_missing_bits_are_the_union_of_its_tracks() {
+        use lofty::config::WriteOptions;
+        use lofty::prelude::*;
+        use lofty::tag::{Tag, TagType};
+
+        let temp = TempDir::new();
+        let no_year = temp.dir().join("one.wav");
+        write(&no_year, &crate::metadata::fixtures::wav_bytes(1));
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("One".into());
+        tag.set_artist("Band".into());
+        tag.set_album("Record".into());
+        tag.save_to_path(&no_year, WriteOptions::default()).unwrap();
+
+        let no_title = temp.dir().join("two.wav");
+        write(&no_title, &crate::metadata::fixtures::wav_bytes(1));
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_artist("Band".into());
+        tag.set_album("Record".into());
+        tag.set_year(2002);
+        tag.save_to_path(&no_title, WriteOptions::default())
+            .unwrap();
+
+        let mut conn = memory();
+        reconcile(&mut conn, &[temp.dir().to_path_buf()], &cache()).unwrap();
+        let bits: i64 = conn
+            .query_row("SELECT tags_missing FROM albums", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(bits as u32, MISSING_TITLE | MISSING_YEAR);
     }
 
     #[test]

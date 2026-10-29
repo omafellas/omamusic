@@ -15,6 +15,8 @@ pub struct Release {
     pub title: String,
     pub artist: String,
     pub year: u32,
+    /// Number of discs or other media; track positions restart per medium.
+    pub media: usize,
     pub tracks: Vec<ReleaseTrack>,
 }
 
@@ -99,6 +101,7 @@ pub fn parse_release(body: &[u8]) -> Result<Release> {
         .or_else(|| year_of(json["release-group"]["first-release-date"].as_str()))
         .unwrap_or(0);
     let mut tracks = Vec::new();
+    let media = json["media"].as_array().map_or(0, Vec::len);
     for medium in json["media"].as_array().into_iter().flatten() {
         for track in medium["tracks"].as_array().into_iter().flatten() {
             let track_artist = artist_credit(&track["artist-credit"]);
@@ -121,6 +124,7 @@ pub fn parse_release(body: &[u8]) -> Result<Release> {
         title: text(&json["title"]),
         artist,
         year,
+        media,
         tracks,
     })
 }
@@ -243,6 +247,7 @@ mod tests {
         assert_eq!(release.artist, "Exxótica & Friends");
         assert_eq!(release.year, 2002);
         assert_eq!(release.tracks.len(), 3);
+        assert_eq!(release.media, 2);
         assert_eq!(release.tracks[0].number, 1);
         assert_eq!(release.tracks[0].title, "No Palco");
         assert_eq!(release.tracks[0].artist, "Exxótica");

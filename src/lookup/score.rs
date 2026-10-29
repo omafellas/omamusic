@@ -176,6 +176,7 @@ mod tests {
             title: title.into(),
             artist: artist.into(),
             year,
+            media: 1,
             tracks: tracks
                 .iter()
                 .enumerate()

@@ -135,8 +135,11 @@ const ALBUM_ORDER: &str = "a.artist COLLATE NOCASE, a.year, a.title COLLATE NOCA
 /// Columns of `albums`, aliased as `a`, in the order [`album_summary_from_row`]
 /// reads. `unmatched` marks albums the online lookup gave up on.
 const ALBUM_COLS: &str = "a.key, a.title, a.artist, a.year, a.track_count, \
-     EXISTS(SELECT 1 FROM lookup l WHERE l.album_key = a.key AND l.status = 'unmatched') \
-     AS unmatched";
+     EXISTS(SELECT 1 FROM lookup l WHERE l.album_key = a.key \
+     AND l.status IN ('unmatched', 'error')) AS unmatched";
+
+/// Failed attempts (network or bad answers) are retried after an hour.
+pub const ERROR_RETRY_SECS: i64 = 60 * 60;
 
 /// A SQLite file shared by the UI (reader) and the indexer (writer).
 pub struct Db {
@@ -553,10 +556,12 @@ pub fn record_lookup(conn: &Connection, row: &LookupRow) -> Result<()> {
     Ok(())
 }
 
+/// Albums the lookup gave up on or failed on, for the Settings list.
 pub fn unmatched_albums(conn: &Connection) -> Result<Vec<AlbumSummary>> {
     let sql = format!(
         "SELECT {ALBUM_COLS} FROM albums a \
-         JOIN lookup l ON l.album_key = a.key WHERE l.status = 'unmatched' ORDER BY {ALBUM_ORDER}"
+         JOIN lookup l ON l.album_key = a.key WHERE l.status IN ('unmatched', 'error') \
+         ORDER BY {ALBUM_ORDER}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], album_summary_from_row)?;
@@ -564,7 +569,20 @@ pub fn unmatched_albums(conn: &Connection) -> Result<Vec<AlbumSummary>> {
 }
 
 pub fn clear_unmatched(conn: &Connection) -> Result<usize> {
-    Ok(conn.execute("DELETE FROM lookup WHERE status = 'unmatched'", [])?)
+    Ok(conn.execute(
+        "DELETE FROM lookup WHERE status IN ('unmatched', 'error')",
+        [],
+    )?)
+}
+
+/// Store a cover fetched online so the UI can show it before the next scan.
+pub fn set_artwork(conn: &Connection, key: &str, data: &[u8]) -> Result<()> {
+    conn.execute(
+        "INSERT INTO artwork(album_key, data) VALUES (?1, ?2) \
+         ON CONFLICT(album_key) DO UPDATE SET data = excluded.data",
+        params![key, data],
+    )?;
+    Ok(())
 }
 
 /// Albums with no cover or with missing tags that have not been tried within
@@ -582,12 +600,13 @@ pub fn albums_needing_lookup(
          LEFT JOIN artwork ar ON ar.album_key = a.key \
          LEFT JOIN lookup l ON l.album_key = a.key \
          WHERE (ar.data IS NULL OR a.tags_missing != 0) \
-         AND (l.album_key IS NULL OR l.attempted_at <= ?1) \
+         AND (l.album_key IS NULL OR l.attempted_at <= ?1 \
+              OR (l.status = 'error' AND l.attempted_at <= ?2)) \
          ORDER BY l.attempted_at IS NOT NULL, l.attempted_at, {ALBUM_ORDER}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let albums: Vec<LookupCandidate> = stmt
-        .query_map(params![now - retry_after], |row| {
+        .query_map(params![now - retry_after, now - ERROR_RETRY_SECS], |row| {
             Ok(LookupCandidate {
                 album_key: row.get(0)?,
                 title: row.get(1)?,
@@ -688,6 +707,55 @@ mod tests {
         record_lookup(&conn, &lookup(&key, LookupStatus::Unmatched, 300)).unwrap();
         assert_eq!(clear_unmatched(&conn).unwrap(), 1);
         assert!(unmatched_albums(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn error_rows_count_as_unmatched_and_retry_sooner() {
+        let conn = memory();
+        insert_track(&conn, "/m/a/1.mp3", "One", "Band", "Record", 1);
+        rebuild_albums(&conn);
+        let key = albums_page(&conn, 0, 1).unwrap()[0].id.clone();
+        let now = 10_000_000;
+        let month = 2_592_000;
+
+        record_lookup(&conn, &lookup(&key, LookupStatus::Error, now - 10)).unwrap();
+        assert!(albums_needing_lookup(&conn, now, month).unwrap().is_empty());
+        assert_eq!(
+            unmatched_albums(&conn).unwrap().len(),
+            1,
+            "errors are shown too"
+        );
+        assert!(albums_page(&conn, 0, 1).unwrap()[0].unmatched);
+
+        record_lookup(
+            &conn,
+            &lookup(&key, LookupStatus::Error, now - ERROR_RETRY_SECS - 1),
+        )
+        .unwrap();
+        assert_eq!(
+            albums_needing_lookup(&conn, now, month).unwrap().len(),
+            1,
+            "errors are retried after an hour, not a month"
+        );
+        assert_eq!(
+            clear_unmatched(&conn).unwrap(),
+            1,
+            "retry all covers errors"
+        );
+        assert!(unmatched_albums(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_artwork_stores_a_cover() {
+        let conn = memory();
+        insert_track(&conn, "/m/a/1.mp3", "One", "Band", "Record", 1);
+        rebuild_albums(&conn);
+        let key = albums_page(&conn, 0, 1).unwrap()[0].id.clone();
+        assert_eq!(artwork(&conn, &key).unwrap(), None);
+        set_artwork(&conn, &key, b"img").unwrap();
+        assert_eq!(artwork(&conn, &key).unwrap(), Some(b"img".to_vec()));
+        set_artwork(&conn, &key, b"new").unwrap();
+        assert_eq!(artwork(&conn, &key).unwrap(), Some(b"new".to_vec()));
     }
 
     #[test]

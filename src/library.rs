@@ -165,9 +165,10 @@ impl Library {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    /// Put one album into the in-memory index and mark it as one the online
-    /// lookup gave up on, the way the worker would. For view tests.
-    pub fn insert_unmatched_album(&self, summary: &AlbumSummary) {
+    /// Put one album into the index the way a scan would, and when
+    /// `summary.unmatched` is set, record that the online lookup gave up on
+    /// it. For view tests.
+    pub fn insert_album(&self, summary: &AlbumSummary) {
         let path = format!("/music/{}/01.mp3", summary.title);
         let dir = format!("/music/{}", summary.title);
         self.db
@@ -186,36 +187,68 @@ impl Library {
                     ],
                 )?;
                 conn.execute_batch(index::REBUILD_ALBUMS)?;
-                db::record_lookup(
-                    conn,
-                    &db::LookupRow {
-                        album_key: summary.id.clone(),
-                        status: db::LookupStatus::Unmatched,
-                        release: None,
-                        release_group: None,
-                        score: Some(0.5),
-                        candidate: None,
-                        attempted_at: 1,
-                    },
-                )
+                if summary.unmatched {
+                    db::record_lookup(
+                        conn,
+                        &db::LookupRow {
+                            album_key: summary.id.clone(),
+                            status: db::LookupStatus::Unmatched,
+                            release: None,
+                            release_group: None,
+                            score: Some(0.5),
+                            candidate: None,
+                            attempted_at: 1,
+                        },
+                    )?;
+                }
+                Ok(())
             })
-            .expect("insert unmatched album");
+            .expect("insert album");
         Self::reload(&self.state, &self.db);
         update(&self.state, |s| {
             if s.folders.is_empty() {
                 s.folders.push(PathBuf::from("/music"));
             }
-            s.lookup_unmatched.push(summary.clone());
+            if summary.unmatched {
+                s.lookup_unmatched.push(summary.clone());
+            }
         });
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    /// Pretend the worker is `done` albums into a pass of `total`.
-    pub fn set_lookup_progress(&self, done: usize, total: usize) {
-        update(&self.state, |s| {
-            s.lookup_total = total;
-            s.lookup_pending = total.saturating_sub(done);
-        });
+    /// A library with a real lookup worker talking to `http`, a database and
+    /// cache under `dir`, and no folder scanner. For tests of the wiring
+    /// between the switch, the worker and the views.
+    pub fn with_lookup(dir: &Path, http: Arc<dyn crate::lookup::http::Http>) -> Result<Self> {
+        let db = Arc::new(Db::open(dir.join("library.db"))?);
+        let covers = ArtworkCache::default();
+        {
+            let db = db.clone();
+            covers.set_provider(Arc::new(move |key: &str| {
+                db.read(|conn| db::artwork(conn, key)).ok().flatten()
+            }));
+        }
+        let state: SharedSnapshot =
+            Arc::new(RwLock::new(Arc::new(Self::load_snapshot(&db, Vec::new())?)));
+        let lookup_tx = Worker::spawn(
+            WorkerDeps {
+                http,
+                db_path: db.path.clone(),
+                cache_dir: dir.join("cache"),
+                covers: covers.clone(),
+                state: state.clone(),
+            },
+            AppConfig::load().online_lookup,
+        );
+        let (rescan_tx, _rx) = mpsc::channel::<()>();
+        Ok(Self {
+            state,
+            db,
+            covers,
+            watcher: Mutex::new(None),
+            rescan_tx,
+            lookup_tx: Some(lookup_tx),
+        })
     }
 
     fn cache_dir() -> Result<PathBuf> {

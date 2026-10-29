@@ -91,6 +91,7 @@ impl Http for UreqHttp {
 pub struct FakeHttp {
     routes: Vec<(String, u16, Vec<u8>)>,
     requests: Mutex<Vec<String>>,
+    delay: Duration,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -104,6 +105,12 @@ impl FakeHttp {
         self
     }
 
+    /// Make every answer take this long, so a pass can be observed mid-way.
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
     pub fn requests(&self) -> Vec<String> {
         self.requests.lock().clone()
     }
@@ -113,6 +120,9 @@ impl FakeHttp {
 impl Http for FakeHttp {
     fn get(&self, url: &str) -> Result<Response> {
         self.requests.lock().push(url.to_string());
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
         let hit = self
             .routes
             .iter()
