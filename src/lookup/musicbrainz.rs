@@ -65,6 +65,14 @@ pub fn search_url(album: &str, artist: Option<&str>, track_count: usize) -> Stri
     )
 }
 
+/// Releases of a known release group, for libraries whose tags carry ids.
+pub fn release_group_search_url(release_group: &str) -> String {
+    format!(
+        "{BASE}/?fmt=json&limit={SEARCH_LIMIT}&query={}",
+        utf8_percent_encode(&format!("rgid:{release_group}"), NON_ALPHANUMERIC)
+    )
+}
+
 pub fn release_url(id: &str) -> String {
     format!("{BASE}/{id}?fmt=json&inc=recordings+artist-credits+release-groups")
 }
@@ -176,6 +184,14 @@ mod tests {
         assert_eq!(
             lucene_escape(r#"a+b-c&&d||e!f(g)h{i}j[k]l^m"n~o*p?q:r\s/t"#),
             r#"a\+b\-c\&&d\||e\!f\(g\)h\{i\}j\[k\]l\^m\"n\~o\*p\?q\:r\\s\/t"#
+        );
+    }
+
+    #[test]
+    fn release_group_search_url_uses_rgid() {
+        assert_eq!(
+            release_group_search_url("g-1"),
+            "https://musicbrainz.org/ws/2/release/?fmt=json&limit=5&query=rgid%3Ag%2D1"
         );
     }
 

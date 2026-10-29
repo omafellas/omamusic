@@ -7,7 +7,7 @@ const AUDIO_EXTENSIONS: [&str; 9] = [
     "mp3", "flac", "ogg", "m4a", "mp4", "aac", "wav", "aiff", "caf",
 ];
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct AudioMetadata {
     pub title: String,
     pub artist: String,
