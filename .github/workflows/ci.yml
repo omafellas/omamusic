@@ -69,6 +69,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install flatpak tooling
         run: |
           sudo apt-get update
