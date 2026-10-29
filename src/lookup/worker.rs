@@ -387,8 +387,22 @@ fn best_candidate(
     let ids = musicbrainz::parse_search(&musicbrainz_get(http, throttle, &search)?)?;
     let mut best: Option<(Release, Match)> = None;
     for id in ids {
-        let body = musicbrainz_get(http, throttle, &musicbrainz::release_url(&id))?;
-        let release = musicbrainz::parse_release(&body)?;
+        let body = match musicbrainz_get(http, throttle, &musicbrainz::release_url(&id)) {
+            Ok(body) => body,
+            Err(err)
+                if err.downcast_ref::<RateLimited>().is_some()
+                    || err.downcast_ref::<Offline>().is_some() =>
+            {
+                return Err(err)
+            }
+            Err(err) => {
+                eprintln!("online lookup: skipping candidate {id}: {err:#}");
+                continue;
+            }
+        };
+        let Ok(release) = musicbrainz::parse_release(&body) else {
+            continue;
+        };
         let m = score::distance(local, &release);
         if best.as_ref().is_none_or(|(_, b)| m.distance < b.distance) {
             best = Some((release, m));
@@ -753,6 +767,28 @@ mod tests {
         let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
         assert_eq!(row.status, LookupStatus::Error);
         assert_eq!(row.attempted_at, NOW);
+    }
+
+    #[test]
+    fn a_failing_candidate_fetch_skips_that_candidate() {
+        let fx = Fixture::new("Estranhos no Ninho", Some("Exxótica"));
+        let candidate = fx.candidate();
+        let http = FakeHttp::new()
+            .on(
+                "https://musicbrainz.org/ws/2/release/?",
+                200,
+                br#"{"releases":[{"id":"r0"},{"id":"r1"}]}"#.to_vec(),
+            )
+            .on("https://musicbrainz.org/ws/2/release/r0", 500, b"".to_vec())
+            .on(
+                "https://musicbrainz.org/ws/2/release/r1",
+                200,
+                RELEASE.as_bytes().to_vec(),
+            )
+            .on("https://coverartarchive.org/release/r1", 200, png(400));
+        let row = process_album(&http, &throttle(), &fx.cache, &candidate, NOW).unwrap();
+        assert_eq!(row.status, LookupStatus::Matched);
+        assert_eq!(row.release.as_deref(), Some("r1"));
     }
 
     #[test]

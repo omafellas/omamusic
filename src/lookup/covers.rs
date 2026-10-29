@@ -127,6 +127,9 @@ fn ok_body(http: &dyn Http, url: &str) -> Option<Vec<u8>> {
 }
 
 fn download(http: &dyn Http, url: &str) -> Option<Vec<u8>> {
+    if !url.starts_with("https://") {
+        return None;
+    }
     validate_image(&ok_body(http, url)?)
 }
 
@@ -273,6 +276,25 @@ mod tests {
             requests.len(),
             3,
             "Deezer is not asked once iTunes delivered"
+        );
+    }
+
+    #[test]
+    fn fetch_cover_only_downloads_over_https() {
+        let itunes = r#"{"results":[{"artistName":"A","collectionName":"B","artworkUrl100":"http://x/100x100bb.jpg"}]}"#;
+        let http = FakeHttp::new()
+            .on(
+                "https://itunes.apple.com/search",
+                200,
+                itunes.as_bytes().to_vec(),
+            )
+            .on("http://x/1200x1200bb.jpg", 200, png(600, 600));
+        let throttle = Throttle::new(Duration::ZERO);
+        assert!(fetch_cover(&http, &throttle, None, None, "A", "B").is_none());
+        assert!(
+            http.requests().iter().all(|u| u.starts_with("https://")),
+            "{:?}",
+            http.requests()
         );
     }
 

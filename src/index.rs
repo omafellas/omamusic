@@ -99,7 +99,7 @@ pub fn reconcile(
     let mut embedded: HashMap<String, Vec<u8>> = HashMap::new();
     let mut album_path: HashMap<String, PathBuf> = HashMap::new();
 
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for folder in folders {
         if !folder.is_dir() {
             continue;
