@@ -133,6 +133,15 @@ impl Smoke<'_> {
             window.hover(id, cx)
         });
         self.cx.run_until_parked();
+        self.cx.executor().advance_clock(Duration::from_millis(300));
+        self.cx.run_until_parked();
+    }
+
+    fn bounds(&mut self, id: &'static str) -> gpui_kit::Bounds<Pixels> {
+        self.cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.find(id).bounds()
+        })
     }
 
     fn search(&mut self, text: &str) {
@@ -933,5 +942,47 @@ async fn forward_returns_to_the_page_left_with_back(cx: &mut TestAppContext) {
         app.label("view-title").as_deref(),
         Some("Songs"),
         "switching sections drops the forward history"
+    );
+}
+
+#[gpui_kit::test]
+async fn up_next_opens_beside_the_page_from_the_toolbar_and_the_bar(cx: &mut TestAppContext) {
+    let mut app = open_with(cx, songs_library());
+    assert!(!app.has("nav-queue"), "Up Next is a panel, not a section");
+    assert!(!app.has("queue-panel"));
+
+    app.click("queue-toggle");
+    assert!(app.has("queue-panel"));
+    assert_eq!(
+        app.label("view-title").as_deref(),
+        Some("Songs"),
+        "the panel opens beside the page"
+    );
+    assert!(app.has("queue-empty"), "nothing is queued yet");
+
+    app.hover_on(("song", 0usize));
+    app.play_with(|window, cx| window.click(("song-play", 0usize), cx));
+    assert!(app.has(("queue-row", 2usize)), "the panel lists the queue");
+    assert!(!app.has("queue-empty"));
+
+    app.click("bar-queue");
+    assert!(!app.has("queue-panel"), "the bar button closes it");
+}
+
+#[gpui_kit::test]
+async fn transport_is_centered_above_the_progress_line(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    let play = app.bounds("play");
+    let progress = app.bounds("progress");
+    assert!(
+        play.bottom() <= progress.top(),
+        "the buttons sit above the line: {play:?} vs {progress:?}"
+    );
+    let width = app.cx.update(|window, _| window.viewport_size().width);
+    let offset = (play.center().x - width / 2.).abs();
+    let rem = app.rem();
+    assert!(
+        offset < rem * 0.5,
+        "play is centered in the bar: {play:?} in a window {width:?} wide"
     );
 }

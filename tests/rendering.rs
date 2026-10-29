@@ -490,6 +490,177 @@ mod pixels {
         );
     }
 
+    fn close(got: [u8; 4], want: [u8; 4]) -> bool {
+        got.iter()
+            .zip(want)
+            .take(3)
+            .all(|(&g, w)| (g as i32 - w as i32).abs() <= 6)
+    }
+
+    fn solid_png(rgb: [u8; 3]) -> Vec<u8> {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    fn silent_wav(path: &std::path::Path) {
+        let samples = 44_100u32;
+        let mut wav = Vec::with_capacity(44 + samples as usize * 2);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + samples * 2).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&samples.to_le_bytes());
+        wav.extend_from_slice(&(samples * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples * 2).to_le_bytes());
+        wav.resize(wav.len() + samples as usize * 2, 0);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    fn selected_sidebar_row_has_round_corners() {
+        let mut scene = Scene::open();
+        let capture = scene.capture();
+        let row = scene.bounds("nav-songs");
+        let middle = row.center().y;
+        let sidebar = capture.color_at(gpui_kit::point(row.left() - px(3.), middle));
+        let fill = capture.color_at(gpui_kit::point(row.left() + px(4.), middle));
+        assert!(
+            !close(fill, sidebar),
+            "the selected row must be filled: {fill:?} on {sidebar:?}"
+        );
+        let corner = capture.color_at(row.origin + gpui_kit::point(px(0.5), px(0.5)));
+        assert!(
+            close(corner, sidebar),
+            "the corner of {row:?} must be cut round: {corner:?} vs {sidebar:?}"
+        );
+    }
+
+    fn album_cover_has_round_corners() {
+        let library = Arc::new(Library::empty());
+        library.insert_album(&AlbumSummary {
+            id: "k".to_string(),
+            title: "Estranhos no Ninho".to_string(),
+            artist: "Exxótica".to_string(),
+            year: 2002,
+            track_count: 1,
+            unmatched: false,
+        });
+        library.insert_cover("k", &solid_png([220, 80, 40]));
+        let mut scene = Scene::open_with(library);
+        scene.act(|window, cx| window.click("nav-albums", cx));
+        let card = scene.bounds_of(("album", 0usize));
+        let inside = card.origin + gpui_kit::point(card.size.width / 2., card.size.width / 2.);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let capture = loop {
+            scene.elapse(50);
+            let capture = scene.capture();
+            if close(capture.color_at(inside), [220, 80, 40, 255]) {
+                break capture;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the cover must paint at {inside:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let corner = capture.color_at(card.origin + gpui_kit::point(px(0.5), px(0.5)));
+        assert!(
+            close(corner, capture.background()),
+            "the cover corner must be round and borderless: {corner:?}"
+        );
+    }
+
+    fn bar_play_button_is_a_filled_circle() {
+        let mut scene = Scene::open();
+        let capture = scene.capture();
+        let play = scene.bounds("play");
+        let middle = play.center().y;
+        let edge = capture.color_at(gpui_kit::point(play.left() + px(3.), middle));
+        let bar = capture.color_at(gpui_kit::point(play.left() - px(4.), middle));
+        assert!(
+            !close(edge, bar),
+            "the play button must be filled to its edge: {edge:?} on {bar:?}"
+        );
+        let corner = capture.color_at(play.origin + gpui_kit::point(px(1.), px(1.)));
+        assert!(
+            close(corner, bar),
+            "the play button must be round: {corner:?} vs {bar:?}"
+        );
+    }
+
+    fn the_playing_song_row_is_filled() {
+        let dir = isolated_config_dir();
+        let path = dir.join("Low Tide.wav");
+        silent_wav(&path);
+        let library = Arc::new(Library::empty());
+        for (i, title) in ["Low Tide", "High Water"].iter().enumerate() {
+            library.insert_song(
+                &omamusic::models::Track {
+                    path: if i == 0 {
+                        path.clone()
+                    } else {
+                        dir.join("High Water.wav")
+                    },
+                    title: title.to_string(),
+                    artist: "Neon Harbor".into(),
+                    album: "Afterglow".into(),
+                    track_number: i as u32 + 1,
+                    year: 2020,
+                    duration: 1.0,
+                    album_id: "afterglow".into(),
+                    genre: "Synth-pop".into(),
+                },
+                i as i64,
+            );
+        }
+        let mut scene = Scene::open_with(library);
+        let resting = scene.capture();
+        let row = scene.bounds_of(("song", 0usize));
+        let probe = gpui_kit::point(row.left() + px(4.), row.center().y);
+        scene.act(|window, cx| window.hover(("song", 0usize), cx));
+        scene.act(|window, cx| window.click(("song-play", 0usize), cx));
+        let player = scene.cx.update(|cx| scene.view.read(cx).player.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while player.current().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the song must start playing"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        player.pause();
+        scene.act(|window, cx| window.hover("nav-songs", cx));
+        let playing = scene.capture();
+        assert!(
+            !close(playing.color_at(probe), resting.color_at(probe)),
+            "the playing row must be filled across its width at {probe:?}"
+        );
+    }
+
+    fn up_next_panel_slides_in() {
+        let mut scene = Scene::open();
+        scene.allow_motion();
+        scene.act(|window, cx| window.click("queue-toggle", cx));
+        let first = scene.capture();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        scene.elapse(400);
+        let settled = scene.capture();
+        let panel = scene.bounds("queue-panel");
+        assert!(
+            settled.changed_in(&first, panel) > 0,
+            "the panel must move into place at {panel:?}"
+        );
+        let sidebar = scene.bounds("nav-songs");
+        assert_eq!(settled.changed_in(&first, sidebar), 0);
+    }
+
     pub fn run() {
         match renderer_available() {
             Ok(true) => {}
@@ -503,7 +674,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 8] = [
+        let tests: [(&str, fn()); 13] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -527,6 +698,23 @@ mod pixels {
                 "hovering_a_song_reveals_its_play_button",
                 hovering_a_song_reveals_its_play_button,
             ),
+            (
+                "selected_sidebar_row_has_round_corners",
+                selected_sidebar_row_has_round_corners,
+            ),
+            (
+                "album_cover_has_round_corners",
+                album_cover_has_round_corners,
+            ),
+            (
+                "bar_play_button_is_a_filled_circle",
+                bar_play_button_is_a_filled_circle,
+            ),
+            (
+                "the_playing_song_row_is_filled",
+                the_playing_song_row_is_filled,
+            ),
+            ("up_next_panel_slides_in", up_next_panel_slides_in),
         ];
         for (name, test) in tests {
             println!("running {name}");

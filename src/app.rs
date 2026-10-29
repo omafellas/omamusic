@@ -9,16 +9,17 @@ use crate::playlists::Playlists;
 use crate::search::{highlight_ranges, top_result, TopResult};
 use crate::{DecreaseFontSize, FocusSearch, GoBack, GoForward, IncreaseFontSize, ResetFontSize};
 use gpui_kit::base::input::{InputEvent, InputState};
+use gpui_kit::base::motion::{transition, Transition};
 use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::TestSupportExt;
 use gpui_kit::{
     div, ease_out_quint, img, px, rems, uniform_list, Animation, AnimationExt as _, AnyElement,
-    App, AppContext, ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler, FocusHandle,
-    Focusable, FontWeight, HighlightStyle, ImageSource, InteractiveElement, IntoElement,
-    MouseButton, NavigationDirection, ObjectFit, ParentElement, PathPromptOptions, Render,
-    SharedString, Stateful, StatefulInteractiveElement, StyleRefinement, Styled, StyledImage as _,
-    StyledText, Window,
+    App, AppContext, BoxShadow, ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, ImageSource, InteractiveElement,
+    IntoElement, MouseButton, NavigationDirection, ObjectFit, ParentElement, PathPromptOptions,
+    Pixels, Render, SharedString, Stateful, StatefulInteractiveElement, StyleRefinement, Styled,
+    StyledImage as _, StyledText, Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, keycap,
@@ -43,6 +44,10 @@ pub struct Omamusic {
     selection: BTreeSet<usize>,
     anchor: Option<usize>,
     show_settings: bool,
+    /// The Up Next panel beside the page.
+    show_queue: bool,
+    /// Bumped each time the Up Next panel opens so it slides in afresh.
+    queue_seq: u64,
     lib_version: u64,
     prefs: AppConfig,
     new_folder: Entity<InputState>,
@@ -199,7 +204,7 @@ const ALBUM_MORE_ACTIONS: &[RowAction] = &[
     RowAction::AddToPlaylistMenu,
 ];
 const SIDEBAR_REMS: f32 = 13.75;
-const SONG_COVER: f32 = 28.;
+const QUEUE_REMS: f32 = 17.5;
 const SONG_COLUMNS: [(SongColumn, &str); 5] = [
     (SongColumn::Title, "Title"),
     (SongColumn::Artist, "Artist"),
@@ -315,17 +320,60 @@ impl Selectable for MenuTrigger {
 
 const PAGE_ENTER: Duration = Duration::from_millis(220);
 const COVER_ENTER: Duration = Duration::from_millis(240);
+const PANEL_ENTER: Duration = Duration::from_millis(200);
+pub(crate) const ROW_FILL: Duration = Duration::from_millis(120);
+pub(crate) const LIFT: Duration = Duration::from_millis(120);
 
 /// The marker for the current track in a list.
-fn now_playing(playing: bool, cx: &App) -> AnyElement {
+fn now_playing(playing: bool, color: Hsla) -> AnyElement {
     icon(if playing {
         IconName::Volume2
     } else {
         IconName::Volume
     })
     .size(rems(0.875))
-    .text_color(cx.omarchy().accent)
+    .text_color(color)
     .into_any_element()
+}
+
+/// How far the pointer's arrival over `key` has eased in, from 0 at rest to
+/// 1 while hovered, plus the listener that feeds it. The element using it
+/// must pass the listener to `on_hover`.
+pub(crate) fn hover_progress(
+    key: impl Into<ElementId>,
+    policy: Transition,
+    window: &mut Window,
+    cx: &mut App,
+) -> (f32, impl Fn(&bool, &mut Window, &mut App) + 'static) {
+    let key = key.into();
+    let hovered = window.use_keyed_state((key.clone(), "hovered"), cx, |_, _| false);
+    let target = if *hovered.read(cx) { 1. } else { 0. };
+    let progress = transition((key, "hover"), target, policy, window, cx);
+    let listener = move |over: &bool, _: &mut Window, cx: &mut App| {
+        hovered.update(cx, |state, cx| {
+            if *state != *over {
+                *state = *over;
+                cx.notify();
+            }
+        })
+    };
+    (progress, listener)
+}
+
+/// A row fill that eases toward the hover color the way kit buttons do.
+pub(crate) fn row_fill(rest: Hsla, hover: Hsla, progress: f32) -> Hsla {
+    rest.blend(hover.opacity(hover.a * progress))
+}
+
+/// Corner radius for a cover of `size` pixels: tighter on small thumbnails.
+pub fn cover_radius(size: f32) -> Pixels {
+    px(if size >= 180. {
+        8.
+    } else if size >= 96. {
+        6.
+    } else {
+        4.
+    })
 }
 /// Re-renders a view while cover thumbnails it asked for are still being
 /// decoded. Polling a timer keeps the wake-up on the foreground executor,
@@ -358,10 +406,14 @@ pub fn cover(
     name: &str,
     cx: &App,
 ) -> AnyElement {
-    let cover = avatar(initials(name), cx).size(px(size));
+    let radius = cover_radius(size);
+    let cover = avatar(initials(name), cx)
+        .size(px(size))
+        .rounded(radius)
+        .border_0();
     match album_id.and_then(|id| library.covers().cached(id, size as u32 * 2)) {
         Some(thumb) if thumb.fresh => cover
-            .image(avatar_image(ImageSource::Render(thumb.image)))
+            .image(avatar_image(ImageSource::Render(thumb.image)).rounded(radius))
             .with_animation(
                 ElementId::Name(format!("cover-in-{}", album_id.unwrap_or_default()).into()),
                 Animation::new(COVER_ENTER).with_easing(ease_out_quint()),
@@ -369,10 +421,49 @@ pub fn cover(
             )
             .into_any_element(),
         Some(thumb) => cover
-            .image(avatar_image(ImageSource::Render(thumb.image)))
+            .image(avatar_image(ImageSource::Render(thumb.image)).rounded(radius))
             .into_any_element(),
         None => cover.into_any_element(),
     }
+}
+
+/// The art slot of a grid tile, raised and shadowed as `lift` eases to 1.
+fn lifted(size: f32, lift: f32) -> Div {
+    div()
+        .relative()
+        .mb(rems(0.375))
+        .top(px(-2. * lift))
+        .rounded(cover_radius(size))
+        .when(lift > 0., |d| {
+            d.shadow(vec![BoxShadow {
+                color: gpui_kit::black().opacity(0.35 * lift),
+                offset: gpui_kit::point(px(0.), px(6. * lift)),
+                blur_radius: px(16. * lift),
+                spread_radius: px(0.),
+                inset: false,
+            }])
+        })
+}
+
+/// A rounded Play or Shuffle action: filled with the accent when `primary`.
+fn pill(id: &'static str, glyph: IconName, label: &'static str, primary: bool, cx: &App) -> Button {
+    let t = cx.omarchy();
+    let (rest, hover, ink) = if primary {
+        (t.accent, t.accent.opacity(0.85), t.on_accent)
+    } else {
+        (t.hover_fill(), t.selected_fill(), t.foreground)
+    };
+    button(id, "", ButtonVariant::Secondary, cx)
+        .accessibility_label(label)
+        .child(icon(glyph).size(rems(0.75)))
+        .child(label)
+        .rounded_full()
+        .px(rems(1.))
+        .border_color(rest.opacity(0.))
+        .font_weight(FontWeight::MEDIUM)
+        .bg(rest)
+        .text_color(ink)
+        .hover(|s| s.bg(hover))
 }
 
 fn highlighted(text: &str, query: &str, color: gpui_kit::Hsla) -> StyledText {
@@ -606,11 +697,11 @@ impl Omamusic {
         let visualizer = cx.new(|cx| Visualizer::new(player.clone(), cx));
 
         let view = std::env::var("OMADRIVE_VIEW").ok();
+        let show_queue = view.as_deref() == Some("queue");
         let (section, pages, show_settings) = match view.as_deref() {
             Some("artists") => (Section::Artists, Vec::new(), false),
             Some("genres") => (Section::Genres, Vec::new(), false),
             Some("songs") => (Section::Songs, Vec::new(), false),
-            Some("queue") => (Section::Queue, Vec::new(), false),
             Some("settings") => (Section::Albums, Vec::new(), true),
             Some("album") => {
                 let first = library.first_album_key();
@@ -632,6 +723,8 @@ impl Omamusic {
             selection: BTreeSet::new(),
             anchor: None,
             show_settings,
+            show_queue,
+            queue_seq: 0,
             lib_version: 0,
             prefs: AppConfig::load(),
             new_folder,
@@ -792,6 +885,18 @@ impl Omamusic {
             });
         })
         .detach();
+    }
+
+    pub fn toggle_queue(&mut self, cx: &mut Context<Self>) {
+        self.show_queue = !self.show_queue;
+        if self.show_queue {
+            self.queue_seq += 1;
+        }
+        cx.notify();
+    }
+
+    pub fn queue_open(&self) -> bool {
+        self.show_queue
     }
 
     pub fn show_album(&mut self, album_id: String, cx: &mut Context<Self>) {
@@ -1420,8 +1525,8 @@ fn sidebar_btn(
         .items_center()
         .gap(rems(0.5))
         .px(rems(0.625))
-        .py(rems(0.4375))
-        .rounded_none()
+        .py(rems(0.25))
+        .rounded(rems(0.375))
         .cursor_pointer()
         .text_size(rems(0.75))
         .font_family(t.font.clone())
@@ -1480,16 +1585,23 @@ impl Render for Omamusic {
                             .child(self.render_toolbar(window, cx))
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .min_h_0()
                                     .flex()
-                                    .flex_col()
-                                    .bg(theme.background)
+                                    .flex_1()
+                                    .min_h_0()
                                     .child(
-                                        if snap.folders.is_empty() && self.section != Section::Queue
-                                        {
-                                            empty_state("No Music", "Add a folder with music.", cx)
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .min_h_0()
+                                            .flex()
+                                            .flex_col()
+                                            .bg(theme.background)
+                                            .child(if snap.folders.is_empty() {
+                                                empty_state(
+                                                    "No Music",
+                                                    "Add a folder with music.",
+                                                    cx,
+                                                )
                                                 .child(
                                                     button(
                                                         "empty-add-folder",
@@ -1502,23 +1614,23 @@ impl Render for Omamusic {
                                                     })),
                                                 )
                                                 .into_any_element()
-                                        } else if snap.album_count == 0
-                                            && snap.scanning
-                                            && self.section != Section::Queue
-                                        {
-                                            empty_state(
-                                                "Scanning…",
-                                                "Reading the music folders.",
-                                                cx,
-                                            )
-                                            .into_any_element()
-                                        } else {
-                                            {
-                                                let content = self.render_content(window, cx);
-                                                self.page_enter(content)
-                                            }
-                                        },
-                                    ),
+                                            } else if snap.album_count == 0 && snap.scanning {
+                                                empty_state(
+                                                    "Scanning…",
+                                                    "Reading the music folders.",
+                                                    cx,
+                                                )
+                                                .into_any_element()
+                                            } else {
+                                                {
+                                                    let content = self.render_content(window, cx);
+                                                    self.page_enter(content)
+                                                }
+                                            }),
+                                    )
+                                    .when(self.show_queue, |d| {
+                                        d.child(self.render_queue_panel(cx))
+                                    }),
                             ),
                     )
                     .when(self.show_settings, |d| {
@@ -1610,7 +1722,6 @@ impl Omamusic {
             ("nav-albums", "Albums", IconName::Disc3, Section::Albums),
             ("nav-artists", "Artists", IconName::Mic, Section::Artists),
             ("nav-genres", "Genres", IconName::Tag, Section::Genres),
-            ("nav-queue", "Up Next", IconName::ListMusic, Section::Queue),
         ];
         let library_items: Vec<AnyElement> = library_nav
             .into_iter()
@@ -1821,13 +1932,6 @@ impl Omamusic {
                 "Genres".into(),
                 count_text(self.library.genres().len(), "genre"),
             ),
-            Section::Queue => {
-                let (queue, _) = self.player.queue();
-                (
-                    "Up Next".into(),
-                    span_text(queue.len(), queue.iter().map(|t| t.duration).sum()),
-                )
-            }
             Section::Playlist(id) => {
                 let playlist = self.playlists.get(id)?;
                 let source = SongSource::Paths(playlist.tracks.clone().into());
@@ -1936,6 +2040,18 @@ impl Omamusic {
                     }),
             )
             .children(controls)
+            .child(with_tooltip(
+                icon_button(
+                    "queue-toggle",
+                    IconName::ListMusic,
+                    "Up Next",
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .selected(self.show_queue)
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_queue(cx))),
+                "Up Next",
+            ))
             .child(
                 div()
                     .w(rems(15.))
@@ -2045,17 +2161,11 @@ impl Omamusic {
                     }
                 };
                 vec![
-                    button("playlist-play", "", ButtonVariant::Primary, cx)
-                        .accessibility_label("Play")
-                        .child(icon(IconName::Play).size(rems(0.75)))
-                        .child("Play")
+                    pill("playlist-play", IconName::Play, "Play", true, cx)
                         .disabled(empty)
                         .on_click(cx.listener(play(false, paths.clone())))
                         .into_any_element(),
-                    button("playlist-shuffle", "", ButtonVariant::Secondary, cx)
-                        .accessibility_label("Shuffle")
-                        .child(icon(IconName::Shuffle).size(rems(0.75)))
-                        .child("Shuffle")
+                    pill("playlist-shuffle", IconName::Shuffle, "Shuffle", false, cx)
                         .disabled(empty)
                         .on_click(cx.listener(play(true, paths)))
                         .into_any_element(),
@@ -2188,18 +2298,19 @@ impl Omamusic {
             return empty_state("No Genres", "Songs with a genre tag show up here.", cx)
                 .into_any_element();
         }
-        let (columns, gap, card) = Self::grid_columns(window);
+        let (columns, gap, card) = self.grid_columns(window);
         let rows = genres.len().div_ceil(columns);
         uniform_list(
             "genres",
             rows,
-            cx.processor(move |this, range: Range<usize>, _, cx| {
+            cx.processor(move |this, range: Range<usize>, window, cx| {
                 range
                     .map(|row| {
                         let start = row * columns;
                         let end = (start + columns).min(genres.len());
                         div().flex().gap(gap).px(gap).pt(gap).children(
-                            (start..end).map(|idx| this.genre_tile(idx, &genres[idx], card, cx)),
+                            (start..end)
+                                .map(|idx| this.genre_tile(idx, &genres[idx], card, window, cx)),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -2216,15 +2327,21 @@ impl Omamusic {
         idx: usize,
         genre: &GenreEntry,
         size: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Popover {
         let theme = cx.omarchy().clone();
+        let (lift, on_hover) = hover_progress(
+            ElementId::NamedInteger("genre-lift".into(), idx as u64),
+            Transition::new(LIFT),
+            window,
+            cx,
+        );
         let name = genre.name.clone();
         let open_name = genre.name.clone();
         let play_name = genre.name.clone();
         let menu_name = genre.name.clone();
         let sort = self.prefs.song_sort;
-        let group: SharedString = format!("genre-{idx}").into();
         let count = format!(
             "{} · {}",
             plural(genre.song_count, "song"),
@@ -2234,32 +2351,21 @@ impl Omamusic {
             .id(("genre", idx))
             .test_support()
             .aria_label(name.clone())
-            .group(group.clone())
             .w(px(size))
             .flex_none()
             .flex()
             .flex_col()
             .gap(rems(0.125))
             .cursor_pointer()
+            .on_hover(on_hover)
             .on_click(
                 cx.listener(move |this, _, _, cx| {
                     this.navigate(Page::Genre(open_name.clone()), cx)
                 }),
             )
             .child(
-                div()
-                    .relative()
-                    .mb(rems(0.375))
+                lifted(size, lift)
                     .child(self.genre_art(idx, genre, size, cx))
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .rounded(rems(0.5))
-                            .bg(theme.foreground.opacity(0.08))
-                            .opacity(0.)
-                            .group_hover(group.clone(), |s| s.opacity(1.)),
-                    )
                     .child(
                         div()
                             .id(ElementId::Name(format!("genre-play-{name}").into()))
@@ -2267,16 +2373,16 @@ impl Omamusic {
                             .aria_label(format!("Play {name}"))
                             .absolute()
                             .right(rems(0.5))
-                            .bottom(rems(0.5))
+                            .bottom(px(4. + 4. * lift))
                             .size(rems(2.))
                             .rounded_full()
                             .flex()
                             .items_center()
                             .justify_center()
                             .bg(theme.accent)
-                            .text_color(theme.background)
-                            .opacity(0.)
-                            .group_hover(group, |s| s.opacity(1.))
+                            .text_color(theme.on_accent)
+                            .shadow_md()
+                            .opacity(lift)
                             .child(icon(IconName::Play).size(rems(0.875)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
@@ -2326,19 +2432,17 @@ impl Omamusic {
     /// and a tag glyph when none of its albums has art.
     fn genre_art(&self, idx: usize, genre: &GenreEntry, size: f32, cx: &App) -> AnyElement {
         let theme = cx.omarchy().clone();
-        let radius = rems(0.5);
+        let radius = cover_radius(size);
         let art = div()
             .id(("genre-art", idx))
             .test_support()
             .size(px(size))
             .flex_none()
             .rounded(radius)
-            .bg(theme.hover_fill())
-            .border_1()
-            .border_color(theme.border);
+            .bg(theme.hover_fill());
         let ids = &genre.cover_album_ids;
         if ids.len() >= crate::db::GENRE_COVERS {
-            let cell = (size - 2.) / 2.;
+            let cell = size / 2.;
             return art
                 .flex()
                 .flex_wrap()
@@ -2362,7 +2466,7 @@ impl Omamusic {
         match ids.first() {
             Some(id) => art
                 .overflow_hidden()
-                .child(self.genre_cell(id, size - 2.).rounded(radius))
+                .child(self.genre_cell(id, size).rounded(radius))
                 .into_any_element(),
             None => art
                 .flex()
@@ -2411,7 +2515,7 @@ impl Omamusic {
                 uniform_list(
                     id,
                     total,
-                    cx.processor(move |this, range: Range<usize>, _, cx| {
+                    cx.processor(move |this, range: Range<usize>, window, cx| {
                         let start = range.start;
                         let tracks = this.library.song_page(&source, start, range.len());
                         let query = if highlight {
@@ -2429,7 +2533,7 @@ impl Omamusic {
                                     current: current.as_deref(),
                                     playing,
                                 };
-                                this.song_row(&track, row, cx)
+                                this.song_row(&track, row, window, cx)
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -2459,7 +2563,8 @@ impl Omamusic {
                     } else {
                         theme.secondary
                     })
-                    .child(div().min_w_0().truncate().child(label))
+                    .when(column == SongColumn::Time, |d| d.justify_end())
+                    .child(div().min_w_0().truncate().child(label.to_uppercase()))
                     .when(active, |d| {
                         d.child(
                             icon(if descending {
@@ -2487,32 +2592,53 @@ impl Omamusic {
             .flex()
             .items_center()
             .gap(rems(0.75))
-            .px(rems(0.75))
+            .mx(rems(0.375))
+            .px(rems(0.5))
             .py(rems(0.375))
             .border_b_1()
             .border_color(theme.border)
-            .text_size(rems(0.6875))
+            .text_size(rems(0.625))
+            .font_weight(FontWeight::MEDIUM)
             .text_color(theme.secondary)
             .child(div().w(rems(2.)).flex_shrink_0().child("#"))
-            .child(div().w(px(SONG_COVER)).flex_shrink_0())
             .children(cells.by_ref().take(4))
             .child(div().w(rems(1.5)).flex_shrink_0())
             .children(cells)
     }
 
-    fn song_row(&self, t: &Track, row: SongRow<'_>, cx: &mut Context<Self>) -> Popover {
+    fn song_row(
+        &self,
+        t: &Track,
+        row: SongRow<'_>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Popover {
         let theme = cx.omarchy().clone();
         let i = row.index;
         let is_current = row.current.is_some_and(|p| p == t.path.as_path());
-        let selected = self.selection.contains(&i);
         let group: SharedString = format!("song-row-{i}").into();
-        let bg = if i.is_multiple_of(2) {
+        let (hover, on_hover) = hover_progress(
+            ("song-hover", i),
+            Transition::new(ROW_FILL).ease(gpui_kit::linear),
+            window,
+            cx,
+        );
+        let zebra = if i.is_multiple_of(2) {
             theme.background
         } else {
-            theme.hover_fill()
+            theme.background.blend(theme.hover_fill().opacity(0.5))
+        };
+        let (bg, ink, muted) = if is_current {
+            (theme.accent, theme.on_accent, theme.on_accent.opacity(0.8))
+        } else {
+            (
+                row_fill(zebra, theme.hover_fill(), hover),
+                theme.foreground,
+                theme.secondary,
+            )
         };
         let number = if is_current {
-            now_playing(row.playing, cx)
+            now_playing(row.playing, ink)
         } else {
             (i + 1).to_string().into_any_element()
         };
@@ -2530,10 +2656,10 @@ impl Omamusic {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(theme.secondary)
+                .text_color(muted)
                 .opacity(0.)
                 .group_hover(group.clone(), |s| s.opacity(1.))
-                .hover(|s| s.text_color(theme.foreground))
+                .hover(|s| s.text_color(ink))
                 .child(icon(IconName::Ellipsis).size(rems(0.875)))
                 .test_support()
                 .aria_label("More"),
@@ -2545,7 +2671,8 @@ impl Omamusic {
             song_cell(column, div())
                 .truncate()
                 .text_size(rems(0.6875))
-                .text_color(theme.secondary)
+                .text_color(muted)
+                .when(column == SongColumn::Time, |d| d.text_right())
                 .child(text)
         };
         let content = div()
@@ -2554,11 +2681,13 @@ impl Omamusic {
             .flex()
             .items_center()
             .gap(rems(0.75))
-            .px(rems(0.75))
+            .mx(rems(0.375))
+            .px(rems(0.5))
             .py(rems(0.25))
+            .rounded(rems(0.375))
             .relative()
             .bg(bg)
-            .hover(|s| s.bg(theme.hover_fill()))
+            .on_hover(on_hover)
             .cursor_pointer()
             .child(
                 div()
@@ -2568,7 +2697,7 @@ impl Omamusic {
                     .flex()
                     .items_center()
                     .text_size(rems(0.6875))
-                    .text_color(theme.secondary)
+                    .text_color(muted)
                     .child(
                         div()
                             .group_hover(group.clone(), |s| s.opacity(0.))
@@ -2583,7 +2712,7 @@ impl Omamusic {
                             .left_0()
                             .flex()
                             .items_center()
-                            .text_color(theme.foreground)
+                            .text_color(ink)
                             .opacity(0.)
                             .group_hover(group, |s| s.opacity(1.))
                             .child(icon(IconName::Play).size(rems(0.875)))
@@ -2596,40 +2725,22 @@ impl Omamusic {
                             .aria_label(format!("Play {}", t.title)),
                     ),
             )
-            .child(div().flex_shrink_0().child(self.cover(
-                Some(&t.album_id),
-                SONG_COVER,
-                &t.album,
-                cx,
-            )))
             .child(
                 song_cell(SongColumn::Title, div())
                     .truncate()
                     .text_size(rems(0.75))
-                    .text_color(if is_current {
-                        theme.accent
-                    } else {
-                        theme.foreground
-                    })
-                    .child(highlighted(&t.title, row.query, theme.accent)),
+                    .text_color(ink)
+                    .child(highlighted(
+                        &t.title,
+                        row.query,
+                        if is_current { ink } else { theme.accent },
+                    )),
             )
             .child(text_cell(SongColumn::Artist, t.artist.clone()))
             .child(text_cell(SongColumn::Album, t.album.clone()))
             .child(text_cell(SongColumn::Genre, t.genre.clone()))
             .child(div().w(rems(1.5)).flex_shrink_0().child(more))
-            .child(text_cell(SongColumn::Time, format_time(t.duration)))
-            .when(selected, |d| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left_0()
-                        .right_0()
-                        .border_1()
-                        .border_color(theme.accent),
-                )
-            });
+            .child(text_cell(SongColumn::Time, format_time(t.duration)));
         self.track_row("song", i, row.list.clone(), false, content, cx)
     }
 }
@@ -2742,7 +2853,6 @@ impl Omamusic {
             Section::Albums => self.render_albums_section(window, cx),
             Section::Artists => self.render_artist_list(cx),
             Section::Genres => self.render_genre_list(window, cx),
-            Section::Queue => self.render_queue(cx),
             Section::Playlist(id) => self.render_playlist(id, cx),
         }
     }
@@ -2792,10 +2902,15 @@ impl Omamusic {
         self.render_album_list("artist-albums", albums, window, cx)
     }
 
-    fn grid_columns(window: &Window) -> (usize, gpui_kit::Pixels, f32) {
+    fn grid_columns(&self, window: &Window) -> (usize, gpui_kit::Pixels, f32) {
         let rem = window.rem_size();
         let gap = rem * 0.75;
-        let width = window.viewport_size().width - rem * SIDEBAR_REMS - px(1.) - gap * 2.;
+        let queue = if self.show_queue {
+            rem * QUEUE_REMS + px(1.)
+        } else {
+            px(0.)
+        };
+        let width = window.viewport_size().width - rem * SIDEBAR_REMS - px(1.) - queue - gap * 2.;
         let card = rem * ALBUM_CARD_REMS;
         let columns = (((width + gap) / (card + gap)).floor() as usize).max(1);
         (columns, gap, card / px(1.))
@@ -2850,13 +2965,13 @@ impl Omamusic {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (columns, gap, card) = Self::grid_columns(window);
+        let (columns, gap, card) = self.grid_columns(window);
         let total = self.library.album_total();
         let rows = total.div_ceil(columns);
         uniform_list(
             id,
             rows,
-            cx.processor(move |this, range: Range<usize>, _, cx| {
+            cx.processor(move |this, range: Range<usize>, window, cx| {
                 range
                     .map(|row| {
                         let start = row * columns;
@@ -2869,7 +2984,7 @@ impl Omamusic {
                             .pt(gap)
                             .children((start..end).map(|idx| {
                                 let album = albums.get(idx - start).cloned().unwrap_or_default();
-                                this.album_card(&album, "album", idx, card, cx)
+                                this.album_card(&album, "album", idx, card, window, cx)
                             }))
                     })
                     .collect::<Vec<_>>()
@@ -2888,21 +3003,25 @@ impl Omamusic {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (columns, gap, card) = Self::grid_columns(window);
+        let (columns, gap, card) = self.grid_columns(window);
         let albums: Arc<[AlbumSummary]> = albums.into();
         let rows = albums.len().div_ceil(columns);
         uniform_list(
             id,
             rows,
-            cx.processor(move |this, range: Range<usize>, _, cx| {
+            cx.processor(move |this, range: Range<usize>, window, cx| {
                 range
                     .map(|row| {
                         let start = row * columns;
                         let end = (start + columns).min(albums.len());
-                        div().flex().gap(gap).px(gap).pt(gap).children(
-                            (start..end)
-                                .map(|idx| this.album_card(&albums[idx], "album", idx, card, cx)),
-                        )
+                        div()
+                            .flex()
+                            .gap(gap)
+                            .px(gap)
+                            .pt(gap)
+                            .children((start..end).map(|idx| {
+                                this.album_card(&albums[idx], "album", idx, card, window, cx)
+                            }))
                     })
                     .collect::<Vec<_>>()
             }),
@@ -2940,12 +3059,18 @@ impl Omamusic {
         id: &'static str,
         idx: usize,
         size: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Popover {
         let theme = cx.omarchy().clone();
         let key = a.id.clone();
         let play_key = a.id.clone();
-        let group: SharedString = format!("{id}-{idx}").into();
+        let (lift, on_hover) = hover_progress(
+            ElementId::Name(format!("{id}-lift-{idx}").into()),
+            Transition::new(LIFT),
+            window,
+            cx,
+        );
         let subtitle = if a.year > 0 {
             format!("{} · {}", a.artist, a.year)
         } else {
@@ -2955,20 +3080,18 @@ impl Omamusic {
             .id((id, idx))
             .test_support()
             .aria_label(a.title.clone())
-            .group(group.clone())
             .w(px(size))
             .flex_none()
             .flex()
             .flex_col()
             .gap(rems(0.125))
             .cursor_pointer()
+            .on_hover(on_hover)
             .on_click(
                 cx.listener(move |this, _, _, cx| this.navigate(Page::Album(key.clone()), cx)),
             )
             .child(
-                div()
-                    .relative()
-                    .mb(rems(0.375))
+                lifted(size, lift)
                     .child(self.badged_cover(&a.id, a.unmatched, size, &a.title, cx))
                     .child(
                         div()
@@ -2977,16 +3100,16 @@ impl Omamusic {
                             .aria_label(format!("Play {}", a.title))
                             .absolute()
                             .right(rems(0.5))
-                            .bottom(rems(0.5))
+                            .bottom(px(4. + 4. * lift))
                             .size(rems(2.))
                             .rounded_full()
                             .flex()
                             .items_center()
                             .justify_center()
                             .bg(theme.accent)
-                            .text_color(theme.background)
-                            .opacity(0.)
-                            .group_hover(group, |s| s.opacity(1.))
+                            .text_color(theme.on_accent)
+                            .shadow_md()
+                            .opacity(lift)
                             .child(icon(IconName::Play).size(rems(0.875)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
@@ -3219,29 +3342,32 @@ impl Omamusic {
         } else {
             Vec::new()
         };
-        let (columns, gap, card) = Self::grid_columns(window);
-        let artist_label: AnyElement = if linkable {
-            let name = album.artist.clone();
-            button(
-                "album-artist",
-                album.artist.clone(),
-                ButtonVariant::Secondary,
-                cx,
-            )
-            .px_0()
-            .text_size(rems(0.875))
-            .text_color(theme.accent)
-            .on_click(
-                cx.listener(move |this, _, _, cx| this.navigate(Page::Artist(name.clone()), cx)),
-            )
-            .into_any_element()
-        } else {
-            div()
-                .text_size(rems(0.875))
-                .text_color(theme.foreground)
-                .child(album.artist.clone())
-                .into_any_element()
-        };
+        let (columns, gap, card) = self.grid_columns(window);
+        let artist_label: AnyElement =
+            if linkable {
+                let name = album.artist.clone();
+                button("album-artist", "", ButtonVariant::Secondary, cx)
+                    .accessibility_label(album.artist.clone())
+                    .child(album.artist.to_uppercase())
+                    .px(rems(0.25))
+                    .py(rems(0.125))
+                    .ml(rems(-0.25))
+                    .rounded(rems(0.25))
+                    .text_size(rems(0.6875))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.accent)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.navigate(Page::Artist(name.clone()), cx)
+                    }))
+                    .into_any_element()
+            } else {
+                div()
+                    .text_size(rems(0.6875))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.secondary)
+                    .child(album.artist.to_uppercase())
+                    .into_any_element()
+            };
         let more_tracks = album.tracks.clone();
         let more_menu = self.action_menu(
             "album-more-menu",
@@ -3252,7 +3378,8 @@ impl Omamusic {
                     "More",
                     ButtonVariant::Secondary,
                     cx,
-                ),
+                )
+                .rounded_full(),
                 "More",
             ),
             ALBUM_MORE_ACTIONS,
@@ -3264,8 +3391,14 @@ impl Omamusic {
         let header = div()
             .flex()
             .items_end()
-            .gap(rems(1.25))
-            .child(self.badged_cover(&album.id, album.unmatched, 200., &album.title, cx))
+            .gap(rems(1.5))
+            .child(
+                div()
+                    .flex_none()
+                    .rounded(cover_radius(200.))
+                    .shadow_lg()
+                    .child(self.badged_cover(&album.id, album.unmatched, 200., &album.title, cx)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -3273,24 +3406,18 @@ impl Omamusic {
                     .flex()
                     .flex_col()
                     .gap(rems(0.25))
-                    .child(
-                        div()
-                            .text_size(rems(0.625))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.secondary)
-                            .child("ALBUM"),
-                    )
+                    .child(div().flex().child(artist_label))
                     .child(
                         div()
                             .id("album-title")
                             .test_support()
                             .aria_label(album.title.clone())
                             .text_size(rems(1.75))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::BOLD)
+                            .line_height(rems(2.125))
                             .text_color(theme.foreground)
                             .child(album.title.clone()),
                     )
-                    .child(div().flex().child(artist_label))
                     .child(
                         div()
                             .id("album-meta")
@@ -3305,19 +3432,13 @@ impl Omamusic {
                             .flex()
                             .items_center()
                             .gap(rems(0.5))
-                            .pt(rems(0.5))
+                            .pt(rems(0.75))
                             .child(
-                                button("play-album", "", ButtonVariant::Primary, cx)
-                                    .accessibility_label("Play")
-                                    .child(icon(IconName::Play).size(rems(0.75)))
-                                    .child("Play")
+                                pill("play-album", IconName::Play, "Play", true, cx)
                                     .on_click(cx.listener(play(false, album.tracks.clone()))),
                             )
                             .child(
-                                button("shuffle-album", "", ButtonVariant::Secondary, cx)
-                                    .accessibility_label("Shuffle")
-                                    .child(icon(IconName::Shuffle).size(rems(0.75)))
-                                    .child("Shuffle")
+                                pill("shuffle-album", IconName::Shuffle, "Shuffle", false, cx)
                                     .on_click(cx.listener(play(true, album.tracks.clone()))),
                             )
                             .child(more_menu),
@@ -3325,8 +3446,28 @@ impl Omamusic {
             );
         let rows = album.tracks.iter().enumerate().map(|(i, t)| {
             let is_current = current.as_ref().is_some_and(|c| c.path == t.path);
+            let (hover, on_hover) = hover_progress(
+                ("album-track-hover", i),
+                Transition::new(ROW_FILL).ease(gpui_kit::linear),
+                window,
+                cx,
+            );
+            let zebra = if i.is_multiple_of(2) {
+                theme.background
+            } else {
+                theme.background.blend(theme.hover_fill().opacity(0.5))
+            };
+            let (bg, ink, muted) = if is_current {
+                (theme.accent, theme.on_accent, theme.on_accent.opacity(0.8))
+            } else {
+                (
+                    row_fill(zebra, theme.hover_fill(), hover),
+                    theme.foreground,
+                    theme.secondary,
+                )
+            };
             let number = if is_current {
-                now_playing(playing, cx)
+                now_playing(playing, ink)
             } else if t.track_number > 0 {
                 t.track_number.to_string().into_any_element()
             } else {
@@ -3341,10 +3482,10 @@ impl Omamusic {
                 .items_center()
                 .gap(rems(0.75))
                 .px(rems(0.5))
-                .py(rems(0.375))
-                .border_b_1()
-                .border_color(theme.border)
-                .hover(|s| s.bg(theme.hover_fill()))
+                .py(rems(0.4375))
+                .rounded(rems(0.375))
+                .bg(bg)
+                .on_hover(on_hover)
                 .cursor_pointer()
                 .child(
                     div()
@@ -3352,7 +3493,7 @@ impl Omamusic {
                         .w(rems(2.))
                         .flex()
                         .justify_end()
-                        .text_color(theme.secondary)
+                        .text_color(muted)
                         .child(
                             div()
                                 .group_hover(group.clone(), |s| s.opacity(0.))
@@ -3369,7 +3510,7 @@ impl Omamusic {
                                 .right_0()
                                 .flex()
                                 .items_center()
-                                .text_color(theme.foreground)
+                                .text_color(ink)
                                 .opacity(0.)
                                 .group_hover(group, |s| s.opacity(1.))
                                 .child(icon(IconName::Play).size(rems(0.875)))
@@ -3390,11 +3531,7 @@ impl Omamusic {
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_color(if is_current {
-                                    theme.accent
-                                } else {
-                                    theme.foreground
-                                })
+                                .text_color(ink)
                                 .child(t.title.clone()),
                         )
                         .when(t.artist != album.artist, |d| {
@@ -3402,16 +3539,12 @@ impl Omamusic {
                                 div()
                                     .min_w_0()
                                     .truncate()
-                                    .text_color(theme.secondary)
+                                    .text_color(muted)
                                     .child(t.artist.clone()),
                             )
                         }),
                 )
-                .child(
-                    div()
-                        .text_color(theme.secondary)
-                        .child(format_time(t.duration)),
-                );
+                .child(div().text_color(muted).child(format_time(t.duration)));
             self.track_row(
                 "album-track-menu",
                 i,
@@ -3444,7 +3577,7 @@ impl Omamusic {
                             more.iter()
                                 .take(columns)
                                 .enumerate()
-                                .map(|(i, a)| self.album_card(a, "more-by", i, card, cx))
+                                .map(|(i, a)| self.album_card(a, "more-by", i, card, window, cx))
                                 .collect::<Vec<_>>(),
                         ),
                     )
@@ -3454,12 +3587,12 @@ impl Omamusic {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .p(rems(1.25))
+            .p(rems(1.5))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(rems(1.25))
+                    .gap(rems(1.5))
                     .child(header)
                     .child(div().flex().flex_col().text_size(rems(0.75)).children(rows))
                     .children(more_section),
@@ -3626,7 +3759,7 @@ impl Omamusic {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (columns, gap, card) = Self::grid_columns(window);
+        let (columns, gap, card) = self.grid_columns(window);
         let song_total = self.library.track_total();
         let album_total = self.library.album_total();
         let artist_total = self.library.artist_total();
@@ -3668,7 +3801,7 @@ impl Omamusic {
                         current: current.as_deref(),
                         playing,
                     };
-                    self.song_row(t, row, cx)
+                    self.song_row(t, row, window, cx)
                 })
                 .collect();
             sections.push(
@@ -3691,7 +3824,7 @@ impl Omamusic {
             let cards: Vec<Popover> = albums
                 .iter()
                 .enumerate()
-                .map(|(i, a)| self.album_card(a, "search-album", i, card, cx))
+                .map(|(i, a)| self.album_card(a, "search-album", i, card, window, cx))
                 .collect();
             sections.push(
                 div()
@@ -3853,65 +3986,100 @@ impl Omamusic {
             .into_any_element()
     }
 
-    fn render_queue(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_queue_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.omarchy().clone();
         let (queue, index) = self.player.queue();
-        if queue.is_empty() {
-            return empty_state(
-                "Queue Empty",
-                "Play something or add songs to the queue.",
-                cx,
-            )
-            .into_any_element();
-        }
         let playing = self.player.state() == PlayerState::Playing;
-        div()
-            .flex_1()
-            .min_h_0()
+        let summary = span_text(queue.len(), queue.iter().map(|t| t.duration).sum());
+        let header = div()
             .flex()
-            .flex_col()
+            .items_center()
+            .gap(rems(0.5))
+            .px(rems(0.75))
+            .py(rems(0.5))
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
-                    .items_center()
-                    .gap(rems(0.75))
-                    .px(rems(0.75))
-                    .py(rems(0.5))
-                    .border_b_1()
-                    .border_color(theme.border)
+                    .flex_col()
                     .child(
                         div()
-                            .flex_1()
-                            .text_size(rems(0.75))
-                            .text_color(theme.secondary)
-                            .child(format!(
-                                "{} songs · {}",
-                                queue.len(),
-                                format_time(queue.iter().map(|t| t.duration).sum())
-                            )),
+                            .text_size(rems(0.8125))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child("Up Next"),
                     )
                     .child(
-                        button("clear-queue", "Clear", ButtonVariant::Secondary, cx).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.player.stop();
-                                this.clear_selection();
-                                cx.notify();
-                            }),
-                        ),
+                        div()
+                            .id("queue-summary")
+                            .test_support()
+                            .aria_label(summary.clone())
+                            .text_size(rems(0.6875))
+                            .text_color(theme.secondary)
+                            .truncate()
+                            .child(summary),
                     ),
             )
-            .child(
-                uniform_list(
-                    "queue",
-                    queue.len(),
-                    cx.processor(move |this, range: Range<usize>, _, cx| {
-                        range
-                            .map(|i| this.queue_row(i, &queue, index, playing, cx))
-                            .collect::<Vec<_>>()
-                    }),
+            .when(!queue.is_empty(), |d| {
+                d.child(
+                    button("clear-queue", "Clear", ButtonVariant::Secondary, cx).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.player.stop();
+                            this.clear_selection();
+                            cx.notify();
+                        }),
+                    ),
                 )
+            });
+        let body = if queue.is_empty() {
+            div()
+                .id("queue-empty")
+                .test_support()
                 .flex_1()
-                .min_h_0(),
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(rems(1.))
+                .text_size(rems(0.75))
+                .text_color(theme.secondary)
+                .text_center()
+                .child("Songs you play or queue show up here.")
+                .into_any_element()
+        } else {
+            uniform_list(
+                "queue",
+                queue.len(),
+                cx.processor(move |this, range: Range<usize>, window, cx| {
+                    range
+                        .map(|i| this.queue_row(i, &queue, index, playing, window, cx))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .flex_1()
+            .min_h_0()
+            .px(rems(0.375))
+            .pb(rems(0.375))
+            .into_any_element()
+        };
+        div()
+            .id("queue-panel")
+            .test_support()
+            .aria_label("Up Next")
+            .relative()
+            .flex()
+            .flex_col()
+            .w(rems(QUEUE_REMS))
+            .flex_shrink_0()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(header)
+            .child(body)
+            .with_animation(
+                ElementId::NamedInteger("queue-panel".into(), self.queue_seq),
+                Animation::new(PANEL_ENTER).with_easing(ease_out_quint()),
+                |panel, t| panel.opacity(t).left(px(16. * (1. - t))),
             )
             .into_any_element()
     }
@@ -3922,53 +4090,81 @@ impl Omamusic {
         queue: &Arc<[Track]>,
         index: Option<usize>,
         playing: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Popover {
         let theme = cx.omarchy().clone();
         let t = &queue[i];
         let is_current = index == Some(i);
         let past = index.is_some_and(|current| i < current);
-        let number = if is_current {
-            now_playing(playing, cx)
+        let (hover, on_hover) = hover_progress(
+            ("queue-row-hover", i),
+            Transition::new(ROW_FILL).ease(gpui_kit::linear),
+            window,
+            cx,
+        );
+        let (rest, title_color, sub_color) = if is_current {
+            (theme.accent, theme.on_accent, theme.on_accent.opacity(0.8))
+        } else if past {
+            (theme.background, theme.secondary, theme.secondary)
         } else {
-            (i + 1).to_string().into_any_element()
+            (theme.background, theme.foreground, theme.secondary)
         };
         let row = div()
             .id(("queue-row", i))
             .flex()
             .items_center()
-            .gap(rems(0.75))
-            .px(rems(0.75))
-            .py(rems(0.375))
+            .gap(rems(0.5))
+            .px(rems(0.375))
+            .py(rems(0.25))
+            .rounded(rems(0.375))
             .text_size(rems(0.75))
-            .text_color(if past {
-                theme.secondary
+            .bg(if is_current {
+                rest
             } else {
-                theme.foreground
+                row_fill(rest, theme.hover_fill(), hover)
             })
-            .hover(|s| s.bg(theme.hover_fill()))
+            .on_hover(on_hover)
             .cursor_pointer()
+            .child(div().relative().flex_none().child(self.cover(
+                Some(&t.album_id),
+                32.,
+                &t.album,
+                cx,
+            )))
             .child(
                 div()
-                    .w(rems(2.))
+                    .flex_1()
+                    .min_w_0()
                     .flex()
-                    .justify_end()
-                    .text_color(theme.secondary)
-                    .child(number),
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(rems(0.25))
+                            .when(is_current, |d| d.child(now_playing(playing, title_color)))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(title_color)
+                                    .child(t.title.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(rems(0.6875))
+                            .text_color(sub_color)
+                            .truncate()
+                            .child(t.artist.clone()),
+                    ),
             )
-            .child(self.cover(Some(&t.album_id), 28., &t.album, cx))
-            .child(div().flex_1().min_w_0().truncate().child(t.title.clone()))
             .child(
                 div()
-                    .w(rems(10.))
-                    .text_color(theme.secondary)
-                    .truncate()
-                    .child(t.artist.clone()),
-            )
-            .child(
-                div()
-                    .w(rems(3.))
-                    .text_color(theme.secondary)
+                    .flex_none()
+                    .text_size(rems(0.6875))
+                    .text_color(sub_color)
                     .child(format_time(t.duration)),
             );
         self.track_row(
