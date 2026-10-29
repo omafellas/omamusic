@@ -23,6 +23,9 @@ pub struct Album {
     pub year: u32,
     #[serde(with = "arc_vec_serde")]
     pub tracks: Arc<[Track]>,
+    /// Online lookup ran and found no confident match.
+    #[serde(default)]
+    pub unmatched: bool,
 }
 
 /// An album without its tracks, for grids and artist pages that only need

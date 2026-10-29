@@ -2,6 +2,7 @@
 //! window with the real key bindings and asserts the visible outcome.
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{px, Entity, Pixels, TestAppContext, VisualTestContext};
+use omamusic::models::AlbumSummary;
 use omamusic::{AppConfig, Library, Omamusic, Player, Root};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,6 +60,14 @@ impl Smoke<'_> {
         })
     }
 
+    fn exists(&mut self, id: &str) -> bool {
+        let id = id.to_string();
+        self.cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.try_find(id).is_some()
+        })
+    }
+
     fn search_text(&mut self) -> String {
         self.view
             .read_with(self.cx, |view, cx| view.search_text(cx))
@@ -66,8 +75,11 @@ impl Smoke<'_> {
 }
 
 fn open(cx: &mut TestAppContext) -> Smoke<'_> {
+    open_with(cx, Arc::new(Library::empty()))
+}
+
+fn open_with(cx: &mut TestAppContext, library: Arc<Library>) -> Smoke<'_> {
     let config_dir = isolated_config_dir();
-    let library = Arc::new(Library::empty());
     let player = Arc::new(Player::new_test());
     cx.update(|cx| {
         gpui_omarchy::init(cx);
@@ -208,6 +220,59 @@ async fn online_lookup_switch_persists_to_config(cx: &mut TestAppContext) {
     let text = std::fs::read_to_string(app.config_dir.join("config.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["online_lookup"], serde_json::Value::Bool(false));
+}
+
+fn unmatched_summary(key: &str) -> AlbumSummary {
+    AlbumSummary {
+        id: key.to_string(),
+        title: "Estranhos no Ninho".to_string(),
+        artist: "Exxótica".to_string(),
+        year: 2002,
+        track_count: 1,
+        unmatched: true,
+    }
+}
+
+#[gpui_kit::test]
+async fn unmatched_album_shows_badge_and_settings_count(cx: &mut TestAppContext) {
+    let library = Arc::new(Library::empty());
+    library.insert_unmatched_album(&unmatched_summary("k"));
+    let mut app = open_with(cx, library);
+    app.click("nav-albums");
+    assert!(
+        app.exists("album-unmatched-k"),
+        "the album card carries a badge"
+    );
+
+    app.click("settings");
+    assert_eq!(
+        app.label("lookup-status").as_deref(),
+        Some("1 album could not be identified")
+    );
+
+    app.click("lookup-retry");
+    assert!(
+        !app.exists("lookup-status"),
+        "the list empties once retried"
+    );
+    assert!(!app.exists("album-unmatched-k"), "the badge goes with it");
+}
+
+#[gpui_kit::test]
+async fn lookup_progress_is_shown_while_working(cx: &mut TestAppContext) {
+    let library = Arc::new(Library::empty());
+    library.set_lookup_progress(3, 12);
+    let mut app = open_with(cx, library.clone());
+    app.click("settings");
+    assert_eq!(
+        app.label("lookup-status").as_deref(),
+        Some("Looking up albums… 3 of 12")
+    );
+    library.set_lookup_progress(12, 12);
+    assert!(
+        !app.exists("lookup-status"),
+        "nothing to say once the pass is over"
+    );
 }
 
 #[gpui_kit::test]

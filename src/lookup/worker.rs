@@ -429,7 +429,7 @@ mod tests {
                 }
             }
             let mut conn = Db::open_writer(&root.join("library.db")).unwrap();
-            index::reconcile(&mut conn, &[music.clone()], &cache).unwrap();
+            index::reconcile(&mut conn, std::slice::from_ref(&music), &cache).unwrap();
             Self {
                 root,
                 music,

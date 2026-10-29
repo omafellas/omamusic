@@ -389,7 +389,7 @@ pub fn artists_page(conn: &Connection, offset: usize, limit: usize) -> Result<Ve
 pub fn album_detail(conn: &Connection, key: &str) -> Result<Option<Album>> {
     let album = conn
         .query_row(
-            "SELECT a.key, a.title, a.artist, a.year FROM albums a WHERE a.key = ?1",
+            &format!("SELECT {ALBUM_COLS} FROM albums a WHERE a.key = ?1"),
             params![key],
             |row| {
                 Ok(Album {
@@ -398,6 +398,7 @@ pub fn album_detail(conn: &Connection, key: &str) -> Result<Option<Album>> {
                     artist: row.get("artist")?,
                     year: row.get::<_, i64>("year")?.max(0) as u32,
                     tracks: Vec::new().into(),
+                    unmatched: row.get::<_, i64>("unmatched")? != 0,
                 })
             },
         )

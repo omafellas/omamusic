@@ -155,10 +155,67 @@ impl Library {
 
     /// Forget every album the lookup gave up on and try them again.
     pub fn retry_unmatched(&self) {
+        if let Err(err) = self.db.read(db::clear_unmatched) {
+            eprintln!("online lookup: clear unmatched: {err:#}");
+        }
         update(&self.state, |s| s.lookup_unmatched.clear());
         if let Some(tx) = &self.lookup_tx {
             let _ = tx.send(Wake::Retry);
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Put one album into the in-memory index and mark it as one the online
+    /// lookup gave up on, the way the worker would. For view tests.
+    pub fn insert_unmatched_album(&self, summary: &AlbumSummary) {
+        let path = format!("/music/{}/01.mp3", summary.title);
+        let dir = format!("/music/{}", summary.title);
+        self.db
+            .read(|conn| {
+                conn.execute(
+                    "INSERT INTO tracks(path, dir, title, artist, album, album_key, track_number, \
+                     year, duration, mtime_ns, size) VALUES (?1, ?2, 'Song', ?3, ?4, ?5, 1, ?6, \
+                     200.0, 1, 1)",
+                    rusqlite::params![
+                        path,
+                        dir,
+                        summary.artist,
+                        summary.title,
+                        summary.id,
+                        summary.year
+                    ],
+                )?;
+                conn.execute_batch(index::REBUILD_ALBUMS)?;
+                db::record_lookup(
+                    conn,
+                    &db::LookupRow {
+                        album_key: summary.id.clone(),
+                        status: db::LookupStatus::Unmatched,
+                        release: None,
+                        release_group: None,
+                        score: Some(0.5),
+                        candidate: None,
+                        attempted_at: 1,
+                    },
+                )
+            })
+            .expect("insert unmatched album");
+        Self::reload(&self.state, &self.db);
+        update(&self.state, |s| {
+            if s.folders.is_empty() {
+                s.folders.push(PathBuf::from("/music"));
+            }
+            s.lookup_unmatched.push(summary.clone());
+        });
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Pretend the worker is `done` albums into a pass of `total`.
+    pub fn set_lookup_progress(&self, done: usize, total: usize) {
+        update(&self.state, |s| {
+            s.lookup_total = total;
+            s.lookup_pending = total.saturating_sub(done);
+        });
     }
 
     fn cache_dir() -> Result<PathBuf> {
