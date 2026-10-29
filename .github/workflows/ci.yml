@@ -63,9 +63,6 @@ jobs:
   flatpak:
     name: Flatpak build
     runs-on: ubuntu-latest
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v5
 
