@@ -499,6 +499,30 @@ fn id3_text(data: &[u8]) -> String {
         .to_string()
 }
 
+/// Synthetic audio files for tests across the crate.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    /// Minimal PCM WAV: `seconds` of silence at 8 kHz mono, 16-bit.
+    pub(crate) fn wav_bytes(seconds: u32) -> Vec<u8> {
+        let samples = 8000u32 * 2 * seconds;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + samples).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&8000u32.to_le_bytes());
+        out.extend_from_slice(&16000u32.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&samples.to_le_bytes());
+        out.resize(out.len() + samples as usize, 0);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,26 +561,6 @@ mod tests {
         }
     }
 
-    /// Minimal PCM WAV: one second of silence at 8 kHz mono.
-    fn wav_bytes() -> Vec<u8> {
-        let samples = 8000u32 * 2;
-        let mut out = Vec::new();
-        out.extend_from_slice(b"RIFF");
-        out.extend_from_slice(&(36 + samples).to_le_bytes());
-        out.extend_from_slice(b"WAVEfmt ");
-        out.extend_from_slice(&16u32.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&8000u32.to_le_bytes());
-        out.extend_from_slice(&16000u32.to_le_bytes());
-        out.extend_from_slice(&2u16.to_le_bytes());
-        out.extend_from_slice(&16u16.to_le_bytes());
-        out.extend_from_slice(b"data");
-        out.extend_from_slice(&samples.to_le_bytes());
-        out.resize(out.len() + samples as usize, 0);
-        out
-    }
-
     /// ID3v2.3 header plus the given frames, followed by four silent MPEG-1
     /// Layer III frames (128 kbit/s, 44.1 kHz, 417 bytes each).
     fn mp3_bytes(frames: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
@@ -591,7 +595,7 @@ mod tests {
         use lofty::tag::{Tag, TagType};
 
         let file = TempFile::new("tagged.wav");
-        std::fs::write(&file.0, wav_bytes()).unwrap();
+        std::fs::write(&file.0, fixtures::wav_bytes(1)).unwrap();
         let mut tag = Tag::new(TagType::Id3v2);
         tag.set_title("Teu Olhar".into());
         tag.set_artist("Exxótica".into());
