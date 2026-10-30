@@ -144,6 +144,11 @@ impl Smoke<'_> {
         })
     }
 
+    fn tooltip_visible(&mut self) -> bool {
+        self.cx.update(|window, cx| window.render_frame(cx));
+        self.cx.debug_bounds("omarchy-tooltip-surface").is_some()
+    }
+
     fn liked_file(&self) -> serde_json::Value {
         let text = std::fs::read_to_string(self.config_dir.join("liked.json")).unwrap_or_default();
         serde_json::from_str(&text).unwrap_or_default()
@@ -349,6 +354,26 @@ async fn online_lookup_switch_persists_to_config(cx: &mut TestAppContext) {
     let text = std::fs::read_to_string(app.config_dir.join("config.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["online_lookup"], serde_json::Value::Bool(false));
+}
+
+#[gpui_kit::test]
+async fn online_lookup_details_live_behind_the_info_icon_tooltip(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    app.click("settings");
+
+    assert!(
+        app.has("lookup-info-hint"),
+        "the settings page keeps a hover target for the online-lookup details"
+    );
+
+    // The helper paragraph is gone; hovering the info icon surfaces it.
+    app.hover_on("lookup-info-hint");
+    app.cx.executor().advance_clock(Duration::from_millis(500));
+    app.cx.run_until_parked();
+    assert!(
+        app.tooltip_visible(),
+        "hovering the info icon shows the online-lookup details"
+    );
 }
 
 fn album(key: &str, title: &str, unmatched: bool) -> AlbumSummary {

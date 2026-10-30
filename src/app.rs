@@ -4575,23 +4575,31 @@ impl Omamusic {
                                 |c, on| c.visual_effects = on,
                                 cx,
                             ))
-                            .child(self.pref_switch(
-                                "pref-online-lookup",
-                                "Complete missing tags and covers online",
-                                self.prefs.online_lookup,
-                                |c, on| c.online_lookup = on,
-                                cx,
-                            ))
                             .child(
                                 div()
-                                    .px(rems(0.3125))
-                                    .text_size(rems(0.6875))
-                                    .text_color(theme.secondary)
-                                    .child(
+                                    .flex()
+                                    .items_center()
+                                    .gap(rems(0.5))
+                                    .child(self.pref_switch(
+                                        "pref-online-lookup",
+                                        "Complete missing tags and covers online",
+                                        self.prefs.online_lookup,
+                                        |c, on| c.online_lookup = on,
+                                        cx,
+                                    ))
+                                    .child(with_tooltip(
+                                        div()
+                                            .id("lookup-info-hint")
+                                            .test_support()
+                                            .flex()
+                                            .items_center()
+                                            .text_color(theme.secondary)
+                                            .cursor_pointer()
+                                            .child(icon(IconName::Info).size(rems(0.75))),
                                         "Sends album and artist names to MusicBrainz, Apple and \
                                          Deezer, and audio fingerprints to AcoustID when a key is \
                                          set. Writes covers and missing tags into your music files.",
-                                    ),
+                                    )),
                             )
                             .when(self.prefs.acoustid_key.is_empty(), |d| {
                                 d.child(
