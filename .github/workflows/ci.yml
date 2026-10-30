@@ -47,16 +47,16 @@ jobs:
         with:
           components: clippy
 
-      - uses: jdx/mr-boxington-action@v1
+      - uses: Swatinem/rust-cache@v2
 
       - name: Clippy
-        run: mbx clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
-        run: mbx build --all-targets
+        run: cargo build --all-targets
 
       - name: Test
-        run: mbx test
+        run: cargo test
         env:
           RENDERING_REQUIRED: "1"
 
@@ -69,8 +69,6 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - uses: jdx/mr-boxington-action@v1
-
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -81,12 +79,6 @@ jobs:
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-xcb-dev libxcb1-dev libvulkan-dev mesa-vulkan-drivers \
             flatpak flatpak-builder
-
-      - name: Cache Flatpak runtime
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/share/flatpak
-          key: flatpak-gnome-48-${{ runner.os }}
 
       - name: Add Flathub remote
         run: flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
