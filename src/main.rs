@@ -78,6 +78,7 @@ fn show_window(library: &Arc<Library>, player: &Arc<Player>, cx: &mut App) {
     let opened = cx.open_window(
         WindowOptions {
             titlebar: None,
+            app_id: Some("omamusic".into()),
             window_min_size: Some(size(px(560.), px(420.))),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
