@@ -20,7 +20,6 @@ fn main() {
             let library = Arc::new(Library::new().expect("library"));
             let config = AppConfig::load();
             let player = Arc::new(Player::new(config.volume).expect("player"));
-            desktop::set_cover_icon(!config.plain_tray_icon);
             let (commands, received) = async_channel::unbounded();
             let has_tray = desktop::start(player.clone(), library.clone(), commands);
 

@@ -2,22 +2,17 @@ use crate::library::Library;
 use crate::models::{PlayerState, Track};
 use crate::player::Player;
 use crate::{mpris, tray};
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
 use ksni::blocking::TrayMethods;
 use mpris_server::zbus;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 const BUS_NAME: &str = "org.mpris.MediaPlayer2.omamusic";
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
-
-static COVER_ICON: AtomicBool = AtomicBool::new(true);
-static COVER_ICON_CHANGED: LazyLock<(Sender<()>, Receiver<()>)> =
-    LazyLock::new(|| async_channel::bounded(1));
 
 pub enum Command {
     ToggleWindow,
@@ -37,12 +32,6 @@ pub struct NowPlaying {
     pub track: Option<Track>,
     pub state: PlayerState,
     pub cover: Option<Arc<Cover>>,
-    pub cover_icon: bool,
-}
-
-pub fn set_cover_icon(enabled: bool) {
-    COVER_ICON.store(enabled, Ordering::Relaxed);
-    let _ = COVER_ICON_CHANGED.0.try_send(());
 }
 
 pub fn hash(text: &str) -> u64 {
@@ -126,18 +115,16 @@ async fn sync(
         }
     };
     let changes = player.subscribe();
-    let cover_icon_changes = COVER_ICON_CHANGED.1.clone();
     let mut now = NowPlaying::default();
     let mut position = 0.0;
     let mut checked = Instant::now();
     loop {
         let track = player.current();
         let state = player.state();
-        let cover_icon = COVER_ICON.load(Ordering::Relaxed);
         let track_changed = track.as_ref().map(|t| &t.path) != now.track.as_ref().map(|t| &t.path);
         let album_changed =
             track.as_ref().map(|t| &t.album_id) != now.track.as_ref().map(|t| &t.album_id);
-        let changed = track_changed || state != now.state || cover_icon != now.cover_icon;
+        let changed = track_changed || state != now.state;
 
         let previous = position;
         position = player.position();
@@ -163,7 +150,6 @@ async fn sync(
             }
             now.track = track;
             now.state = state;
-            now.cover_icon = cover_icon;
             if let Some(tray) = &tray {
                 let update = now.clone();
                 tray.update(move |tray| tray.now = update);
@@ -176,7 +162,7 @@ async fn sync(
             }
         }
 
-        let woke = futures_lite::future::or(changes.recv(), cover_icon_changes.recv()).await;
+        let woke = changes.recv().await;
         if woke.is_err() {
             break;
         }

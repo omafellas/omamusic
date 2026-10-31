@@ -2,7 +2,7 @@
 name = "omamusic"
 version = "0.1.0"
 edition = "2021"
-description = "Lightweight music player for Omarchy, port of Overdrive"
+description = "Minimalist local music player optimized for Omarchy Linux written in Rust & GPUI."
 license = "MIT"
 
 [dependencies]

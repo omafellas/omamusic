@@ -41,6 +41,10 @@ pub struct LibrarySnapshot {
     pub track_count: usize,
     pub filter: Option<Filter>,
     pub scanning: bool,
+    /// Bumped every time a scan finishes (transitions from `scanning=true` to
+    /// `scanning=false`). Lets the UI notice a completed scan even if both
+    /// edges happen between two view polls.
+    pub scan_id: u64,
     pub query: String,
     pub version: u64,
     pub lookup_pending: usize,
@@ -130,7 +134,10 @@ impl Library {
                     }
                     Err(err) => eprintln!("scan library: {err:#}"),
                 }
-                update(&thread_state, |s| s.scanning = false);
+                update(&thread_state, |s| {
+                    s.scanning = false;
+                    s.scan_id += 1;
+                });
                 let _ = thread_lookup.send(Wake::ScanFinished);
 
                 if rx.recv().is_err() {
@@ -379,6 +386,18 @@ impl Library {
 
     pub fn request_rescan(&self) {
         let _ = self.rescan_tx.send(());
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Simulate a scan completion on `Library::empty` (which has no scanner
+    /// thread) by bumping `scan_id` and `version`. Tests use this to assert the
+    /// UI reacts to scan completion.
+    pub fn finish_scan_for_test(&self, albums: usize, tracks: usize) {
+        update(&self.state, |s| {
+            s.album_count = albums;
+            s.track_count = tracks;
+            s.scan_id += 1;
+        });
     }
 
     #[cfg(any(test, feature = "test-support"))]

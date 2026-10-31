@@ -32,6 +32,7 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,7 +60,9 @@ pub struct Omamusic {
     cover_poll: CoverPoll,
     /// Bumped on every navigation so the content area fades in afresh.
     nav_seq: u64,
-    prev_scanning: bool,
+    /// Last `scan_id` observed from the library. When this changes, a scan
+    /// finished and the UI shows a completion toast.
+    last_scan_id: u64,
     /// Music-reactive bottom strip; see `Visualizer`.
     visualizer: Entity<Visualizer>,
     /// Latest text typed into the search field, applied after the debounce.
@@ -156,6 +159,7 @@ enum RowAction {
     GoToArtist,
     Remove,
     ExportFile,
+    OpenContainingFolder,
     AddToPlaylistMenu,
     AddToPlaylist(u64),
     NewPlaylistWith,
@@ -170,6 +174,7 @@ const TRACK_ACTIONS: &[RowAction] = &[
     RowAction::GoToAlbum,
     RowAction::GoToArtist,
     RowAction::ExportFile,
+    RowAction::OpenContainingFolder,
 ];
 const PLAYLIST_TRACK_ACTIONS: &[RowAction] = &[
     RowAction::Play,
@@ -180,6 +185,7 @@ const PLAYLIST_TRACK_ACTIONS: &[RowAction] = &[
     RowAction::GoToArtist,
     RowAction::RemoveFromPlaylist,
     RowAction::ExportFile,
+    RowAction::OpenContainingFolder,
 ];
 const QUEUE_ACTIONS: &[RowAction] = &[
     RowAction::Play,
@@ -282,7 +288,7 @@ impl RowAction {
             | RowAction::NewPlaylistWith => 0,
             RowAction::GoToAlbum | RowAction::GoToArtist => 1,
             RowAction::Remove | RowAction::RemoveFromPlaylist => 2,
-            RowAction::ExportFile => 3,
+            RowAction::ExportFile | RowAction::OpenContainingFolder => 3,
         }
     }
 
@@ -295,6 +301,7 @@ impl RowAction {
             RowAction::GoToArtist => ("Go to Artist", IconName::Mic),
             RowAction::Remove => ("Remove from Queue", IconName::ListX),
             RowAction::ExportFile => ("Export File…", IconName::Download),
+            RowAction::OpenContainingFolder => ("Open Containing Folder", IconName::FolderOpen),
             RowAction::AddToPlaylistMenu | RowAction::AddToPlaylist(_) => {
                 ("Add to Playlist", IconName::ListPlus)
             }
@@ -547,6 +554,23 @@ fn library_counts_text(albums: usize, tracks: usize) -> String {
     format!("{} songs · {} albums", tracks, albums)
 }
 
+/// Open `url` in the user's default browser.
+fn open_url(url: &str) {
+    let _ = Command::new("xdg-open").arg(url).spawn();
+}
+
+/// A settings section heading, visually separated from the controls around it.
+fn section_header(label: &'static str, cx: &App) -> impl IntoElement {
+    div()
+        .flex()
+        .px(rems(0.3125))
+        .pt(rems(0.5))
+        .text_size(rems(0.625))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(cx.omarchy().secondary)
+        .child(label)
+}
+
 /// Equalizer bar shape over one animation cycle, 0.0..=1.0. The two mixed
 /// sine waves use whole cycles per animation loop, so repeating never jumps.
 fn visualizer_shape(bar: usize, delta: f32) -> f32 {
@@ -703,6 +727,19 @@ impl Omamusic {
         })
         .detach();
 
+        // Pressing Enter in the folder path field adds the typed path (after a
+        // paste, say), mirroring the "Add" button.
+        cx.subscribe(&new_folder, |this, _, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                let path = this.new_folder.read(cx).text().to_string();
+                if !path.is_empty() {
+                    this.library.add_folder(PathBuf::from(path));
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
+
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
@@ -745,6 +782,8 @@ impl Omamusic {
             _ => (Section::Songs, Vec::new(), false),
         };
 
+        let initial_scan_id = library.snapshot().scan_id;
+
         Self {
             library,
             player,
@@ -764,7 +803,7 @@ impl Omamusic {
             notify_seq: 0,
             cover_poll: CoverPoll::default(),
             nav_seq: 0,
-            prev_scanning: false,
+            last_scan_id: initial_scan_id,
             visualizer,
             pending_query: String::new(),
             search_task: None,
@@ -871,16 +910,21 @@ impl Omamusic {
             self.clear_selection();
         }
 
-        // Detect scan completion: scanning went from true to false
+        // Detect scan completion by a scan_id change. Both `scanning=true`
+        // and `scanning=false` bumps can happen between two polls on a fast
+        // rescan; `scan_id` is monotonic so it's never missed.
         let snap = self.library.snapshot();
-        let scanning_now = snap.scanning;
-        let notify_msg = if self.prev_scanning && !scanning_now {
-            Some(library_counts_text(snap.album_count, snap.track_count))
+        let scan_done = snap.scan_id != self.last_scan_id;
+        self.last_scan_id = snap.scan_id;
+        let notify_msg = if scan_done {
+            Some(format!(
+                "Library rescanned — {}",
+                library_counts_text(snap.album_count, snap.track_count)
+            ))
         } else {
             None
         };
         drop(snap);
-        self.prev_scanning = scanning_now;
         if let Some(msg) = notify_msg {
             self.show_notify(msg, cx);
         }
@@ -1193,6 +1237,16 @@ impl Omamusic {
                     .detach();
                 }
             }
+            RowAction::OpenContainingFolder => {
+                if let Some(track) = tracks.first() {
+                    let path = track.path.clone();
+                    cx.spawn(async move |_, _cx| {
+                        let parent = path.parent().unwrap_or(std::path::Path::new("."));
+                        let _ = Command::new("xdg-open").arg(parent).spawn();
+                    })
+                    .detach();
+                }
+            }
         }
         cx.notify();
     }
@@ -1225,6 +1279,7 @@ impl Omamusic {
             | RowAction::GoToArtist
             | RowAction::Remove
             | RowAction::ExportFile
+            | RowAction::OpenContainingFolder
             | RowAction::AddToPlaylistMenu
             | RowAction::RemoveFromPlaylist => {}
         }
@@ -1462,6 +1517,11 @@ impl Omamusic {
         self.query.read(cx).text().to_string()
     }
 
+    /// Text of the visible scan-completion toast, if any. For smoke tests.
+    pub fn notify_text(&self) -> Option<String> {
+        self.rescan_notify.as_ref().map(|(msg, _)| msg.clone())
+    }
+
     /// Take focus back when nothing in the window has it, so shortcuts keep working.
     fn reclaim_focus(&self, window: &mut Window, cx: &mut App) {
         if window.focused(cx).is_none() {
@@ -1520,13 +1580,8 @@ impl Omamusic {
         let this = cx.entity().downgrade();
         switch(id, label, checked, cx).on_change(move |on, _, _, cx| {
             let _ = this.update(cx, |this, cx| {
-                let lookup_before = this.prefs.online_lookup;
                 change(&mut this.prefs, on);
                 AppConfig::update(|c| change(c, on));
-                crate::desktop::set_cover_icon(!this.prefs.plain_tray_icon);
-                if this.prefs.online_lookup != lookup_before {
-                    this.library.set_online_lookup(this.prefs.online_lookup);
-                }
                 cx.notify();
             });
         })
@@ -1873,11 +1928,6 @@ impl Omamusic {
                     .into_any_element(),
             );
         }
-        let status = if snap.scanning {
-            "Scanning…"
-        } else {
-            "Up to date"
-        };
         div()
             .flex()
             .flex_col()
@@ -1944,14 +1994,7 @@ impl Omamusic {
                         .border_color(theme.border)
                         .text_size(rems(0.6875))
                         .text_color(theme.secondary)
-                        .child(library_counts_text(snap.album_count, snap.track_count))
-                        .child(
-                            div()
-                                .id("library-status")
-                                .test_support()
-                                .aria_label(status)
-                                .child(status),
-                        ),
+                        .child(library_counts_text(snap.album_count, snap.track_count)),
                 )
             })
             .into_any_element()
@@ -4488,7 +4531,18 @@ impl Omamusic {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.omarchy().clone();
-        // Overlay backdrop
+        let version = env!("CARGO_PKG_VERSION");
+        let folder_text = self.new_folder.read(cx).text().to_string();
+        let has_folder_text = !folder_text.trim().is_empty();
+        let config_path = AppConfig::path().to_string_lossy().to_string();
+        let title_text: SharedString = format!("Settings ({config_path})").into();
+
+        // Backdrop: full-window overlay. `on_mouse_down` + `on_scroll_wheel`
+        // consume clicks and wheel events so the window behind cannot be
+        // clicked through or scrolled while the settings panel is open.
+        // Scrolling *inside* the panel still works: the panel is the deepest
+        // hitbox under the pointer and its `overflow_y_scroll` handles the
+        // wheel before the event ever reaches the backdrop.
         div()
             .absolute()
             .size_full()
@@ -4497,10 +4551,23 @@ impl Omamusic {
             .items_center()
             .justify_center()
             .p(rems(1.))
+            .on_scroll_wheel(|_, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_down(MouseButton::Middle, |_, _, cx| {
+                cx.stop_propagation();
+            })
             .child(
                 div()
                     .id("settings-panel")
-                    .w(rems(32.))
+                    .w(rems(34.))
                     .max_h_full()
                     .overflow_y_scroll()
                     .flex()
@@ -4523,9 +4590,10 @@ impl Omamusic {
                                 div()
                                     .id("settings-title")
                                     .test_support()
+                                    .aria_label(title_text.clone())
                                     .text_size(rems(0.875))
                                     .font_weight(FontWeight::BOLD)
-                                    .child("Settings"),
+                                    .child(title_text),
                             )
                             .child(
                                 icon_button(
@@ -4535,91 +4603,103 @@ impl Omamusic {
                                     ButtonVariant::Secondary,
                                     cx,
                                 )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_settings = false;
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.show_settings = false;
+                                        cx.notify();
+                                    },
+                                )),
                             ),
                     )
                     .child(separator(cx))
+                    // --- Interface ---
+                    .child(section_header("Interface", cx))
+                    .child(self.pref_switch(
+                        "pref-visual-effects",
+                        "Visual Effects",
+                        self.prefs.visual_effects,
+                        |c, on| c.visual_effects = on,
+                        cx,
+                    ))
+                    .child(self.text_size_row(cx))
+                    .child(separator(cx))
+                    // --- Behavior ---
+                    .child(section_header("Behavior", cx))
+                    .child(self.pref_switch(
+                        "pref-close-to-tray",
+                        "Close window to tray",
+                        !self.prefs.quit_on_close,
+                        |c, on| c.quit_on_close = !on,
+                        cx,
+                    ))
+                    .child(self.pref_switch(
+                        "pref-start-hidden",
+                        "Start hidden in tray",
+                        self.prefs.start_hidden,
+                        |c, on| c.start_hidden = on,
+                        cx,
+                    ))
+                    // --- Online lookup ---
+                    .child(section_header("Online lookup", cx))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .gap(rems(0.25))
-                            .child(self.pref_switch(
-                                "pref-close-to-tray",
-                                "Close window to tray",
-                                !self.prefs.quit_on_close,
-                                |c, on| c.quit_on_close = !on,
-                                cx,
-                            ))
-                            .child(self.pref_switch(
-                                "pref-tray-cover",
-                                "Use album cover as tray icon",
-                                !self.prefs.plain_tray_icon,
-                                |c, on| c.plain_tray_icon = !on,
-                                cx,
-                            ))
-                            .child(self.pref_switch(
-                                "pref-start-hidden",
-                                "Start hidden in tray",
-                                self.prefs.start_hidden,
-                                |c, on| c.start_hidden = on,
-                                cx,
-                            ))
-                            .child(self.pref_switch(
-                                "pref-visual-effects",
-                                "Visual Effects",
-                                self.prefs.visual_effects,
-                                |c, on| c.visual_effects = on,
-                                cx,
-                            ))
-                            .child(
+                            .items_center()
+                            .gap(rems(0.5))
+                            .child({
+                                let entity = cx.entity().downgrade();
+                                switch(
+                                    "pref-online-lookup",
+                                    "Complete missing tags and covers online",
+                                    self.prefs.online_lookup,
+                                    cx,
+                                )
+                                .on_change(move |on, _, _, cx| {
+                                    let _ = entity.update(cx, |this, cx| {
+                                        let lookup_before = this.prefs.online_lookup;
+                                        this.prefs.online_lookup = on;
+                                        AppConfig::update(|c| c.online_lookup = on);
+                                        if this.prefs.online_lookup != lookup_before {
+                                            this.library
+                                                .set_online_lookup(this.prefs.online_lookup);
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                            })
+                            .child(with_tooltip(
                                 div()
+                                    .id("lookup-info-hint")
+                                    .test_support()
                                     .flex()
                                     .items_center()
-                                    .gap(rems(0.5))
-                                    .child(self.pref_switch(
-                                        "pref-online-lookup",
-                                        "Complete missing tags and covers online",
-                                        self.prefs.online_lookup,
-                                        |c, on| c.online_lookup = on,
-                                        cx,
-                                    ))
-                                    .child(with_tooltip(
-                                        div()
-                                            .id("lookup-info-hint")
-                                            .test_support()
-                                            .flex()
-                                            .items_center()
-                                            .text_color(theme.secondary)
-                                            .cursor_pointer()
-                                            .child(icon(IconName::Info).size(rems(0.75))),
-                                        "Sends album and artist names to MusicBrainz, Apple and \
-                                         Deezer, and audio fingerprints to AcoustID when a key is \
-                                         set. Writes covers and missing tags into your music files.",
-                                    )),
-                            )
-                            .when(self.prefs.acoustid_key.is_empty(), |d| {
-                                d.child(
-                                    div()
-                                        .id("lookup-acoustid-hint")
-                                        .test_support()
-                                        .px(rems(0.3125))
-                                        .text_size(rems(0.6875))
-                                        .text_color(theme.secondary)
-                                        .child(
-                                            "Untagged files can also be identified by sound: get a \
-                                             free AcoustID application key, put it in config.json \
-                                             as \"acoustid_key\" and restart.",
-                                        ),
-                                )
-                            })
-                            .children(self.lookup_status(snap, cx))
-                            .child(self.text_size_row(cx)),
+                                    .text_color(theme.secondary)
+                                    .cursor_pointer()
+                                    .child(icon(IconName::Info).size(rems(0.75))),
+                                "Sends album and artist names to MusicBrainz, Apple and \
+                                 Deezer, and audio fingerprints to AcoustID when a key is \
+                                 set. Writes covers and missing tags into your music files.",
+                            )),
                     )
+                    .when(self.prefs.acoustid_key.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .id("lookup-acoustid-hint")
+                                .test_support()
+                                .px(rems(0.3125))
+                                .text_size(rems(0.6875))
+                                .text_color(theme.secondary)
+                                .child(
+                                    "Untagged files can also be identified by sound: get a \
+                                     free AcoustID application key, put it in config.json \
+                                     as \"acoustid_key\" and restart.",
+                                ),
+                        )
+                    })
+                    .children(self.lookup_status(snap, cx))
                     .child(separator(cx))
+                    // --- Folder directories ---
+                    .child(section_header("Folder directories", cx))
                     .child(div().flex().flex_col().gap(rems(0.5)).children(
                         snap.folders.iter().map(|f| {
                             let p = f.clone();
@@ -4653,19 +4733,42 @@ impl Omamusic {
                                 cx,
                             )))
                             .child(
-                                button("browse-folder", "Browse…", ButtonVariant::Secondary, cx)
-                                    .on_click(cx.listener(|this, _, _, cx| this.browse_folder(cx))),
+                                button(
+                                    "browse-folder",
+                                    if has_folder_text { "Add" } else { "Browse…" },
+                                    ButtonVariant::Secondary,
+                                    cx,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.browse_folder(cx))),
                             ),
                     )
+                    .child(separator(cx))
+                    // --- About ---
+                    .child(section_header("About", cx))
                     .child(
-                        button("add-folder", "Add ~/Music", ButtonVariant::Primary, cx).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(music) = dirs::audio_dir() {
-                                    this.library.add_folder(music);
-                                }
-                                cx.notify();
-                            }),
-                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(rems(0.5))
+                            .text_size(rems(0.6875))
+                            .text_color(theme.secondary)
+                            .child("Version ")
+                            .child(
+                                div()
+                                    .id("settings-version")
+                                    .test_support()
+                                    .text_color(theme.foreground)
+                                    .child(version),
+                            )
+                            .child(with_tooltip(
+                                button("github", "GitHub", ButtonVariant::Secondary, cx).on_click(
+                                    cx.listener(|_, _, _, cx| {
+                                        open_url("https://github.com/omafellas/omamusic");
+                                        cx.notify();
+                                    }),
+                                ),
+                                "Open omafellas/omamusic on GitHub",
+                            )),
                     )
                     .child(
                         button("close-settings", "Close", ButtonVariant::Secondary, cx).on_click(

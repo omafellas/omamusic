@@ -14,7 +14,6 @@ pub struct AppConfig {
     pub folders: Vec<PathBuf>,
     pub volume: f64,
     pub quit_on_close: bool,
-    pub plain_tray_icon: bool,
     pub start_hidden: bool,
     pub tray_hint_shown: bool,
     /// UI scale factor applied to the base rem size. 1.0 is the default.
@@ -39,7 +38,6 @@ impl Default for AppConfig {
             folders: Vec::new(),
             volume: 1.0,
             quit_on_close: false,
-            plain_tray_icon: false,
             start_hidden: false,
             tray_hint_shown: false,
             ui_scale: 1.0,

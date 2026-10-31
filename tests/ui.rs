@@ -343,6 +343,77 @@ async fn settings_close_button_is_aligned_with_title(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn settings_shows_version_and_github_link(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    app.click("settings");
+    assert!(
+        app.has("settings-version"),
+        "settings shows the app version element"
+    );
+    assert!(app.has("github"), "settings links to GitHub");
+    // The title names the file the settings live in.
+    let title = app.label("settings-title").unwrap_or_default();
+    assert!(
+        title.starts_with("Settings (") && title.ends_with(')'),
+        "the title includes the config path, got {title:?}"
+    );
+    assert!(
+        title.contains("config.json"),
+        "the title names the config file, got {title:?}"
+    );
+}
+
+#[gpui_kit::test]
+async fn settings_folder_button_toggles_add_and_browse(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    app.click("settings");
+
+    // With an empty field the button is "Browse…" (opens the folder picker).
+    assert_eq!(
+        app.label("browse-folder").as_deref(),
+        Some("Browse…"),
+        "empty folder field shows Browse"
+    );
+
+    // Typing a path switches the button to "Add".
+    app.click_on("new-folder");
+    app.typing("/tmp/omamusic-settings-test-folder");
+    assert_eq!(
+        app.label("browse-folder").as_deref(),
+        Some("Add"),
+        "non-empty folder field shows Add"
+    );
+}
+
+#[gpui_kit::test]
+async fn rescan_completion_shows_a_toast(cx: &mut TestAppContext) {
+    let library = Arc::new(Library::empty());
+    let mut app = open_with(cx, library.clone());
+    app.click("rescan");
+    assert!(
+        app.view
+            .read_with(app.cx, |view, _| view.notify_text().is_none()),
+        "rescan click alone does not show the toast"
+    );
+
+    // The scan finished (bumps scan_id and version).
+    library.finish_scan_for_test(3, 12);
+    app.cx.executor().advance_clock(Duration::from_millis(600));
+    app.cx.run_until_parked();
+
+    let text = app
+        .view
+        .read_with(app.cx, |view, _| view.notify_text())
+        .expect("a toast is shown when a scan completes");
+    assert!(
+        text.contains("Library rescanned")
+            && text.contains("12 songs")
+            && text.contains("3 albums"),
+        "toast describes the completed scan, got {text:?}"
+    );
+}
+
+#[gpui_kit::test]
 async fn online_lookup_switch_persists_to_config(cx: &mut TestAppContext) {
     let mut app = open(cx);
     app.click("settings");
@@ -814,7 +885,10 @@ async fn sidebar_sections_show_their_title_and_counts(cx: &mut TestAppContext) {
         Some("Play Bravo")
     );
     assert!(!app.has(("song-play", 2usize)), "only the genre's songs");
-    assert_eq!(app.label("library-status").as_deref(), Some("Up to date"));
+    assert!(
+        !app.has("library-status"),
+        "the up-to-date status line is removed"
+    );
 }
 
 #[gpui_kit::test]

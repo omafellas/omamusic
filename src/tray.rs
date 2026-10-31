@@ -106,15 +106,6 @@ impl Tray {
     fn send(&self, command: Command) {
         let _ = self.commands.send_blocking(command);
     }
-
-    fn cover_icon(&self) -> Option<&Icon> {
-        let cover = self.now.cover.as_ref().filter(|_| self.now.cover_icon)?;
-        Some(if self.now.state == PlayerState::Paused {
-            &cover.dimmed
-        } else {
-            &cover.icon
-        })
-    }
 }
 
 fn item(label: &str, icon: &[u8], activate: impl Fn(&mut Tray) + Send + 'static) -> MenuItem<Tray> {
@@ -137,11 +128,7 @@ impl ksni::Tray for Tray {
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
-        self.cover_icon()
-            .or(self.icons.idle.as_ref())
-            .cloned()
-            .into_iter()
-            .collect()
+        self.icons.idle.as_ref().cloned().into_iter().collect()
     }
 
     fn menu_about_to_show(&mut self) {

@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (defaults to the version in Cargo.toml)"
+        required: false
+      tag:
+        description: "Git tag to create (defaults to v<version>)"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  version:
+    name: Read version from Cargo.toml
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            # Parse the `version = "..."` line under [package] only.
+            VERSION=$(awk '
+              /^\[package\]/   { in_package = 1; next }
+              /^\[[^]]+\]/     { in_package = 0 }
+              in_package && /^version[[:space:]]*=/ {
+                gsub(/^version[[:space:]]*=[[:space:]]*"|".*$/, "")
+                print; exit
+              }
+            ' Cargo.toml)
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "error: could not determine version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="v${{ steps.version.outputs.version }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Linux ${{ matrix.label }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x86-64
+            runner: ubuntu-latest
+            arch: x86_64-unknown-linux-gnu
+          - label: ARM64
+            runner: ubuntu-24.04-arm
+            arch: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang ffmpeg \
+            libasound2-dev libpulse-dev libdbus-1-dev \
+            libfontconfig-dev libfreetype-dev libssl-dev libzstd-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libvulkan-dev mesa-vulkan-drivers
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package binary
+        run: |
+          VERSION=${{ needs.version.outputs.version }}
+          NAME="omamusic-${VERSION}-${{ matrix.arch }}"
+          install -m755 target/release/omamusic "$NAME"
+          echo "ARTIFACT=$NAME" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ env.ARTIFACT }}
+
+  build-flatpak:
+    name: Build Flatpak bundle
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: jdx/mr-boxington-action@v1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang ffmpeg \
+            libasound2-dev libpulse-dev libdbus-1-dev \
+            libfontconfig-dev libfreetype-dev libssl-dev libzstd-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libvulkan-dev mesa-vulkan-drivers \
+            flatpak flatpak-builder
+
+      - name: Cache Flatpak runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/flatpak
+          key: flatpak-gnome-48-${{ runner.os }}
+
+      - name: Add Flathub remote
+        run: flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Install GNOME Platform and SDK 48
+        run: |
+          flatpak install -y --user flathub org.gnome.Platform//48 org.gnome.Sdk//48
+
+      - name: Build flatpak bundle
+        run: ./flatpak/build.sh
+
+      - name: Verify bundle produced
+        run: test -f io.github.omafellas.omamusic.flatpak
+
+      - name: Rename with version
+        run: |
+          VERSION=${{ needs.version.outputs.version }}
+          mv io.github.omafellas.omamusic.flatpak "omamusic-${VERSION}-x86_64.flatpak"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omamusic-${{ needs.version.outputs.version }}-x86_64.flatpak
+          path: omamusic-${{ needs.version.outputs.version }}-x86_64.flatpak
+
+  create-release:
+    name: Create GitHub release
+    needs: [version, build, build-flatpak]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release assets
+        run: |
+          ls -la release-assets
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -ge 3
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "omamusic ${VERSION}" \
+              --notes "omamusic release ${VERSION}. Pre-compiled binaries for Linux x86-64 and Linux ARM64, plus a Flatpak bundle."
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" \
+              --title "omamusic ${VERSION}" \
+              --notes "omamusic release ${VERSION}. Pre-compiled binaries for Linux x86-64 and Linux ARM64, plus a Flatpak bundle." \
+              release-assets/*
+          fi
