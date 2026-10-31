@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufReader;
 use std::num::NonZero;
+use std::path::PathBuf;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -33,7 +34,12 @@ struct Playback {
     repeat: RepeatMode,
     duration: f64,
     current: Option<Track>,
+    /// Whether the current song already counted as played.
+    counted: bool,
 }
+
+/// Share of a song that must play before it counts as a play.
+const PLAYED_SHARE: f64 = 0.8;
 
 #[derive(Default)]
 struct AudioBuffer {
@@ -90,6 +96,8 @@ struct Shared {
     /// The latest mono output samples for the spectrum, written by the audio
     /// callback whenever the lock is free.
     recent: Mutex<Recent>,
+    /// Songs that crossed [`PLAYED_SHARE`] and await the library's counter.
+    played: Mutex<Vec<PathBuf>>,
     pending: AtomicUsize,
     loaded: Mutex<Option<Track>>,
     channels: usize,
@@ -151,7 +159,35 @@ fn select(playback: &mut Playback, index: usize) -> Option<Track> {
     playback.duration = track.duration;
     playback.current = Some(track.clone());
     playback.state = PlayerState::Playing;
+    playback.counted = false;
     Some(track)
+}
+
+/// Mark the current song as played once enough of it has been heard, or at
+/// its end when the length is unknown. Returns true the moment it counts, so
+/// the caller can tell listeners to pick it up via [`Player::take_played`].
+fn note_played(shared: &Shared, position: f64, finished: bool) -> bool {
+    let mut playback = shared.playback.lock();
+    let Some(path) = playback.current.as_ref().map(|t| t.path.clone()) else {
+        return false;
+    };
+    let enough = if playback.duration > 0.0 {
+        position >= playback.duration * PLAYED_SHARE
+    } else {
+        finished
+    };
+    if playback.counted || !enough {
+        return false;
+    }
+    playback.counted = true;
+    shared.played.lock().push(path);
+    true
+}
+
+fn position_of(shared: &Shared) -> f64 {
+    let audio = shared.audio.lock();
+    audio.base_position
+        + audio.played_samples as f64 / (shared.sample_rate as f64 * shared.channels as f64)
 }
 
 fn insert(playback: &mut Playback, tracks: Vec<Track>, next: bool) {
@@ -354,6 +390,9 @@ fn run_decoder(shared: Arc<Shared>, commands: Receiver<Command>) {
 
         if let Some(active) = source.as_mut() {
             let buffered = shared.audio.lock().samples.len();
+            if note_played(&shared, position_of(&shared), end_of_file && buffered == 0) {
+                shared.changed();
+            }
             if !end_of_file && buffered < shared.sample_rate as usize * shared.channels {
                 let mut block = Vec::with_capacity(4096);
                 for _ in 0..4096 {
@@ -487,6 +526,7 @@ impl Player {
             listeners: Mutex::new(Vec::new()),
             level: AtomicU32::new(0),
             recent: Mutex::new(Recent::default()),
+            played: Mutex::new(Vec::new()),
             channels: channels as usize,
             sample_rate,
         });
@@ -658,6 +698,7 @@ impl Player {
     pub fn seek(&self, secs: f64) {
         if self.current().is_some() && secs.is_finite() {
             let secs = secs.max(0.0);
+            self.shared.changed();
             self.send(Command::Seek(secs));
         }
     }
@@ -751,10 +792,12 @@ impl Player {
         self.shared.playback.lock().state
     }
     pub fn position(&self) -> f64 {
-        let audio = self.shared.audio.lock();
-        audio.base_position
-            + audio.played_samples as f64
-                / (self.shared.sample_rate as f64 * self.shared.channels as f64)
+        position_of(&self.shared)
+    }
+
+    /// Songs that counted as played since the last call, in play order.
+    pub fn take_played(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.shared.played.lock())
     }
     pub fn duration(&self) -> f64 {
         self.shared.playback.lock().duration
@@ -838,6 +881,7 @@ mod tests {
             duration: 0.0,
             album_id: String::new(),
             genre: String::new(),
+            plays: 0,
         }
     }
 
@@ -989,6 +1033,46 @@ mod tests {
             "the ring never saw the square wave"
         );
         assert_eq!(player.recent_samples(&mut out), 48_000);
+        drop(player);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_song_counts_as_played_past_eighty_percent() {
+        let base = std::env::temp_dir().join(format!("omamusic-played-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let quiet = base.join("quiet.wav");
+        write_wav(&quiet, |_| 0);
+        let player = Player::new_test();
+        let mut song = track(quiet.clone());
+        song.duration = 1.0;
+        player.play(vec![song], 0);
+        assert!(
+            wait_for(|| player.position() > 0.3),
+            "the song did not start"
+        );
+        assert!(
+            player.take_played().is_empty(),
+            "a third of a song is not a play"
+        );
+        player.seek(0.9);
+        let mut played = Vec::new();
+        assert!(
+            wait_for(|| {
+                played.extend(player.take_played());
+                !played.is_empty()
+            }),
+            "crossing 80% did not count"
+        );
+        assert_eq!(played, vec![quiet.clone()]);
+        assert!(player.take_played().is_empty(), "a play is reported once");
+        player.seek(0.1);
+        player.seek(0.95);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            player.take_played().is_empty(),
+            "seeking back and forth does not count the same song twice"
+        );
         drop(player);
         std::fs::remove_dir_all(&base).unwrap();
     }

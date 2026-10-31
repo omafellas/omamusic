@@ -15,6 +15,9 @@ pub struct Track {
     pub album_id: String,
     #[serde(default)]
     pub genre: String,
+    /// Times the song played past 80% of its length.
+    #[serde(default)]
+    pub plays: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +128,7 @@ pub enum SongColumn {
     Title,
     Artist,
     Genre,
+    Plays,
     Time,
     Added,
 }
@@ -151,7 +155,7 @@ impl SongSort {
         } else {
             Self {
                 column,
-                descending: column == SongColumn::Added,
+                descending: matches!(column, SongColumn::Added | SongColumn::Plays),
             }
         }
     }
@@ -241,6 +245,10 @@ mod tests {
                 .descending
         );
         assert_eq!(sort.toggled(SongColumn::Added), SongSort::RECENT);
+        assert!(
+            sort.toggled(SongColumn::Plays).descending,
+            "most played comes first"
+        );
     }
 
     #[test]

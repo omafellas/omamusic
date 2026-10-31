@@ -219,11 +219,12 @@ const SIDEBAR_COMPACT_REMS: f32 = 3.25;
 const SEARCH_KEYCAPS_REMS: f32 = 44.;
 const SEARCH_FOLD_REMS: f32 = 30.;
 const QUEUE_REMS: f32 = 17.5;
-const SONG_COLUMNS: [(SongColumn, &str); 5] = [
+const SONG_COLUMNS: [(SongColumn, &str); 6] = [
     (SongColumn::Title, "Title"),
     (SongColumn::Artist, "Artist"),
     (SongColumn::Album, "Album"),
     (SongColumn::Genre, "Genre"),
+    (SongColumn::Plays, "Plays"),
     (SongColumn::Time, "Time"),
 ];
 
@@ -533,6 +534,24 @@ fn format_minutes(secs: f64) -> String {
         format!("{} hr {} min", minutes / 60, minutes % 60)
     } else {
         format!("{minutes} min")
+    }
+}
+
+/// Play count for a list cell: blank until the song has been heard once.
+fn plays_cell(plays: u32) -> String {
+    if plays == 0 {
+        String::new()
+    } else {
+        thousands(plays as usize)
+    }
+}
+
+/// Play count as a phrase, for accessibility labels and the player bar.
+pub fn plays_label(plays: u32) -> String {
+    match plays {
+        0 => "Not played yet".into(),
+        1 => "1 play".into(),
+        n => format!("{} plays", thousands(n as usize)),
     }
 }
 
@@ -1046,6 +1065,13 @@ impl Omamusic {
     }
 
     fn tick(&mut self, force: bool, cx: &mut Context<Self>) {
+        let played = self.player.take_played();
+        for path in &played {
+            self.library.record_play(path);
+        }
+        if !played.is_empty() {
+            cx.notify();
+        }
         let version = self.library.version();
         if !force && version == self.lib_version {
             return;
@@ -2906,7 +2932,10 @@ impl Omamusic {
                     } else {
                         theme.secondary
                     })
-                    .when(column == SongColumn::Time, |d| d.justify_end())
+                    .when(
+                        matches!(column, SongColumn::Time | SongColumn::Plays),
+                        |d| d.justify_end(),
+                    )
                     .child(div().min_w_0().truncate().child(label.to_uppercase()))
                     .when(active, |d| {
                         d.child(
@@ -3039,7 +3068,10 @@ impl Omamusic {
                 .truncate()
                 .text_size(rems(0.6875))
                 .text_color(muted)
-                .when(column == SongColumn::Time, |d| d.text_right())
+                .when(
+                    matches!(column, SongColumn::Time | SongColumn::Plays),
+                    |d| d.text_right(),
+                )
                 .child(text)
         };
         let content = div()
@@ -3108,6 +3140,12 @@ impl Omamusic {
             .child(text_cell(SongColumn::Genre, t.genre.clone()))
             .child(heart)
             .child(div().w(rems(1.5)).flex_shrink_0().child(more))
+            .child(
+                text_cell(SongColumn::Plays, plays_cell(t.plays))
+                    .id(("song-plays", i))
+                    .test_support()
+                    .aria_label(plays_label(t.plays)),
+            )
             .child(text_cell(SongColumn::Time, format_time(t.duration)));
         let role = RowRole {
             queue: false,
@@ -3150,7 +3188,9 @@ fn song_cell(column: SongColumn, cell: Div) -> Div {
             cell.flex_1().max_w(rems(SECONDARY_MAX_W)).min_w_0()
         }
         SongColumn::Genre => cell.flex_1().max_w(rems(7.)).min_w_0(),
-        SongColumn::Time | SongColumn::Added => cell.w(rems(3.)).flex_shrink_0(),
+        SongColumn::Time | SongColumn::Plays | SongColumn::Added => {
+            cell.w(rems(3.)).flex_shrink_0()
+        }
     }
 }
 
@@ -5256,6 +5296,17 @@ mod tests {
         assert_eq!(visualizer_columns(16.0, 4.0, 2.0), 3);
         assert_eq!(visualizer_columns(600.0, 4.0, 2.0), 100);
         assert!(visualizer_columns(600.0, 8.0, 4.0) < visualizer_columns(600.0, 4.0, 2.0));
+    }
+
+    #[test]
+    fn play_counts_read_blank_until_heard_then_as_a_phrase() {
+        assert_eq!(plays_cell(0), "");
+        assert_eq!(plays_cell(1), "1");
+        assert_eq!(plays_cell(1234), "1,234");
+        assert_eq!(plays_label(0), "Not played yet");
+        assert_eq!(plays_label(1), "1 play");
+        assert_eq!(plays_label(2), "2 plays");
+        assert_eq!(plays_label(1000), "1,000 plays");
     }
 
     #[test]

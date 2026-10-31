@@ -192,6 +192,11 @@ fn open(cx: &mut TestAppContext) -> Smoke<'_> {
 
 fn open_with(cx: &mut TestAppContext, library: Arc<Library>) -> Smoke<'_> {
     let config_dir = isolated_config_dir();
+    // The player decodes and paces audio on real threads, and those wake the
+    // view's subscription when a song ends or seeks. GPUI's test scheduler
+    // treats a wake from another thread as nondeterminism unless parking is
+    // allowed, so allow it: the tests wait on real time for the player anyway.
+    cx.executor().allow_parking();
     let player = Arc::new(Player::new_test());
     cx.update(|cx| {
         gpui_omarchy::init(cx);
@@ -843,6 +848,7 @@ fn song(title: &str, artist: &str, album: &str, genre: &str) -> Track {
         duration: 200.0,
         album_id: format!("{album}-key"),
         genre: genre.to_string(),
+        plays: 0,
     }
 }
 
@@ -1178,6 +1184,7 @@ async fn the_bar_heart_likes_the_playing_song(cx: &mut TestAppContext) {
             duration: 1.0,
             album_id: "afterglow".into(),
             genre: "Synth-pop".into(),
+            plays: 0,
         },
         1,
     );
@@ -1194,6 +1201,146 @@ async fn the_bar_heart_likes_the_playing_song(cx: &mut TestAppContext) {
     );
     app.click_on("like");
     assert_eq!(app.liked_file(), serde_json::json!([]));
+}
+
+#[gpui_kit::test]
+async fn a_song_played_past_eighty_percent_counts_in_the_list_and_the_bar(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "omamusic-plays-{}-{}",
+        std::process::id(),
+        NEXT_CONFIG_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Low Tide.wav");
+    silent_wav_lasting(&path, 30);
+    let library = Arc::new(Library::empty());
+    library.insert_song(
+        &Track {
+            path: path.clone(),
+            title: "Low Tide".into(),
+            artist: "Neon Harbor".into(),
+            album: "Afterglow".into(),
+            track_number: 1,
+            year: 2020,
+            duration: 30.0,
+            album_id: "afterglow".into(),
+            genre: "Synth-pop".into(),
+            plays: 0,
+        },
+        1,
+    );
+    let mut app = open_with(cx, library.clone());
+    assert!(
+        app.has("song-col-plays"),
+        "the song list has a Plays column"
+    );
+    assert_eq!(
+        app.label_of(("song-plays", 0usize)).as_deref(),
+        Some("Not played yet")
+    );
+
+    app.hover_on(("song", 0usize));
+    app.play_with(|window, cx| window.click(("song-play", 0usize), cx));
+    let player = app.view.read_with(app.cx, |view, _| view.player.clone());
+    wait_until("the song to load", || player.current().is_some());
+    assert_eq!(
+        app.label("now-playing-sub").as_deref(),
+        Some("Neon Harbor — Afterglow"),
+        "nothing counted yet"
+    );
+
+    player.seek(25.0);
+    player.settle();
+    wait_until("the play to be counted", || {
+        app.cx.executor().advance_clock(Duration::from_millis(600));
+        app.cx.run_until_parked();
+        library.plays(&path) == 1
+    });
+    assert_eq!(
+        app.label_of(("song-plays", 0usize)).as_deref(),
+        Some("1 play")
+    );
+    assert_eq!(
+        app.label("now-playing-sub").as_deref(),
+        Some("Neon Harbor — Afterglow · 1 play")
+    );
+
+    player.seek(2.0);
+    player.settle();
+    player.seek(26.0);
+    player.settle();
+    std::thread::sleep(Duration::from_millis(150));
+    app.cx.executor().advance_clock(Duration::from_millis(600));
+    app.cx.run_until_parked();
+    assert_eq!(library.plays(&path), 1, "one listen counts once");
+
+    app.click("song-col-plays");
+    let text = std::fs::read_to_string(app.config_dir.join("config.json")).unwrap();
+    assert!(
+        text.contains("\"plays\""),
+        "sorting by plays is remembered: {text}"
+    );
+    player.pause();
+}
+
+#[gpui_kit::test]
+async fn a_finished_song_advances_the_bar_to_the_next_one(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "omamusic-advance-{}-{}",
+        std::process::id(),
+        NEXT_CONFIG_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let library = Arc::new(Library::empty());
+    for (i, (title, album)) in [("Low Tide", "Afterglow"), ("High Water", "Undertow")]
+        .iter()
+        .enumerate()
+    {
+        let path = dir.join(format!("{title}.wav"));
+        silent_wav(&path);
+        library.insert_song(
+            &Track {
+                path,
+                title: title.to_string(),
+                artist: "Neon Harbor".into(),
+                album: album.to_string(),
+                track_number: 1,
+                year: 2020,
+                duration: 1.0,
+                album_id: album.to_lowercase(),
+                genre: "Synth-pop".into(),
+                plays: 0,
+            },
+            i as i64,
+        );
+    }
+    let mut app = open_with(cx, library.clone());
+    app.hover_on(("song", 0usize));
+    app.play_with(|window, cx| window.click(("song-play", 0usize), cx));
+    let player = app.view.read_with(app.cx, |view, _| view.player.clone());
+    wait_until("the first song to load", || {
+        player.current().is_some_and(|t| t.title == "Low Tide")
+    });
+    assert_eq!(
+        app.label("now-playing-sub").as_deref(),
+        Some("Neon Harbor — Afterglow")
+    );
+
+    wait_until("the player to move on by itself", || {
+        player.current().is_some_and(|t| t.title == "High Water")
+    });
+    app.cx.run_until_parked();
+    assert_eq!(
+        app.label("now-playing-sub").as_deref(),
+        Some("Neon Harbor — Undertow"),
+        "the bar follows the song that started on its own"
+    );
+    assert_eq!(
+        library.plays(&dir.join("Low Tide.wav")),
+        1,
+        "the finished song counted as a play"
+    );
+    player.pause();
 }
 
 #[gpui_kit::test]
@@ -1218,6 +1365,7 @@ async fn the_visual_effects_switch_shows_and_hides_the_spectrum(cx: &mut TestApp
             duration: 10.0,
             album_id: "afterglow".into(),
             genre: "Synth-pop".into(),
+            plays: 0,
         },
         1,
     );
@@ -1269,6 +1417,7 @@ async fn the_playing_album_is_marked_in_the_grid_and_the_list(cx: &mut TestAppCo
                 duration: 1.0,
                 album_id: album.to_lowercase(),
                 genre: "Synth-pop".into(),
+                plays: 0,
             },
             1,
         );

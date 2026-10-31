@@ -368,6 +368,20 @@ impl Library {
         .flatten()
     }
 
+    /// Count one more play of `path` and return the new total.
+    pub fn record_play(&self, path: &Path) -> u32 {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as i64);
+        self.db
+            .read(|conn| db::record_play(conn, path, now_ns))
+            .unwrap_or(0)
+    }
+
+    pub fn plays(&self, path: &Path) -> u32 {
+        self.db.read(|conn| db::plays(conn, path)).unwrap_or(0)
+    }
+
     pub fn snapshot(&self) -> Arc<LibrarySnapshot> {
         self.state.read().clone()
     }

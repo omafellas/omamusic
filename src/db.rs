@@ -73,6 +73,12 @@ CREATE TABLE IF NOT EXISTS lookup (
     attempted_at  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plays (
+    path           TEXT PRIMARY KEY,
+    count          INTEGER NOT NULL DEFAULT 0,
+    last_played_ns INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
     title, artist, album, genre,
     content='tracks', content_rowid='id',
@@ -125,8 +131,9 @@ DROP TABLE IF EXISTS lookup;
 "#;
 
 /// Columns of `tracks`, aliased as `t`, in the order [`track_from_row`] reads.
-const TRACK_COLS: &str =
-    "t.path, t.title, t.artist, t.album, t.album_key, t.track_number, t.year, t.duration, t.genre";
+const TRACK_COLS: &str = "t.path, t.title, t.artist, t.album, t.album_key, t.track_number, \
+     t.year, t.duration, t.genre, \
+     COALESCE((SELECT p.count FROM plays p WHERE p.path = t.path), 0) AS plays";
 
 /// Order of tracks inside an album. Numbered tracks sort by number first, the
 /// rest by path, matching the ordering the player used before SQLite.
@@ -258,6 +265,7 @@ fn track_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Track> {
         duration: row.get("duration")?,
         album_id: row.get("album_key")?,
         genre: row.get("genre")?,
+        plays: row.get::<_, i64>("plays")?.max(0) as u32,
     })
 }
 
@@ -327,8 +335,32 @@ fn song_order(sort: SongSort) -> String {
             "(t.genre = ''), t.genre COLLATE NOCASE {dir}, {ALBUM_ORDER}, {TRACK_ORDER}"
         ),
         SongColumn::Time => format!("t.duration {dir}, t.title COLLATE NOCASE, t.path"),
+        SongColumn::Plays => format!("plays {dir}, {ALBUM_ORDER}, {TRACK_ORDER}"),
         SongColumn::Added => format!("t.mtime_ns {dir}, {ALBUM_ORDER}, {TRACK_ORDER}"),
     }
+}
+
+/// Count one more play of `path` and return the new total. Plays live in
+/// their own table, so a rescan or a schema rebuild never resets them.
+pub fn record_play(conn: &Connection, path: &Path, now_ns: i64) -> Result<u32> {
+    let path = path.to_string_lossy();
+    conn.execute(
+        "INSERT INTO plays(path, count, last_played_ns) VALUES (?1, 1, ?2) \
+         ON CONFLICT(path) DO UPDATE SET count = count + 1, last_played_ns = excluded.last_played_ns",
+        params![path, now_ns],
+    )?;
+    plays(conn, Path::new(path.as_ref()))
+}
+
+pub fn plays(conn: &Connection, path: &Path) -> Result<u32> {
+    let count: Option<i64> = conn
+        .query_row(
+            "SELECT count FROM plays WHERE path = ?1",
+            params![path.to_string_lossy()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(count.unwrap_or(0).max(0) as u32)
 }
 
 fn genre_clause(genre: Option<&str>) -> &'static str {
@@ -780,6 +812,51 @@ mod tests {
             params![path, dir, title, artist, album, key, number],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn play_counts_accumulate_and_outlive_rescans_and_rebuilds() {
+        let conn = memory();
+        insert_track(&conn, "/m/a/1.mp3", "One", "Neon Harbor", "Afterglow", 1);
+        insert_track(&conn, "/m/a/2.mp3", "Two", "Neon Harbor", "Afterglow", 2);
+        rebuild_albums(&conn);
+        let one = Path::new("/m/a/1.mp3");
+        assert_eq!(plays(&conn, one).unwrap(), 0);
+        assert_eq!(record_play(&conn, one, 10).unwrap(), 1);
+        assert_eq!(record_play(&conn, one, 20).unwrap(), 2);
+        assert_eq!(plays(&conn, one).unwrap(), 2);
+        assert_eq!(plays(&conn, Path::new("/m/a/2.mp3")).unwrap(), 0);
+
+        let page = songs_page(&conn, SongSort::default(), None, 0, 10).unwrap();
+        assert_eq!(page[0].plays, 2, "the track row carries its count");
+        assert_eq!(page[1].plays, 0);
+        let most_played = songs_page(
+            &conn,
+            SongSort::default().toggled(SongColumn::Plays),
+            None,
+            0,
+            10,
+        )
+        .unwrap();
+        assert_eq!(most_played[0].title, "One", "most played sorts first");
+
+        conn.execute("DELETE FROM tracks WHERE path = '/m/a/1.mp3'", [])
+            .unwrap();
+        insert_track(&conn, "/m/a/1.mp3", "One", "Neon Harbor", "Afterglow", 1);
+        rebuild_albums(&conn);
+        assert_eq!(
+            tracks_page(&conn, 0, 10).unwrap()[0].plays,
+            2,
+            "a rescan keeps the count"
+        );
+
+        conn.execute_batch(DROP).unwrap();
+        ensure_schema(&conn).unwrap();
+        assert_eq!(
+            plays(&conn, one).unwrap(),
+            2,
+            "a schema rebuild keeps the count"
+        );
     }
 
     fn rebuild_albums(conn: &Connection) {

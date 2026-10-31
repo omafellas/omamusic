@@ -1,5 +1,6 @@
 use crate::app::{
-    cover, format_time, hover_progress, tint_color, CoverPoll, Omamusic, LIFT, TINT_ENTER,
+    cover, format_time, hover_progress, plays_label, tint_color, CoverPoll, Omamusic, LIFT,
+    TINT_ENTER,
 };
 use crate::config::AppConfig;
 use crate::library::Library;
@@ -233,7 +234,10 @@ impl Render for PlayerBar {
             .map(|t| t.title.clone())
             .unwrap_or_else(|| "Not Playing".into());
         let sub = current
-            .map(|t| format!("{} — {}", t.artist, t.album))
+            .map(|t| match self.library.plays(&t.path) {
+                0 => format!("{} — {}", t.artist, t.album),
+                plays => format!("{} — {} · {}", t.artist, t.album, plays_label(plays)),
+            })
             .unwrap_or_else(|| "Pick a song to start".into());
         let shuffle = self.player.shuffle();
         let repeat = self.player.repeat();
@@ -304,6 +308,9 @@ impl Render for PlayerBar {
                     )
                     .child(
                         div()
+                            .id("now-playing-sub")
+                            .test_support()
+                            .aria_label(sub.clone())
                             .text_size(rems(0.6875))
                             .text_color(theme.secondary)
                             .truncate()

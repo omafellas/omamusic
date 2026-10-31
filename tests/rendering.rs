@@ -354,6 +354,7 @@ mod pixels {
                     duration: 230.0,
                     album_id: id.clone(),
                     genre: "Synth-pop".into(),
+                    plays: 0,
                 },
                 i as i64,
             );
@@ -420,6 +421,7 @@ mod pixels {
                 duration: 230.0,
                 album_id: "afterglow".into(),
                 genre: "Synth-pop".into(),
+                plays: 0,
             },
             1,
         );
@@ -452,6 +454,7 @@ mod pixels {
                 duration: 230.0,
                 album_id: "afterglow".into(),
                 genre: "Synth-pop".into(),
+                plays: 0,
             },
             1,
         );
@@ -542,6 +545,7 @@ mod pixels {
                 duration: 4.0,
                 album_id: "afterglow".into(),
                 genre: "Synth-pop".into(),
+                plays: 0,
             },
             0,
         );
@@ -764,6 +768,7 @@ mod pixels {
                     duration: 1.0,
                     album_id: "afterglow".into(),
                     genre: "Synth-pop".into(),
+                    plays: 0,
                 },
                 i as i64,
             );
@@ -840,6 +845,7 @@ mod pixels {
                     duration: 230.0,
                     album_id: "afterglow".into(),
                     genre: "Synth-pop".into(),
+                    plays: 0,
                 },
                 1,
             );
@@ -884,6 +890,7 @@ mod pixels {
                 duration: 1.0,
                 album_id: "afterglow".into(),
                 genre: "Synth-pop".into(),
+                plays: 0,
             },
             1,
         );
