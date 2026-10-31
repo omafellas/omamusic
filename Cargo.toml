@@ -40,6 +40,13 @@ test-support = []
 gpui-kit = { version = "=0.7.1", default-features = false, features = ["test-support"] }
 omamusic = { path = ".", features = ["test-support"] }
 
+[profile.dev]
+debug = "line-tables-only"
+strip = "debuginfo"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 opt-level = "z"
