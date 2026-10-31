@@ -1,4 +1,5 @@
 use crate::models::{PlayerState, RepeatMode, Track};
+use crate::spectrum;
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
@@ -49,6 +50,36 @@ impl AudioBuffer {
     }
 }
 
+struct Recent {
+    samples: Vec<f32>,
+    head: usize,
+}
+
+impl Default for Recent {
+    fn default() -> Self {
+        Self {
+            samples: vec![0.0; spectrum::SIZE],
+            head: 0,
+        }
+    }
+}
+
+impl Recent {
+    fn push(&mut self, sample: f32) {
+        self.samples[self.head] = sample;
+        self.head = (self.head + 1) % self.samples.len();
+    }
+
+    fn copy_to(&self, out: &mut [f32]) {
+        let n = out.len().min(self.samples.len());
+        let out = &mut out[..n];
+        let start = (self.head + self.samples.len() - n) % self.samples.len();
+        let tail = (self.samples.len() - start).min(n);
+        out[..tail].copy_from_slice(&self.samples[start..start + tail]);
+        out[tail..].copy_from_slice(&self.samples[..n - tail]);
+    }
+}
+
 struct Shared {
     playback: Mutex<Playback>,
     audio: Mutex<AudioBuffer>,
@@ -56,6 +87,9 @@ struct Shared {
     /// Loudness meter (f32 bits, 0.0..=1.0) of the most recent output block,
     /// written by the audio callback and read by the visual effects.
     level: AtomicU32,
+    /// The latest mono output samples for the spectrum, written by the audio
+    /// callback whenever the lock is free.
+    recent: Mutex<Recent>,
     pending: AtomicUsize,
     loaded: Mutex<Option<Track>>,
     channels: usize,
@@ -181,6 +215,9 @@ fn fill_output<T: cpal::SizedSample + cpal::FromSample<f32>>(data: &mut [T], sha
         (state.state == PlayerState::Playing, state.volume as f32)
     };
     let mut audio = shared.audio.lock();
+    let mut recent = shared.recent.try_lock();
+    let channels = shared.channels.max(1);
+    let (mut frame_sum, mut frame_len) = (0f32, 0usize);
     let mut peak = 0f32;
     for sample in data {
         let value = match playing.then(|| audio.samples.pop_front()).flatten() {
@@ -193,6 +230,14 @@ fn fill_output<T: cpal::SizedSample + cpal::FromSample<f32>>(data: &mut [T], sha
         let value = value.clamp(-1.0, 1.0);
         peak = peak.max(value.abs());
         *sample = T::from_sample(value);
+        if let Some(recent) = recent.as_mut() {
+            frame_sum += value;
+            frame_len += 1;
+            if frame_len == channels {
+                recent.push(frame_sum / channels as f32);
+                (frame_sum, frame_len) = (0.0, 0);
+            }
+        }
     }
     let prev = f32::from_bits(shared.level.load(Ordering::Relaxed));
     shared
@@ -441,6 +486,7 @@ impl Player {
             loaded: Mutex::new(None),
             listeners: Mutex::new(Vec::new()),
             level: AtomicU32::new(0),
+            recent: Mutex::new(Recent::default()),
             channels: channels as usize,
             sample_rate,
         });
@@ -639,6 +685,13 @@ impl Player {
     /// Output loudness in 0.0..=1.0 for the visual effects.
     pub fn level(&self) -> f32 {
         f32::from_bits(self.shared.level.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+    }
+
+    /// Copy the most recent mono output samples into `out`, oldest first, and
+    /// return the sample rate they were played at.
+    pub fn recent_samples(&self, out: &mut [f32]) -> u32 {
+        self.shared.recent.lock().copy_to(out);
+        self.shared.sample_rate
     }
 
     /// Silence playback or restore the previous volume. Returns the muted state.
@@ -904,6 +957,40 @@ mod tests {
             envelope(decayed, 0.0) < decayed,
             "decay continues towards silence"
         );
+    }
+
+    #[test]
+    fn recent_samples_hold_the_latest_output_oldest_first() {
+        let mut recent = Recent::default();
+        let mut out = vec![0.0; spectrum::SIZE];
+        recent.copy_to(&mut out);
+        assert!(out.iter().all(|s| *s == 0.0));
+        for i in 0..(spectrum::SIZE + 10) {
+            recent.push(i as f32);
+        }
+        recent.copy_to(&mut out);
+        assert_eq!(out[0], 10.0, "the oldest kept sample comes first");
+        assert_eq!(out[spectrum::SIZE - 1], (spectrum::SIZE + 9) as f32);
+        let mut short = [0.0; 4];
+        recent.copy_to(&mut short);
+        assert_eq!(short[3], (spectrum::SIZE + 9) as f32);
+
+        let base = std::env::temp_dir().join(format!("omamusic-recent-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let loud = base.join("loud.wav");
+        write_wav(&loud, |i| if i % 2 == 0 { 12_000 } else { -12_000 });
+        let player = Player::new_test();
+        player.play(vec![track(loud)], 0);
+        assert!(
+            wait_for(|| {
+                player.recent_samples(&mut out);
+                out.iter().any(|s| s.abs() > 0.1)
+            }),
+            "the ring never saw the square wave"
+        );
+        assert_eq!(player.recent_samples(&mut out), 48_000);
+        drop(player);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

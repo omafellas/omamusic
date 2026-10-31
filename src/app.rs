@@ -8,6 +8,7 @@ use crate::models::{
 use crate::player::Player;
 use crate::playlists::Playlists;
 use crate::search::{highlight_ranges, top_result, TopResult};
+use crate::spectrum::{self, Analyzer};
 use crate::{DecreaseFontSize, FocusSearch, GoBack, GoForward, IncreaseFontSize, ResetFontSize};
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::base::motion::{transition, Transition};
@@ -15,12 +16,13 @@ use gpui_kit::base::{Popover, Selectable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::TestSupportExt;
 use gpui_kit::{
-    div, ease_out_quint, img, linear_color_stop, linear_gradient, px, rems, uniform_list,
-    Animation, AnimationExt as _, AnyElement, App, AppContext, BoxShadow, ClickEvent, Context, Div,
-    ElementId, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    Hsla, ImageSource, InteractiveElement, IntoElement, MouseButton, NavigationDirection,
-    ObjectFit, ParentElement, PathPromptOptions, Pixels, Render, Rgba, SharedString, Stateful,
-    StatefulInteractiveElement, StyleRefinement, Styled, StyledImage as _, StyledText, Window,
+    canvas, div, ease_out_quint, fill, img, linear_color_stop, linear_gradient, px, rems,
+    uniform_list, Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, BoxShadow,
+    ClickEvent, Context, Corners, Div, ElementId, Entity, EntityInputHandler, FocusHandle,
+    Focusable, FontWeight, HighlightStyle, Hsla, ImageSource, InteractiveElement, IntoElement,
+    MouseButton, NavigationDirection, ObjectFit, ParentElement, PathPromptOptions, Pixels, Render,
+    Rgba, SharedString, Stateful, StatefulInteractiveElement, StyleRefinement, Styled,
+    StyledImage as _, StyledText, Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, keycap,
@@ -35,7 +37,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct Omamusic {
     pub library: Arc<Library>,
@@ -261,8 +263,9 @@ const NOTIFY_HOLD: Duration = Duration::from_millis(2600);
 const NOTIFY_FADE: Duration = Duration::from_millis(400);
 const NOTIFY_FADE_STEP: Duration = Duration::from_millis(50);
 
-/// Number of equalizer bars in the "Visual Effects" background animation.
-const VISUALIZER_BARS: usize = 40;
+/// Width of one spectrum bar and the gap between bars, in rems.
+const VISUALIZER_BAR: f32 = 0.25;
+const VISUALIZER_GAP: f32 = 0.125;
 
 /// Song-list layout priority: the title flexes at this rate while the artist
 /// column flexes at 1 and caps at `SECONDARY_MAX_W` rems, so a narrow window
@@ -624,81 +627,88 @@ fn settings_row(
         )
 }
 
-/// Equalizer bar shape over one animation cycle, 0.0..=1.0. The two mixed
-/// sine waves use whole cycles per animation loop, so repeating never jumps.
-fn visualizer_shape(bar: usize, delta: f32) -> f32 {
-    let tau = std::f32::consts::TAU;
-    let fast = (delta * tau * (1 + (bar % 4)) as f32 + bar as f32 * 0.7).sin() * 0.5 + 0.5;
-    let slow = (delta * tau * (2 + (bar % 3)) as f32 + bar as f32 * 1.3).sin() * 0.5 + 0.5;
-    ((0.6 * fast + 0.4 * slow) * (0.55 + 0.45 * (bar % 5) as f32 / 4.)).clamp(0.0, 1.0)
+/// How many bars of `bar` width separated by `gap` fit into `width`.
+fn visualizer_columns(width: f32, bar: f32, gap: f32) -> usize {
+    (((width + gap) / (bar + gap)).floor() as usize).max(1)
 }
 
-/// Bar height in rems for a loudness level. Silence keeps a thin baseline;
-/// bars grow vertically as the music gets louder.
-fn visualizer_height(level: f32, delta: f32, bar: usize) -> f32 {
-    0.12 + level * visualizer_shape(bar, delta) * 2.4
-}
-
-/// Low alpha so the strip never blocks the text behind it.
-fn visualizer_opacity(level: f32, delta: f32, bar: usize) -> f32 {
-    0.08 + 0.34 * level * visualizer_shape(bar, delta)
-}
-
-/// Music-reactive strip of bars pinned to the bottom of the main area, just
-/// above the player bar. Only rendered while "Visual Effects" is enabled;
-/// heights follow the audio level meter of the current output.
+/// Spectrum strip pinned to the bottom of the main area, just above the
+/// player bar. Only rendered while "Visual effects" is enabled; each bar
+/// follows one frequency band of the current output.
 struct Visualizer {
     player: Arc<Player>,
+    analyzer: Analyzer,
+    samples: Vec<f32>,
+    started: Instant,
 }
 
 impl Visualizer {
-    fn new(player: Arc<Player>, cx: &mut Context<Self>) -> Self {
-        // Repaint often enough to follow the meter while playing, and idle
-        // otherwise so a paused track costs nothing.
-        cx.spawn(async move |this, cx| loop {
-            let delay = this
-                .update(cx, |this, _| {
-                    if this.player.state() == PlayerState::Playing {
-                        Duration::from_millis(120)
-                    } else {
-                        Duration::from_millis(500)
-                    }
-                })
-                .unwrap_or(Duration::from_millis(500));
-            cx.background_executor().timer(delay).await;
-            let _ = this.update(cx, |_, cx| cx.notify());
-        })
-        .detach();
-        Self { player }
+    fn new(player: Arc<Player>) -> Self {
+        Self {
+            player,
+            analyzer: Analyzer::new(),
+            samples: vec![0.0; spectrum::SIZE],
+            started: Instant::now(),
+        }
+    }
+
+    fn levels(&mut self, count: usize, active: bool) -> Vec<f32> {
+        let rate = self.player.recent_samples(&mut self.samples);
+        let time = self.started.elapsed().as_secs_f64();
+        self.analyzer
+            .update(&self.samples, rate, count, active, time)
+            .to_vec()
     }
 }
 
 impl Render for Visualizer {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.omarchy().clone();
-        let level = self.player.level();
+        let active = self.player.state() == PlayerState::Playing && !self.player.is_muted();
+        if !cx.reduce_motion() && (active || !self.analyzer.idle()) {
+            window.request_animation_frame();
+        }
+        let view = cx.entity();
         div()
+            .id("visualizer")
+            .test_support()
             .size_full()
-            .flex()
-            .items_end()
-            .gap(px(3.))
             .px(rems(1.5))
-            .children((0..VISUALIZER_BARS).map(|bar| {
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h(rems(visualizer_height(level, 0.0, bar)))
-                    .rounded_t(px(2.))
-                    .with_animation(
-                        ElementId::Name(format!("visualizer-bar-{bar}").into()),
-                        Animation::new(Duration::from_millis(900 + (bar % 5) as u64 * 210))
-                            .repeat(),
-                        move |el, delta| {
-                            el.h(rems(visualizer_height(level, delta, bar)))
-                                .bg(theme.accent.opacity(visualizer_opacity(level, delta, bar)))
-                        },
-                    )
-            }))
+            .child(
+                canvas(
+                    move |bounds, window, cx| {
+                        let rem = f32::from(window.rem_size());
+                        let (bar, gap) = (VISUALIZER_BAR * rem, VISUALIZER_GAP * rem);
+                        let count = visualizer_columns(f32::from(bounds.size.width), bar, gap);
+                        let levels = view.update(cx, |this, _| this.levels(count, active));
+                        (levels, gap)
+                    },
+                    move |bounds, (levels, gap), window, _| {
+                        let step = (f32::from(bounds.size.width) + gap) / levels.len() as f32;
+                        let width = px(step - gap);
+                        let radius = width / 2.;
+                        for (index, level) in levels.iter().enumerate() {
+                            let height = (bounds.size.height * *level).max(width);
+                            let origin = gpui_kit::point(
+                                bounds.left() + px(index as f32 * step),
+                                bounds.bottom() - height,
+                            );
+                            window.paint_quad(
+                                fill(
+                                    Bounds::new(origin, gpui_kit::size(width, height)),
+                                    linear_gradient(
+                                        180.,
+                                        linear_color_stop(theme.accent.opacity(0.55), 0.),
+                                        linear_color_stop(theme.accent.opacity(0.2), 1.),
+                                    ),
+                                )
+                                .corner_radii(Corners::all(radius)),
+                            );
+                        }
+                    },
+                )
+                .size_full(),
+            )
     }
 }
 
@@ -815,7 +825,7 @@ impl Omamusic {
         })
         .detach();
 
-        let visualizer = cx.new(|cx| Visualizer::new(player.clone(), cx));
+        let visualizer = cx.new(|_| Visualizer::new(player.clone()));
 
         let view = std::env::var("OMADRIVE_VIEW").ok();
         let show_queue = view.as_deref() == Some("queue");
@@ -5146,45 +5156,14 @@ mod tests {
     }
 
     #[test]
-    fn visualizer_shape_stays_in_range_and_loops_seamlessly() {
-        for bar in 0..VISUALIZER_BARS {
-            for step in 0..=20 {
-                let delta = step as f32 / 20.;
-                let shape = visualizer_shape(bar, delta);
-                assert!((0.0..=1.0).contains(&shape), "bar {bar} @ {delta}: {shape}");
-            }
-            assert!(
-                (visualizer_shape(bar, 0.) - visualizer_shape(bar, 1.)).abs() < 1e-5,
-                "bar {bar} jumps when its animation repeats"
-            );
-        }
-    }
-
-    #[test]
-    fn visualizer_bars_rise_with_the_level_and_collapse_without_it() {
-        for bar in 0..VISUALIZER_BARS {
-            assert_eq!(
-                visualizer_height(0.0, 0.5, bar),
-                0.12,
-                "silence leaves only the thin baseline"
-            );
-            assert!(
-                visualizer_height(1.0, 0.5, bar) >= visualizer_height(0.3, 0.5, bar),
-                "louder must not shrink bar {bar}"
-            );
-            assert!(
-                visualizer_height(1.0, 0.5, bar) <= 2.6,
-                "bar {bar} may not overrun its strip"
-            );
-            assert!(visualizer_opacity(1.0, 0.5, bar) <= 0.5, "stay see-through");
-        }
-        let loud = (0..VISUALIZER_BARS)
-            .map(|b| visualizer_height(1.0, 0.4, b))
-            .sum::<f32>();
-        let quiet = (0..VISUALIZER_BARS)
-            .map(|b| visualizer_height(0.2, 0.4, b))
-            .sum::<f32>();
-        assert!(loud > quiet, "the strip as a whole reacts to the level");
+    fn visualizer_columns_fill_the_width_and_never_vanish() {
+        assert_eq!(visualizer_columns(0.0, 4.0, 2.0), 1);
+        assert_eq!(visualizer_columns(4.0, 4.0, 2.0), 1);
+        assert_eq!(visualizer_columns(10.0, 4.0, 2.0), 2);
+        assert_eq!(visualizer_columns(11.0, 4.0, 2.0), 2);
+        assert_eq!(visualizer_columns(16.0, 4.0, 2.0), 3);
+        assert_eq!(visualizer_columns(600.0, 4.0, 2.0), 100);
+        assert!(visualizer_columns(600.0, 8.0, 4.0) < visualizer_columns(600.0, 4.0, 2.0));
     }
 
     #[test]

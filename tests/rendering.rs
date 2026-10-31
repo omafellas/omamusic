@@ -502,6 +502,84 @@ mod pixels {
         std::fs::write(path, wav).unwrap();
     }
 
+    /// Four seconds of a full-band square wave, so every spectrum bar has
+    /// something to show.
+    fn square_wav(path: &std::path::Path) {
+        let samples = 4 * 44_100u32;
+        let mut wav = Vec::with_capacity(44 + samples as usize * 2);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + samples * 2).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&44_100u32.to_le_bytes());
+        wav.extend_from_slice(&(44_100u32 * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(samples * 2).to_le_bytes());
+        for i in 0..samples {
+            let value: i16 = if (i / 50) % 2 == 0 { 12_000 } else { -12_000 };
+            wav.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(path, wav).unwrap();
+    }
+
+    fn visualizer_bars_rise_with_the_music() {
+        let dir = isolated_config_dir();
+        let path = dir.join("Pulse.wav");
+        square_wav(&path);
+        let library = Arc::new(Library::empty());
+        library.insert_song(
+            &omamusic::models::Track {
+                path,
+                title: "Pulse".into(),
+                artist: "Neon Harbor".into(),
+                album: "Afterglow".into(),
+                track_number: 1,
+                year: 2020,
+                duration: 4.0,
+                album_id: "afterglow".into(),
+                genre: "Synth-pop".into(),
+            },
+            0,
+        );
+        let mut scene = Scene::open_with(library);
+        let strip_before = scene
+            .cx
+            .update_window(scene.handle, |_, window, _| {
+                window.try_find("visualizer").is_some()
+            })
+            .unwrap();
+        assert!(!strip_before, "nothing plays yet, so there is no strip");
+        let resting = scene.capture();
+        scene.act(|window, cx| window.hover(("song", 0usize), cx));
+        scene.act(|window, cx| window.click(("song-play", 0usize), cx));
+        let player = scene.cx.update(|cx| scene.view.read(cx).player.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while player.level() < 0.1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the square wave must reach the output (level {})",
+                player.level()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        scene.act(|_, _| {});
+        let strip = scene.bounds("visualizer");
+        let upper = Bounds::new(
+            strip.origin,
+            size(strip.size.width, strip.size.height * 0.6),
+        );
+        let playing = scene.capture();
+        player.pause();
+        assert!(
+            playing.changed_in(&resting, upper) > 0,
+            "bars must rise above the baseline while music plays"
+        );
+    }
+
     fn selected_sidebar_row_has_round_corners() {
         let mut scene = Scene::open();
         let capture = scene.capture();
@@ -819,7 +897,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 18] = [
+        let tests: [(&str, fn()); 19] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -879,6 +957,10 @@ mod pixels {
             (
                 "album_page_takes_its_tint_from_the_cover",
                 album_page_takes_its_tint_from_the_cover,
+            ),
+            (
+                "visualizer_bars_rise_with_the_music",
+                visualizer_bars_rise_with_the_music,
             ),
         ];
         for (name, test) in tests {

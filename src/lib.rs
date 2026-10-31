@@ -14,6 +14,7 @@ pub mod player;
 pub mod player_bar;
 pub mod playlists;
 pub mod search;
+pub mod spectrum;
 pub mod tray;
 
 use gpui_kit::{

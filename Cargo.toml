@@ -32,6 +32,7 @@ percent-encoding = "2"
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 rusty-chromaprint = "0.3"
 base64 = "0.22"
+realfft = "3.5"
 
 [features]
 test-support = []

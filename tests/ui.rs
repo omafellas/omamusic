@@ -1110,7 +1110,11 @@ async fn transport_is_centered_above_the_progress_line(cx: &mut TestAppContext) 
 }
 
 fn silent_wav(path: &std::path::Path) {
-    let samples = 44_100u32;
+    silent_wav_lasting(path, 1);
+}
+
+fn silent_wav_lasting(path: &std::path::Path, seconds: u32) {
+    let samples = 44_100u32 * seconds;
     let mut wav = Vec::with_capacity(44 + samples as usize * 2);
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&(36 + samples * 2).to_le_bytes());
@@ -1118,8 +1122,8 @@ fn silent_wav(path: &std::path::Path) {
     wav.extend_from_slice(&16u32.to_le_bytes());
     wav.extend_from_slice(&1u16.to_le_bytes());
     wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&samples.to_le_bytes());
-    wav.extend_from_slice(&(samples * 2).to_le_bytes());
+    wav.extend_from_slice(&44_100u32.to_le_bytes());
+    wav.extend_from_slice(&(44_100u32 * 2).to_le_bytes());
     wav.extend_from_slice(&2u16.to_le_bytes());
     wav.extend_from_slice(&16u16.to_le_bytes());
     wav.extend_from_slice(b"data");
@@ -1190,6 +1194,53 @@ async fn the_bar_heart_likes_the_playing_song(cx: &mut TestAppContext) {
     );
     app.click_on("like");
     assert_eq!(app.liked_file(), serde_json::json!([]));
+}
+
+#[gpui_kit::test]
+async fn the_visual_effects_switch_shows_and_hides_the_spectrum(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!(
+        "omamusic-spectrum-{}-{}",
+        std::process::id(),
+        NEXT_CONFIG_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Low Tide.wav");
+    silent_wav_lasting(&path, 10);
+    let library = Arc::new(Library::empty());
+    library.insert_song(
+        &Track {
+            path,
+            title: "Low Tide".into(),
+            artist: "Neon Harbor".into(),
+            album: "Afterglow".into(),
+            track_number: 1,
+            year: 2020,
+            duration: 10.0,
+            album_id: "afterglow".into(),
+            genre: "Synth-pop".into(),
+        },
+        1,
+    );
+    let mut app = open_with(cx, library);
+    assert!(!app.has("visualizer"), "nothing plays yet");
+    app.hover_on(("song", 0usize));
+    app.play_with(|window, cx| window.click(("song-play", 0usize), cx));
+    let player = app.view.read_with(app.cx, |view, _| view.player.clone());
+    wait_until("the song to load", || player.current().is_some());
+    assert!(app.has("visualizer"), "playing music shows the spectrum");
+
+    app.click("settings");
+    app.click("pref-visual-effects");
+    assert!(!app.has("visualizer"), "the switch hides the spectrum");
+    let text = std::fs::read_to_string(app.config_dir.join("config.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["visual_effects"], serde_json::Value::Bool(false));
+    app.click("pref-visual-effects");
+    assert!(app.has("visualizer"), "the switch brings the spectrum back");
+
+    player.pause();
+    app.cx.run_until_parked();
+    assert!(!app.has("visualizer"), "a paused player shows no spectrum");
 }
 
 #[gpui_kit::test]
