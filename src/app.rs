@@ -12,7 +12,7 @@ use crate::spectrum::{self, Analyzer};
 use crate::{DecreaseFontSize, FocusSearch, GoBack, GoForward, IncreaseFontSize, ResetFontSize};
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::base::motion::{transition, Transition};
-use gpui_kit::base::{Popover, Selectable};
+use gpui_kit::base::{Popover, Selectable, Switch, SwitchThumb, SwitchTrack};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::TestSupportExt;
 use gpui_kit::{
@@ -26,8 +26,7 @@ use gpui_kit::{
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, keycap,
-    keycaps, link, menu, switch, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName,
-    MenuItem,
+    keycaps, link, menu, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName, MenuItem,
 };
 use rand::Rng;
 use std::cell::Cell;
@@ -589,6 +588,88 @@ fn settings_section(label: &'static str, rows: Vec<AnyElement>, cx: &App) -> imp
 
 /// One settings row: a label, an optional help line under it, and its
 /// control on the trailing edge.
+/// Track width, knob size and track padding of a settings toggle, in rems.
+const TOGGLE_TRACK: f32 = 2.25;
+const TOGGLE_KNOB: f32 = 1.;
+const TOGGLE_PAD: f32 = 0.125;
+const TOGGLE_MOTION: Duration = Duration::from_millis(140);
+
+/// How far the knob slides from off to on, in rems.
+fn toggle_travel() -> f32 {
+    TOGGLE_TRACK - TOGGLE_KNOB - 2. * TOGGLE_PAD
+}
+
+/// Pill switch for the settings rows: accent track when on, inset track
+/// when off, a knob that slides and brightens, a ring on hover and focus.
+fn toggle(
+    id: &'static str,
+    label: &'static str,
+    checked: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Switch {
+    let theme = cx.omarchy().clone();
+    let key: ElementId = id.into();
+    let ease = Transition::new(TOGGLE_MOTION).ease(ease_out_quint());
+    let slide = transition(
+        (key.clone(), "slide"),
+        if checked { 1f32 } else { 0. },
+        ease.clone(),
+        window,
+        cx,
+    );
+    let track = transition(
+        (key.clone(), "track"),
+        if checked {
+            theme.accent
+        } else {
+            theme.selected_fill()
+        },
+        ease.clone(),
+        window,
+        cx,
+    );
+    let knob = transition(
+        (key.clone(), "knob"),
+        if checked {
+            theme.on_accent
+        } else {
+            theme.secondary
+        },
+        ease,
+        window,
+        cx,
+    );
+    Switch::new(key.clone())
+        .checked(checked)
+        .accessibility_label(label)
+        .flex()
+        .flex_none()
+        .items_center()
+        .p(rems(TOGGLE_PAD))
+        .rounded_full()
+        .border_1()
+        .border_color(theme.foreground.opacity(0.))
+        .hover(|s| s.border_color(theme.divider()))
+        .focus_visible(|s| s.border_color(theme.focus_border()))
+        .child(
+            SwitchTrack::new((key, "track"))
+                .checked(checked)
+                .w(rems(TOGGLE_TRACK))
+                .h(rems(TOGGLE_KNOB + 2. * TOGGLE_PAD))
+                .p(rems(TOGGLE_PAD))
+                .rounded_full()
+                .bg(track)
+                .child(
+                    SwitchThumb::new(checked)
+                        .size(rems(TOGGLE_KNOB))
+                        .rounded_full()
+                        .bg(knob)
+                        .ml(rems(toggle_travel() * slide)),
+                ),
+        )
+}
+
 fn settings_row(
     label: impl IntoElement,
     help: Option<AnyElement>,
@@ -1636,24 +1717,21 @@ impl Omamusic {
 
     fn pref_switch(
         &self,
-        id: &'static str,
-        label: &'static str,
-        help: &'static str,
+        (id, label, help): (&'static str, &'static str, &'static str),
         checked: bool,
         change: fn(&mut AppConfig, bool),
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.omarchy().clone();
         let this = cx.entity().downgrade();
-        let control = switch(id, "", checked, cx)
-            .accessibility_label(label)
-            .on_change(move |on, _, _, cx| {
-                let _ = this.update(cx, |this, cx| {
-                    change(&mut this.prefs, on);
-                    AppConfig::update(|c| change(c, on));
-                    cx.notify();
-                });
+        let control = toggle(id, label, checked, window, cx).on_change(move |on, _, _, cx| {
+            let _ = this.update(cx, |this, cx| {
+                change(&mut this.prefs, on);
+                AppConfig::update(|c| change(c, on));
+                cx.notify();
             });
+        });
         settings_row(
             label,
             Some(
@@ -4650,11 +4728,14 @@ impl Omamusic {
             "INTERFACE",
             vec![
                 self.pref_switch(
-                    "pref-visual-effects",
-                    "Visual effects",
-                    "Music-reactive bars above the player",
+                    (
+                        "pref-visual-effects",
+                        "Visual effects",
+                        "Music-reactive bars above the player",
+                    ),
                     self.prefs.visual_effects,
                     |c, on| c.visual_effects = on,
+                    window,
                     cx,
                 )
                 .into_any_element(),
@@ -4667,20 +4748,26 @@ impl Omamusic {
             "BEHAVIOR",
             vec![
                 self.pref_switch(
-                    "pref-close-to-tray",
-                    "Close window to tray",
-                    "Keep playing in the background when the window closes",
+                    (
+                        "pref-close-to-tray",
+                        "Close window to tray",
+                        "Keep playing in the background when the window closes",
+                    ),
                     !self.prefs.quit_on_close,
                     |c, on| c.quit_on_close = !on,
+                    window,
                     cx,
                 )
                 .into_any_element(),
                 self.pref_switch(
-                    "pref-start-hidden",
-                    "Start hidden in tray",
-                    "Open without showing the window",
+                    (
+                        "pref-start-hidden",
+                        "Start hidden in tray",
+                        "Open without showing the window",
+                    ),
                     self.prefs.start_hidden,
                     |c, on| c.start_hidden = on,
+                    window,
                     cx,
                 )
                 .into_any_element(),
@@ -4690,19 +4777,24 @@ impl Omamusic {
 
         let lookup_switch = {
             let entity = cx.entity().downgrade();
-            switch("pref-online-lookup", "", self.prefs.online_lookup, cx)
-                .accessibility_label("Complete missing tags and covers online")
-                .on_change(move |on, _, _, cx| {
-                    let _ = entity.update(cx, |this, cx| {
-                        let lookup_before = this.prefs.online_lookup;
-                        this.prefs.online_lookup = on;
-                        AppConfig::update(|c| c.online_lookup = on);
-                        if this.prefs.online_lookup != lookup_before {
-                            this.library.set_online_lookup(this.prefs.online_lookup);
-                        }
-                        cx.notify();
-                    });
-                })
+            toggle(
+                "pref-online-lookup",
+                "Complete missing tags and covers online",
+                self.prefs.online_lookup,
+                window,
+                cx,
+            )
+            .on_change(move |on, _, _, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    let lookup_before = this.prefs.online_lookup;
+                    this.prefs.online_lookup = on;
+                    AppConfig::update(|c| c.online_lookup = on);
+                    if this.prefs.online_lookup != lookup_before {
+                        this.library.set_online_lookup(this.prefs.online_lookup);
+                    }
+                    cx.notify();
+                });
+            })
         };
         let lookup_info = with_tooltip(
             div()

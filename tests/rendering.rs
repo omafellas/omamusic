@@ -616,6 +616,80 @@ mod pixels {
         );
     }
 
+    fn settings_toggles_are_pills_that_show_their_state() {
+        let mut scene = Scene::open();
+        scene.act(|window, cx| window.click("settings", cx));
+        let on = scene.bounds("pref-visual-effects");
+        let off = scene.bounds("pref-start-hidden");
+        let before = scene.capture();
+        let inset = px(16. * 0.125 + 1.);
+        let track = |b: Bounds<Pixels>| {
+            Bounds::new(
+                b.origin + gpui_kit::point(inset, inset),
+                size(b.size.width - inset * 2., b.size.height - inset * 2.),
+            )
+        };
+        let (on_track, off_track) = (track(on), track(off));
+        let row = before.color_at(gpui_kit::point(on.left() - px(3.), on.center().y));
+        let corner = before.color_at(on_track.origin + gpui_kit::point(px(0.5), px(0.5)));
+        assert!(
+            close(corner, row),
+            "the track corner is rounded away: {corner:?} vs row {row:?}"
+        );
+        let on_fill = before.color_at(gpui_kit::point(
+            on_track.left() + on_track.size.width * 0.25,
+            on_track.center().y,
+        ));
+        let off_fill = before.color_at(gpui_kit::point(
+            off_track.left() + off_track.size.width * 0.75,
+            off_track.center().y,
+        ));
+        assert!(!close(on_fill, row), "an on track is filled: {on_fill:?}");
+        assert!(
+            !close(on_fill, off_fill),
+            "on and off tracks differ: {on_fill:?} vs {off_fill:?}"
+        );
+        let on_knob = before.color_at(gpui_kit::point(
+            on_track.right() - on_track.size.height / 2.,
+            on_track.center().y,
+        ));
+        let off_knob = before.color_at(gpui_kit::point(
+            off_track.left() + off_track.size.height / 2.,
+            off_track.center().y,
+        ));
+        assert!(
+            !close(on_knob, on_fill),
+            "the knob sits at the right when on"
+        );
+        assert!(
+            !close(off_knob, off_fill),
+            "the knob sits at the left when off"
+        );
+        let under_knob = before.color_at(gpui_kit::point(
+            on_track.right() - on_track.size.height / 2.,
+            on_track.bottom() - px(0.5),
+        ));
+        assert!(
+            close(under_knob, on_fill),
+            "the knob stays inside the track: {under_knob:?} vs fill {on_fill:?}"
+        );
+
+        scene.act(|window, cx| window.click("pref-start-hidden", cx));
+        let after = scene.capture();
+        assert!(
+            after.changed_in(&before, off) > 0,
+            "clicking the toggle repaints it"
+        );
+        let switched = after.color_at(gpui_kit::point(
+            off_track.left() + off_track.size.width * 0.25,
+            off_track.center().y,
+        ));
+        assert!(
+            close(switched, on_fill),
+            "the switched-on track takes the on fill: {switched:?} vs {on_fill:?}"
+        );
+    }
+
     fn album_cover_has_round_corners() {
         let library = Arc::new(Library::empty());
         library.insert_album(&AlbumSummary {
@@ -897,7 +971,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 19] = [
+        let tests: [(&str, fn()); 20] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -928,6 +1002,10 @@ mod pixels {
             (
                 "settings_panel_has_round_corners",
                 settings_panel_has_round_corners,
+            ),
+            (
+                "settings_toggles_are_pills_that_show_their_state",
+                settings_toggles_are_pills_that_show_their_state,
             ),
             (
                 "album_cover_has_round_corners",
