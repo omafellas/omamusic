@@ -24,7 +24,7 @@ use gpui_kit::{
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, keycap,
-    keycaps, menu, separator, switch, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName,
+    keycaps, link, menu, switch, with_tooltip, ActiveTheme, Button, ButtonVariant, IconName,
     MenuItem,
 };
 use rand::Rng;
@@ -554,21 +554,74 @@ fn library_counts_text(albums: usize, tracks: usize) -> String {
     format!("{} songs · {} albums", tracks, albums)
 }
 
-/// Open `url` in the user's default browser.
-fn open_url(url: &str) {
-    let _ = Command::new("xdg-open").arg(url).spawn();
-}
-
-/// A settings section heading, visually separated from the controls around it.
-fn section_header(label: &'static str, cx: &App) -> impl IntoElement {
+/// A settings section: the sidebar's eyebrow heading over one rounded group
+/// of rows, divided by hairlines.
+fn settings_section(label: &'static str, rows: Vec<AnyElement>, cx: &App) -> impl IntoElement {
+    let theme = cx.omarchy().clone();
+    let mut group = div()
+        .flex()
+        .flex_col()
+        .rounded(rems(0.5))
+        .bg(theme.normal_fill());
+    for (i, row) in rows.into_iter().enumerate() {
+        if i > 0 {
+            group = group.child(div().mx(rems(0.75)).h(px(1.)).bg(theme.divider()));
+        }
+        group = group.child(row);
+    }
     div()
         .flex()
-        .px(rems(0.3125))
-        .pt(rems(0.5))
-        .text_size(rems(0.625))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(cx.omarchy().secondary)
-        .child(label)
+        .flex_col()
+        .gap(rems(0.375))
+        .child(
+            div()
+                .px(rems(0.75))
+                .text_size(rems(0.625))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.secondary)
+                .child(label),
+        )
+        .child(group)
+}
+
+/// One settings row: a label, an optional help line under it, and its
+/// control on the trailing edge.
+fn settings_row(
+    label: impl IntoElement,
+    help: Option<AnyElement>,
+    control: impl IntoElement,
+    cx: &App,
+) -> Div {
+    let theme = cx.omarchy().clone();
+    div()
+        .flex()
+        .items_center()
+        .gap(rems(0.75))
+        .px(rems(0.75))
+        .py(rems(0.375))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(rems(0.125))
+                .child(
+                    div()
+                        .text_size(rems(0.75))
+                        .text_color(theme.foreground)
+                        .child(label),
+                )
+                .children(help),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(rems(0.25))
+                .child(control),
+        )
 }
 
 /// Equalizer bar shape over one animation cycle, 0.0..=1.0. The two mixed
@@ -1052,7 +1105,6 @@ impl Omamusic {
                     .id("lookup-status")
                     .test_support()
                     .aria_label(text.clone())
-                    .px(rems(0.3125))
                     .text_size(rems(0.6875))
                     .text_color(theme.secondary)
                     .child(text)
@@ -1072,7 +1124,6 @@ impl Omamusic {
                 .flex()
                 .flex_col()
                 .gap(rems(0.25))
-                .px(rems(0.3125))
                 .child(
                     div()
                         .id("lookup-status")
@@ -1532,32 +1583,36 @@ impl Omamusic {
     fn text_size_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.omarchy().clone();
         let pct = format!("{}%", (self.prefs.ui_scale * 100.0).round() as i32);
-        div()
+        let controls = div()
             .flex()
             .items_center()
-            .gap(rems(0.5))
-            .py(rems(0.3125))
-            .px(rems(0.3125))
-            .child(
-                div()
-                    .flex_1()
-                    .text_size(rems(0.75))
-                    .text_color(theme.foreground)
-                    .child("Text size"),
-            )
             .child(
                 button("font-smaller", "−", ButtonVariant::Secondary, cx)
                     .on_click(cx.listener(|this, _, _, cx| this.bump_scale(-1, cx))),
             )
             .child(with_tooltip(
                 button("font-reset", pct, ButtonVariant::Secondary, cx)
+                    .min_w(rems(3.))
+                    .justify_center()
                     .on_click(cx.listener(|this, _, _, cx| this.set_scale(1.0, cx))),
                 "Reset to 100% (Ctrl+0)",
             ))
             .child(
                 button("font-larger", "+", ButtonVariant::Secondary, cx)
                     .on_click(cx.listener(|this, _, _, cx| this.bump_scale(1, cx))),
-            )
+            );
+        settings_row(
+            "Text size",
+            Some(
+                div()
+                    .text_size(rems(0.6875))
+                    .text_color(theme.secondary)
+                    .child("Ctrl + and Ctrl − also work anywhere")
+                    .into_any_element(),
+            ),
+            controls,
+            cx,
+        )
     }
 
     /// Sync the window rem size with the saved UI scale. Called at the top of
@@ -1573,18 +1628,34 @@ impl Omamusic {
         &self,
         id: &'static str,
         label: &'static str,
+        help: &'static str,
         checked: bool,
         change: fn(&mut AppConfig, bool),
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let theme = cx.omarchy().clone();
         let this = cx.entity().downgrade();
-        switch(id, label, checked, cx).on_change(move |on, _, _, cx| {
-            let _ = this.update(cx, |this, cx| {
-                change(&mut this.prefs, on);
-                AppConfig::update(|c| change(c, on));
-                cx.notify();
+        let control = switch(id, "", checked, cx)
+            .accessibility_label(label)
+            .on_change(move |on, _, _, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    change(&mut this.prefs, on);
+                    AppConfig::update(|c| change(c, on));
+                    cx.notify();
+                });
             });
-        })
+        settings_row(
+            label,
+            Some(
+                div()
+                    .text_size(rems(0.6875))
+                    .text_color(theme.secondary)
+                    .child(help)
+                    .into_any_element(),
+            ),
+            control,
+            cx,
+        )
     }
 
     fn browse_folder(&mut self, cx: &mut Context<Self>) {
@@ -4534,16 +4605,255 @@ impl Omamusic {
         let version = env!("CARGO_PKG_VERSION");
         let folder_text = self.new_folder.read(cx).text().to_string();
         let has_folder_text = !folder_text.trim().is_empty();
-        let config_path = AppConfig::path().to_string_lossy().to_string();
-        let title_text: SharedString = format!("Settings ({config_path})").into();
+        let config_path: SharedString = AppConfig::path().to_string_lossy().to_string().into();
 
-        // Backdrop: full-window overlay. `on_mouse_down` + `on_scroll_wheel`
-        // consume clicks and wheel events so the window behind cannot be
-        // clicked through or scrolled while the settings panel is open.
-        // Scrolling *inside* the panel still works: the panel is the deepest
-        // hitbox under the pointer and its `overflow_y_scroll` handles the
-        // wheel before the event ever reaches the backdrop.
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(rems(0.5))
+            .px(rems(0.75))
+            .child(
+                div()
+                    .id("settings-title")
+                    .test_support()
+                    .aria_label("Settings")
+                    .flex_1()
+                    .text_size(rems(0.875))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Settings"),
+            )
+            .child(
+                icon_button(
+                    "close-settings-x",
+                    IconName::Close,
+                    "Close settings",
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_settings = false;
+                    cx.notify();
+                })),
+            );
+
+        let interface = settings_section(
+            "INTERFACE",
+            vec![
+                self.pref_switch(
+                    "pref-visual-effects",
+                    "Visual effects",
+                    "Music-reactive bars above the player",
+                    self.prefs.visual_effects,
+                    |c, on| c.visual_effects = on,
+                    cx,
+                )
+                .into_any_element(),
+                self.text_size_row(cx).into_any_element(),
+            ],
+            cx,
+        );
+
+        let behavior = settings_section(
+            "BEHAVIOR",
+            vec![
+                self.pref_switch(
+                    "pref-close-to-tray",
+                    "Close window to tray",
+                    "Keep playing in the background when the window closes",
+                    !self.prefs.quit_on_close,
+                    |c, on| c.quit_on_close = !on,
+                    cx,
+                )
+                .into_any_element(),
+                self.pref_switch(
+                    "pref-start-hidden",
+                    "Start hidden in tray",
+                    "Open without showing the window",
+                    self.prefs.start_hidden,
+                    |c, on| c.start_hidden = on,
+                    cx,
+                )
+                .into_any_element(),
+            ],
+            cx,
+        );
+
+        let lookup_switch = {
+            let entity = cx.entity().downgrade();
+            switch("pref-online-lookup", "", self.prefs.online_lookup, cx)
+                .accessibility_label("Complete missing tags and covers online")
+                .on_change(move |on, _, _, cx| {
+                    let _ = entity.update(cx, |this, cx| {
+                        let lookup_before = this.prefs.online_lookup;
+                        this.prefs.online_lookup = on;
+                        AppConfig::update(|c| c.online_lookup = on);
+                        if this.prefs.online_lookup != lookup_before {
+                            this.library.set_online_lookup(this.prefs.online_lookup);
+                        }
+                        cx.notify();
+                    });
+                })
+        };
+        let lookup_info = with_tooltip(
+            div()
+                .id("lookup-info-hint")
+                .test_support()
+                .flex()
+                .items_center()
+                .text_color(theme.secondary)
+                .cursor_pointer()
+                .child(icon(IconName::Info).size(rems(0.75))),
+            "Sends album and artist names to MusicBrainz, Apple and Deezer, and audio \
+             fingerprints to AcoustID when a key is set. Writes covers and missing tags \
+             into your music files.",
+        );
+        let acoustid_hint = self.prefs.acoustid_key.is_empty().then(|| {
+            div()
+                .id("lookup-acoustid-hint")
+                .test_support()
+                .text_size(rems(0.6875))
+                .text_color(theme.secondary)
+                .child(
+                    "Untagged files can also be identified by sound: get a free AcoustID \
+                     application key, put it in config.json as \"acoustid_key\" and restart.",
+                )
+                .into_any_element()
+        });
+        let mut lookup_rows = vec![settings_row(
+            "Complete missing tags and covers online",
+            acoustid_hint,
+            div()
+                .flex()
+                .items_center()
+                .gap(rems(0.25))
+                .child(lookup_info)
+                .child(lookup_switch),
+            cx,
+        )
+        .into_any_element()];
+        if let Some(status) = self.lookup_status(snap, cx) {
+            lookup_rows.push(
+                div()
+                    .px(rems(0.75))
+                    .py(rems(0.5))
+                    .child(status)
+                    .into_any_element(),
+            );
+        }
+        let lookup = settings_section("ONLINE LOOKUP", lookup_rows, cx);
+
+        let mut folder_rows: Vec<AnyElement> = snap
+            .folders
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let p = f.clone();
+                let path: SharedString = f.to_string_lossy().to_string().into();
+                settings_row(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(rems(0.5))
+                        .child(
+                            icon(IconName::FolderOpen)
+                                .size(rems(0.875))
+                                .text_color(theme.secondary),
+                        )
+                        .child(div().min_w_0().truncate().child(path)),
+                    None,
+                    icon_button(
+                        ("rm-folder", i),
+                        IconName::Trash,
+                        "Remove folder",
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.library.remove_folder(&p);
+                        cx.notify();
+                    })),
+                    cx,
+                )
+                .into_any_element()
+            })
+            .collect();
+        folder_rows.push(
+            div()
+                .flex()
+                .items_center()
+                .gap(rems(0.5))
+                .px(rems(0.75))
+                .py(rems(0.5))
+                .child(
+                    div()
+                        .flex_1()
+                        .child(input("new-folder", &self.new_folder, window, cx)),
+                )
+                .child(
+                    button(
+                        "browse-folder",
+                        if has_folder_text { "Add" } else { "Browse…" },
+                        ButtonVariant::Secondary,
+                        cx,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.browse_folder(cx))),
+                )
+                .into_any_element(),
+        );
+        let folders = settings_section("MUSIC FOLDERS", folder_rows, cx);
+
+        let about = settings_section(
+            "ABOUT",
+            vec![settings_row(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(rems(0.25))
+                    .child("omamusic")
+                    .child(
+                        div()
+                            .id("settings-version")
+                            .test_support()
+                            .text_color(theme.secondary)
+                            .child(version),
+                    ),
+                Some(
+                    with_tooltip(
+                        div()
+                            .id("settings-config-path")
+                            .test_support()
+                            .aria_label(config_path.clone())
+                            .max_w_full()
+                            .truncate()
+                            .font_family(theme.mono_font.clone())
+                            .text_size(rems(0.6875))
+                            .text_color(theme.secondary)
+                            .child(config_path.clone()),
+                        config_path,
+                    )
+                    .into_any_element(),
+                ),
+                div().id("github").test_support().child(link(
+                    "github-link",
+                    "GitHub",
+                    "https://github.com/omafellas/omamusic",
+                    cx,
+                )),
+                cx,
+            )
+            .into_any_element()],
+            cx,
+        );
+
+        // Backdrop: full-window overlay. `occlude` ends the hit test here so
+        // rows behind it stop receiving hover; `on_mouse_down` +
+        // `on_scroll_wheel` consume clicks and wheel events so the window
+        // behind cannot be clicked through or scrolled while the settings
+        // panel is open. Scrolling *inside* the panel still works: the panel
+        // is the deepest hitbox under the pointer and its `overflow_y_scroll`
+        // handles the wheel before the event ever reaches the backdrop.
         div()
+            .occlude()
             .absolute()
             .size_full()
             .bg(theme.background.opacity(0.6))
@@ -4567,217 +4877,35 @@ impl Omamusic {
             .child(
                 div()
                     .id("settings-panel")
+                    .test_support()
                     .w(rems(34.))
                     .max_h_full()
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .min_w_0()
-                    .gap(rems(0.5))
-                    .p(rems(1.125))
+                    .gap(rems(0.75))
+                    .p(rems(1.))
+                    .rounded(rems(0.75))
                     .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
+                    .border_color(theme.divider())
+                    .bg(theme.surface)
+                    .shadow(vec![BoxShadow {
+                        color: gpui_kit::black().opacity(0.35),
+                        offset: gpui_kit::point(px(0.), px(12.)),
+                        blur_radius: px(32.),
+                        spread_radius: px(0.),
+                        inset: false,
+                    }])
                     .font_family(theme.font.clone())
                     .text_size(rems(0.75))
                     .text_color(theme.foreground)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .id("settings-title")
-                                    .test_support()
-                                    .aria_label(title_text.clone())
-                                    .text_size(rems(0.875))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(title_text),
-                            )
-                            .child(
-                                icon_button(
-                                    "close-settings-x",
-                                    IconName::Close,
-                                    "Close settings",
-                                    ButtonVariant::Secondary,
-                                    cx,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.show_settings = false;
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
-                    )
-                    .child(separator(cx))
-                    // --- Interface ---
-                    .child(section_header("Interface", cx))
-                    .child(self.pref_switch(
-                        "pref-visual-effects",
-                        "Visual Effects",
-                        self.prefs.visual_effects,
-                        |c, on| c.visual_effects = on,
-                        cx,
-                    ))
-                    .child(self.text_size_row(cx))
-                    .child(separator(cx))
-                    // --- Behavior ---
-                    .child(section_header("Behavior", cx))
-                    .child(self.pref_switch(
-                        "pref-close-to-tray",
-                        "Close window to tray",
-                        !self.prefs.quit_on_close,
-                        |c, on| c.quit_on_close = !on,
-                        cx,
-                    ))
-                    .child(self.pref_switch(
-                        "pref-start-hidden",
-                        "Start hidden in tray",
-                        self.prefs.start_hidden,
-                        |c, on| c.start_hidden = on,
-                        cx,
-                    ))
-                    // --- Online lookup ---
-                    .child(section_header("Online lookup", cx))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(rems(0.5))
-                            .child({
-                                let entity = cx.entity().downgrade();
-                                switch(
-                                    "pref-online-lookup",
-                                    "Complete missing tags and covers online",
-                                    self.prefs.online_lookup,
-                                    cx,
-                                )
-                                .on_change(move |on, _, _, cx| {
-                                    let _ = entity.update(cx, |this, cx| {
-                                        let lookup_before = this.prefs.online_lookup;
-                                        this.prefs.online_lookup = on;
-                                        AppConfig::update(|c| c.online_lookup = on);
-                                        if this.prefs.online_lookup != lookup_before {
-                                            this.library
-                                                .set_online_lookup(this.prefs.online_lookup);
-                                        }
-                                        cx.notify();
-                                    });
-                                })
-                            })
-                            .child(with_tooltip(
-                                div()
-                                    .id("lookup-info-hint")
-                                    .test_support()
-                                    .flex()
-                                    .items_center()
-                                    .text_color(theme.secondary)
-                                    .cursor_pointer()
-                                    .child(icon(IconName::Info).size(rems(0.75))),
-                                "Sends album and artist names to MusicBrainz, Apple and \
-                                 Deezer, and audio fingerprints to AcoustID when a key is \
-                                 set. Writes covers and missing tags into your music files.",
-                            )),
-                    )
-                    .when(self.prefs.acoustid_key.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .id("lookup-acoustid-hint")
-                                .test_support()
-                                .px(rems(0.3125))
-                                .text_size(rems(0.6875))
-                                .text_color(theme.secondary)
-                                .child(
-                                    "Untagged files can also be identified by sound: get a \
-                                     free AcoustID application key, put it in config.json \
-                                     as \"acoustid_key\" and restart.",
-                                ),
-                        )
-                    })
-                    .children(self.lookup_status(snap, cx))
-                    .child(separator(cx))
-                    // --- Folder directories ---
-                    .child(section_header("Folder directories", cx))
-                    .child(div().flex().flex_col().gap(rems(0.5)).children(
-                        snap.folders.iter().map(|f| {
-                            let p = f.clone();
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(rems(0.5))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .text_size(rems(0.6875))
-                                        .child(f.to_string_lossy().to_string()),
-                                )
-                                .child(
-                                    button("rm-folder", "Remove", ButtonVariant::Secondary, cx)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.library.remove_folder(&p);
-                                            cx.notify();
-                                        })),
-                                )
-                        }),
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .gap(rems(0.5))
-                            .child(div().flex_1().child(input(
-                                "new-folder",
-                                &self.new_folder,
-                                window,
-                                cx,
-                            )))
-                            .child(
-                                button(
-                                    "browse-folder",
-                                    if has_folder_text { "Add" } else { "Browse…" },
-                                    ButtonVariant::Secondary,
-                                    cx,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| this.browse_folder(cx))),
-                            ),
-                    )
-                    .child(separator(cx))
-                    // --- About ---
-                    .child(section_header("About", cx))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(rems(0.5))
-                            .text_size(rems(0.6875))
-                            .text_color(theme.secondary)
-                            .child("Version ")
-                            .child(
-                                div()
-                                    .id("settings-version")
-                                    .test_support()
-                                    .text_color(theme.foreground)
-                                    .child(version),
-                            )
-                            .child(with_tooltip(
-                                button("github", "GitHub", ButtonVariant::Secondary, cx).on_click(
-                                    cx.listener(|_, _, _, cx| {
-                                        open_url("https://github.com/omafellas/omamusic");
-                                        cx.notify();
-                                    }),
-                                ),
-                                "Open omafellas/omamusic on GitHub",
-                            )),
-                    )
-                    .child(
-                        button("close-settings", "Close", ButtonVariant::Secondary, cx).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.show_settings = false;
-                                cx.notify();
-                            }),
-                        ),
-                    ),
+                    .child(header)
+                    .child(interface)
+                    .child(behavior)
+                    .child(lookup)
+                    .child(folders)
+                    .child(about),
             )
     }
 }

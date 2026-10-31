@@ -439,6 +439,35 @@ mod pixels {
         );
     }
 
+    fn rows_behind_settings_do_not_hover() {
+        let library = Arc::new(Library::empty());
+        library.insert_song(
+            &omamusic::models::Track {
+                path: "/m/Afterglow/Low Tide.flac".into(),
+                title: "Low Tide".into(),
+                artist: "Neon Harbor".into(),
+                album: "Afterglow".into(),
+                track_number: 1,
+                year: 2020,
+                duration: 230.0,
+                album_id: "afterglow".into(),
+                genre: "Synth-pop".into(),
+            },
+            1,
+        );
+        let mut scene = Scene::open_with(library);
+        scene.act(|window, cx| window.click("settings", cx));
+        let row = scene.bounds_of(("song", 0usize));
+        let resting = scene.capture();
+        scene.act(|window, cx| window.hover(("song", 0usize), cx));
+        let hovered = scene.capture();
+        assert_eq!(
+            hovered.changed_in(&resting, row),
+            0,
+            "a row under the settings backdrop must not take its hover fill at {row:?}"
+        );
+    }
+
     fn close(got: [u8; 4], want: [u8; 4]) -> bool {
         got.iter()
             .zip(want)
@@ -488,6 +517,24 @@ mod pixels {
         assert!(
             close(corner, sidebar),
             "the corner of {row:?} must be cut round: {corner:?} vs {sidebar:?}"
+        );
+    }
+
+    fn settings_panel_has_round_corners() {
+        let mut scene = Scene::open();
+        scene.act(|window, cx| window.click("settings", cx));
+        let capture = scene.capture();
+        let panel = scene.bounds("settings-panel");
+        let backdrop = capture.color_at(gpui_kit::point(panel.left() - px(3.), panel.center().y));
+        let fill = capture.color_at(gpui_kit::point(panel.left() + px(4.), panel.center().y));
+        assert!(
+            !close(fill, backdrop),
+            "the panel must be a raised surface: {fill:?} on {backdrop:?}"
+        );
+        let corner = capture.color_at(panel.origin + gpui_kit::point(px(0.5), px(0.5)));
+        assert!(
+            close(corner, backdrop),
+            "the corner of {panel:?} must be cut round: {corner:?} vs {backdrop:?}"
         );
     }
 
@@ -772,7 +819,7 @@ mod pixels {
                 panic!("rendering: RENDERING_REQUIRED is set but the renderer failed: {err}")
             }
         }
-        let tests: [(&str, fn()); 16] = [
+        let tests: [(&str, fn()); 18] = [
             (
                 "window_is_drawn_and_deterministic",
                 window_is_drawn_and_deterministic,
@@ -793,8 +840,16 @@ mod pixels {
                 hovering_a_song_reveals_its_play_button,
             ),
             (
+                "rows_behind_settings_do_not_hover",
+                rows_behind_settings_do_not_hover,
+            ),
+            (
                 "selected_sidebar_row_has_round_corners",
                 selected_sidebar_row_has_round_corners,
+            ),
+            (
+                "settings_panel_has_round_corners",
+                settings_panel_has_round_corners,
             ),
             (
                 "album_cover_has_round_corners",

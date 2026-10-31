@@ -351,15 +351,12 @@ async fn settings_shows_version_and_github_link(cx: &mut TestAppContext) {
         "settings shows the app version element"
     );
     assert!(app.has("github"), "settings links to GitHub");
-    // The title names the file the settings live in.
-    let title = app.label("settings-title").unwrap_or_default();
+    assert_eq!(app.label("settings-title").as_deref(), Some("Settings"));
+    // The About row names the file the settings live in.
+    let path = app.label("settings-config-path").unwrap_or_default();
     assert!(
-        title.starts_with("Settings (") && title.ends_with(')'),
-        "the title includes the config path, got {title:?}"
-    );
-    assert!(
-        title.contains("config.json"),
-        "the title names the config file, got {title:?}"
+        path.ends_with("config.json"),
+        "the About row names the config file, got {path:?}"
     );
 }
 
