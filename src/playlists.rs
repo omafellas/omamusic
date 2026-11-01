@@ -2,11 +2,46 @@ use crate::config::AppConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Playlist {
     pub id: u64,
     pub name: String,
     pub tracks: Vec<PathBuf>,
+    /// Whether this playlist is shared over P2P.
+    #[serde(default)]
+    pub p2p: bool,
+    /// The `omamusic://` share string, only meaningful for the owner.
+    #[serde(default)]
+    pub p2p_share: Option<String>,
+    /// Are we the owner of this P2P playlist? Only the owner can add/remove songs.
+    #[serde(default)]
+    pub p2p_owner: bool,
+    /// Owner's iroh node id (hex), for verifying the share.
+    #[serde(default)]
+    pub p2p_owner_node_id: Option<String>,
+    /// Manifest blob hash (hex) of the shared playlist.
+    #[serde(default)]
+    pub p2p_manifest_hash: Option<String>,
+    /// Have we fully synced every song locally? Gating for playback.
+    #[serde(default)]
+    pub p2p_synced: bool,
+    /// Number of connected peers currently syncing this playlist.
+    #[serde(default)]
+    pub p2p_peer_count: usize,
+    /// Total size of all songs in bytes.
+    #[serde(default)]
+    pub p2p_total_size: u64,
+    /// Last time the playlist was synced/updated (nanos since epoch).
+    #[serde(default)]
+    pub p2p_last_updated: Option<i64>,
+    /// Song count the user last saw; when the synced count exceeds this, the
+    /// playlist list shows a "new" marker (a peer received fresh songs).
+    #[serde(default)]
+    pub p2p_seen_songs: usize,
+    /// Cumulative bytes this node has seeded (served to peers), persisted so a
+    /// restart knows the running total. Shown only while actively seeding.
+    #[serde(default)]
+    pub p2p_seeded_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -46,6 +81,10 @@ impl Playlists {
         self.items.iter().find(|p| p.id == id)
     }
 
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut Playlist> {
+        self.items.iter_mut().find(|p| p.id == id)
+    }
+
     pub fn create(&mut self, name: &str, tracks: Vec<PathBuf>) -> u64 {
         self.next_id = self
             .next_id
@@ -56,6 +95,7 @@ impl Playlists {
             id,
             name: name.trim().to_string(),
             tracks,
+            ..Default::default()
         });
         id
     }

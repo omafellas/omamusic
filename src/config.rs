@@ -30,6 +30,11 @@ pub struct AppConfig {
     pub song_sort: SongSort,
     /// The sidebar shows only its icons.
     pub sidebar_collapsed: bool,
+    /// P2P playlist sharing over the internet (iroh). When off, every P2P
+    /// feature is disabled internally and hidden from the UI.
+    pub p2p_enabled: bool,
+    /// Maximum total size of a single P2P playlist, in gigabytes.
+    pub p2p_max_playlist_size_gb: u64,
 }
 
 impl Default for AppConfig {
@@ -48,6 +53,8 @@ impl Default for AppConfig {
             album_view: AlbumView::default(),
             song_sort: SongSort::default(),
             sidebar_collapsed: false,
+            p2p_enabled: true,
+            p2p_max_playlist_size_gb: 5,
         }
     }
 }
@@ -88,6 +95,16 @@ impl AppConfig {
     /// use this so each one has its own file and never touches the user's.
     pub fn use_dir(dir: impl Into<PathBuf>) {
         CONFIG_DIR.with(|d| *d.borrow_mut() = Some(dir.into()));
+    }
+
+    /// Isolated on-disk directory for P2P blob storage, cache DB and node key.
+    /// Lives under the same folder the app uses for its other state so tests
+    /// with `use_dir` never touch the user's real cache.
+    pub fn p2p_cache_dir() -> PathBuf {
+        Self::path()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(std::env::temp_dir)
     }
 
     pub fn load() -> Self {

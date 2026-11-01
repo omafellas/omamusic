@@ -57,6 +57,9 @@ pub(crate) type SharedSnapshot = Arc<RwLock<Arc<LibrarySnapshot>>>;
 pub struct Library {
     state: SharedSnapshot,
     db: Arc<Db>,
+    /// Cached reader for the isolated P2P cache DB, opened on first use so a
+    /// synced playlist's tracks can be listed without re-opening per frame.
+    p2p_conn: Mutex<Option<rusqlite::Connection>>,
     covers: ArtworkCache,
     watcher: Mutex<Option<RecommendedWatcher>>,
     rescan_tx: Sender<()>,
@@ -151,6 +154,7 @@ impl Library {
         Ok(Self {
             state,
             db,
+            p2p_conn: Mutex::new(None),
             covers,
             watcher: Mutex::new(watcher),
             rescan_tx,
@@ -297,6 +301,7 @@ impl Library {
         Ok(Self {
             state,
             db,
+            p2p_conn: Mutex::new(None),
             covers,
             watcher: Mutex::new(None),
             rescan_tx,
@@ -304,12 +309,15 @@ impl Library {
         })
     }
 
-    fn cache_dir() -> Result<PathBuf> {
+    /// Directory the library keeps its SQLite database and P2P cache in.
+    pub fn cache_dir() -> Result<PathBuf> {
         let dir = dirs::cache_dir().context("no cache directory")?;
         Ok(dir.join("omamusic"))
     }
 
-    fn db_path() -> Result<PathBuf> {
+    /// Path to the library SQLite database. Also used by the P2P subsystem to
+    /// persist share/peer cache records.
+    pub fn db_path() -> Result<PathBuf> {
         Ok(Self::cache_dir()?.join("library.db"))
     }
 
@@ -429,6 +437,7 @@ impl Library {
         Self {
             state: Arc::new(RwLock::new(Arc::new(LibrarySnapshot::default()))),
             db,
+            p2p_conn: Mutex::new(None),
             covers,
             watcher: Mutex::new(None),
             rescan_tx,
@@ -691,6 +700,50 @@ impl Library {
             .unwrap_or_default()
     }
 
+    /// Tracks for a synced P2P playlist, read from the P2P cache DB — the same
+    /// file the P2P worker writes, isolated from the main library index.
+    /// Returns an empty vec for non-P2P or not-yet-synced playlists; callers
+    /// treat that as "not playable yet". The reader connection is cached so a
+    /// synced playlist does not re-open the DB every frame.
+    pub fn p2p_tracks(&self, playlist_id: u64) -> Vec<Track> {
+        let path = AppConfig::p2p_cache_dir().join("p2p").join("p2p.db");
+        let mut cache = self.p2p_conn.lock();
+        // (Re)open only when the path changed, e.g. a test switched config dirs.
+        let reopened = cache
+            .as_ref()
+            .and_then(|c| c.path())
+            .is_none_or(|p| p != path.as_path());
+        if reopened {
+            match rusqlite::Connection::open(&path) {
+                Ok(conn) => {
+                    let _ = db::ensure_p2p_schema(&conn);
+                    *cache = Some(conn);
+                }
+                Err(_) => return Vec::new(),
+            }
+        }
+        let Some(conn) = cache.as_ref() else {
+            return Vec::new();
+        };
+        let rows = db::list_p2p_tracks(conn, playlist_id).unwrap_or_default();
+        rows.into_iter()
+            .map(
+                |(path, hash, title, artist, album, duration, _size, _mime)| Track {
+                    path: PathBuf::from(path),
+                    title,
+                    artist,
+                    album,
+                    track_number: 0,
+                    year: 0,
+                    duration,
+                    album_id: hash,
+                    genre: String::new(),
+                    plays: 0,
+                },
+            )
+            .collect()
+    }
+
     pub fn first_album_key(&self) -> Option<String> {
         self.db.read(db::first_album_key).ok().flatten()
     }
@@ -709,6 +762,7 @@ impl Library {
         Ok(Self {
             state,
             db,
+            p2p_conn: Mutex::new(None),
             covers,
             watcher: Mutex::new(None),
             rescan_tx,

@@ -107,7 +107,9 @@ pub fn reconcile(
         }
         for entry in WalkDir::new(folder)
             .into_iter()
-            .filter_entry(|entry| !metadata::is_macos_junk(entry.path()))
+            .filter_entry(|entry| {
+                !metadata::is_macos_junk(entry.path()) && !metadata::is_shared_p2p(entry.path())
+            })
             .filter_map(|e| e.ok())
         {
             let is_file = entry.file_type().is_file();

@@ -10,6 +10,7 @@ pub mod lookup;
 pub mod metadata;
 pub mod models;
 pub mod mpris;
+pub mod p2p;
 pub mod player;
 pub mod player_bar;
 pub mod playlists;

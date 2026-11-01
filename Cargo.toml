@@ -33,6 +33,10 @@ ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] 
 rusty-chromaprint = "0.3"
 base64 = "0.22"
 realfft = "3.5"
+# P2P playlist sharing over the internet with iroh.
+iroh = "1.4.1"
+iroh-blobs = "0.104"
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 
 [features]
 test-support = []

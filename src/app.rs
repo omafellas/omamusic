@@ -5,6 +5,7 @@ use crate::models::{
     Album, AlbumSort, AlbumSummary, AlbumView, ArtistEntry, GenreEntry, PlayerState, Section,
     SongColumn, SongSort, Track,
 };
+use crate::p2p::{self, P2pEvent, P2pManager};
 use crate::player::Player;
 use crate::playlists::Playlists;
 use crate::search::{highlight_ranges, top_result, TopResult};
@@ -18,11 +19,11 @@ use gpui_kit::TestSupportExt;
 use gpui_kit::{
     canvas, div, ease_out_quint, fill, img, linear_color_stop, linear_gradient, px, rems,
     uniform_list, Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, BoxShadow,
-    ClickEvent, Context, Corners, Div, ElementId, Entity, EntityInputHandler, FocusHandle,
-    Focusable, FontWeight, HighlightStyle, Hsla, ImageSource, InteractiveElement, IntoElement,
-    MouseButton, NavigationDirection, ObjectFit, ParentElement, PathPromptOptions, Pixels, Render,
-    Rgba, SharedString, Stateful, StatefulInteractiveElement, StyleRefinement, Styled,
-    StyledImage as _, StyledText, Window,
+    ClickEvent, ClipboardItem, Context, Corners, Div, ElementId, Entity, EntityInputHandler,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, ImageSource, InteractiveElement,
+    IntoElement, MouseButton, NavigationDirection, ObjectFit, ParentElement, PathPromptOptions,
+    Pixels, Render, Rgba, SharedString, Stateful, StatefulInteractiveElement, StyleRefinement,
+    Styled, StyledImage as _, StyledText, Window,
 };
 use gpui_omarchy::{
     avatar, avatar_image, button, empty_state, focus_scope, icon, icon_button, input, keycap,
@@ -36,7 +37,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Omamusic {
     pub library: Arc<Library>,
@@ -54,7 +55,13 @@ pub struct Omamusic {
     queue_seq: u64,
     lib_version: u64,
     prefs: AppConfig,
+    /// P2P subsystem (None when it could not be started).
+    p2p: Option<P2pManager>,
+    p2p_max_size: Entity<InputState>,
     new_folder: Entity<InputState>,
+    /// Whether the "join a P2P share" input below the + button is open.
+    p2p_join_open: bool,
+    p2p_join_input: Entity<InputState>,
     rescan_notify: Option<(String, f32)>,
     /// Bumped for every toast; makes an older fade task ignore a replaced toast.
     notify_seq: u64,
@@ -86,6 +93,8 @@ pub struct Omamusic {
     playlist_name: Entity<InputState>,
     playlist_edit: Option<PlaylistEdit>,
     confirm_delete: Option<u64>,
+    /// True briefly after the share link is copied, to show a "Copied" cue.
+    p2p_copied: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -126,7 +135,16 @@ impl TrackList {
     fn tracks(&self, library: &Library) -> Vec<Track> {
         match self {
             TrackList::Source(source) => library.songs(source),
-            TrackList::Playlist(_, paths) => library.songs(&SongSource::Paths(paths.clone())),
+            TrackList::Playlist(id, paths) => {
+                // A P2P playlist is served from the synced P2P cache until it
+                // has fully synced; only then are its songs playable.
+                let p2p = library.p2p_tracks(*id);
+                if !p2p.is_empty() {
+                    p2p
+                } else {
+                    library.songs(&SongSource::Paths(paths.clone()))
+                }
+            }
             TrackList::Album(key) => library.album_tracks(key),
             TrackList::Artist(name) => library.artist_tracks(name),
             TrackList::Loaded(tracks) => tracks.to_vec(),
@@ -136,10 +154,15 @@ impl TrackList {
     fn get(&self, library: &Library, index: usize) -> Option<Track> {
         match self {
             TrackList::Source(source) => library.song_page(source, index, 1).into_iter().next(),
-            TrackList::Playlist(_, paths) => library
-                .song_page(&SongSource::Paths(paths.clone()), index, 1)
-                .into_iter()
-                .next(),
+            TrackList::Playlist(id, paths) => {
+                let p2p = library.p2p_tracks(*id);
+                p2p.get(index).cloned().or_else(|| {
+                    library
+                        .song_page(&SongSource::Paths(paths.clone()), index, 1)
+                        .into_iter()
+                        .next()
+                })
+            }
             TrackList::Album(key) => library.album_tracks(key).get(index).cloned(),
             TrackList::Artist(name) => library.artist_tracks(name).get(index).cloned(),
             TrackList::Loaded(tracks) => tracks.get(index).cloned(),
@@ -165,6 +188,8 @@ enum RowAction {
     AddToPlaylist(u64),
     NewPlaylistWith,
     RemoveFromPlaylist,
+    /// Copy a P2P-synced song out of the isolated cache into the user's Music folder.
+    CopyToLibrary,
 }
 
 const TRACK_ACTIONS: &[RowAction] = &[
@@ -187,6 +212,28 @@ const PLAYLIST_TRACK_ACTIONS: &[RowAction] = &[
     RowAction::RemoveFromPlaylist,
     RowAction::ExportFile,
     RowAction::OpenContainingFolder,
+];
+/// Row actions for a song inside a synced P2P playlist.
+const P2P_TRACK_ACTIONS: &[RowAction] = &[
+    RowAction::Play,
+    RowAction::PlayNext,
+    RowAction::AddToQueue,
+    RowAction::GoToAlbum,
+    RowAction::GoToArtist,
+    RowAction::CopyToLibrary,
+    RowAction::ExportFile,
+];
+/// The owner of a P2P playlist can also edit it (remove songs), plus copy out.
+const P2P_OWNER_TRACK_ACTIONS: &[RowAction] = &[
+    RowAction::Play,
+    RowAction::PlayNext,
+    RowAction::AddToQueue,
+    RowAction::AddToPlaylistMenu,
+    RowAction::GoToAlbum,
+    RowAction::GoToArtist,
+    RowAction::RemoveFromPlaylist,
+    RowAction::CopyToLibrary,
+    RowAction::ExportFile,
 ];
 const QUEUE_ACTIONS: &[RowAction] = &[
     RowAction::Play,
@@ -291,7 +338,7 @@ impl RowAction {
             | RowAction::NewPlaylistWith => 0,
             RowAction::GoToAlbum | RowAction::GoToArtist => 1,
             RowAction::Remove | RowAction::RemoveFromPlaylist => 2,
-            RowAction::ExportFile | RowAction::OpenContainingFolder => 3,
+            RowAction::ExportFile | RowAction::OpenContainingFolder | RowAction::CopyToLibrary => 3,
         }
     }
 
@@ -310,6 +357,7 @@ impl RowAction {
             }
             RowAction::NewPlaylistWith => ("New Playlist", IconName::Plus),
             RowAction::RemoveFromPlaylist => ("Remove from Playlist", IconName::ListX),
+            RowAction::CopyToLibrary => ("Copy to Music Folder…", IconName::Download),
         };
         MenuItem::new(label).icon(icon_name)
     }
@@ -822,6 +870,41 @@ impl Omamusic {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let new_folder = cx.new(|cx| InputState::new(window, cx).placeholder("Enter folder path"));
         let playlist_name = cx.new(|cx| InputState::new(window, cx).placeholder("Playlist name"));
+        let p2p_max_size =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Max playlist size (GB)"));
+        let max_gb = AppConfig::load().p2p_max_playlist_size_gb;
+        p2p_max_size.update(cx, |field, cx| {
+            field.set_value(max_gb.to_string(), window, cx);
+        });
+        let p2p_join_input = cx.new(|cx| InputState::new(window, cx).placeholder("omamusic://…"));
+        cx.subscribe(&p2p_join_input, |this, _, event: &InputEvent, cx| {
+            match event {
+                InputEvent::PressEnter { .. } => {
+                    let text = this.p2p_join_input.read(cx).text().to_string();
+                    this.try_join_p2p_search(&text, cx);
+                    this.p2p_join_open = false;
+                    cx.notify();
+                }
+                // Clicking away closes the join input, like the new-playlist row.
+                InputEvent::Blur if this.p2p_join_open => {
+                    this.p2p_join_open = false;
+                    cx.notify();
+                }
+                _ => {}
+            }
+        })
+        .detach();
+        cx.subscribe(&p2p_max_size, |this, _, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                let text = this.p2p_max_size.read(cx).text().to_string();
+                if let Ok(gb) = text.trim().parse::<u64>() {
+                    this.prefs.p2p_max_playlist_size_gb = gb;
+                    AppConfig::update(|c| c.p2p_max_playlist_size_gb = gb);
+                    cx.notify();
+                }
+            }
+        })
+        .detach();
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let _focus_guards = [
@@ -879,6 +962,10 @@ impl Omamusic {
             .detach();
         cx.subscribe(&query, |this, _, event: &InputEvent, cx| {
             if let InputEvent::PressEnter { .. } = event {
+                let text = this.query.read(cx).text().to_string();
+                if this.try_join_p2p_search(&text, cx) {
+                    return;
+                }
                 this.play_top_result(cx);
             }
         })
@@ -947,7 +1034,17 @@ impl Omamusic {
 
         let initial_scan_id = library.snapshot().scan_id;
 
-        Self {
+        let prefs = AppConfig::load();
+        let share_root = Self::p2p_share_root(&library);
+        let p2p = P2pManager::new(
+            &AppConfig::p2p_cache_dir(),
+            &share_root,
+            prefs.p2p_enabled,
+            prefs.p2p_max_playlist_size_gb,
+        )
+        .ok();
+
+        let me = Self {
             library,
             player,
             section,
@@ -960,7 +1057,8 @@ impl Omamusic {
             liked: Liked::load(),
             queue_seq: 0,
             lib_version: 0,
-            prefs: AppConfig::load(),
+            prefs,
+            p2p,
             new_folder,
             rescan_notify: None,
             notify_seq: 0,
@@ -978,8 +1076,65 @@ impl Omamusic {
             forward: Vec::new(),
             playlists: Playlists::load(),
             playlist_name,
+            p2p_max_size,
+            p2p_join_open: false,
+            p2p_join_input,
             playlist_edit: None,
             confirm_delete: None,
+            p2p_copied: false,
+        };
+        // Point 6: a playlist that was shared resumes seeding on launch, so the
+        // owner keeps serving (and a peer keeps re-syncing) even with nothing
+        // playing. No-op when P2P is disabled or nothing is shared.
+        me.resume_shares();
+        me
+    }
+
+    /// Where synced, playable copies of shared playlists live: a hidden folder
+    /// inside the user's primary music directory, skipped by the library
+    /// indexer so it never mixes with the normal library but stays on disk and
+    /// plays fully offline.
+    fn p2p_share_root(library: &Arc<Library>) -> PathBuf {
+        let primary = library
+            .snapshot()
+            .folders
+            .first()
+            .cloned()
+            .or_else(dirs::audio_dir)
+            .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
+            .unwrap_or_else(std::env::temp_dir);
+        primary.join(p2p::SHARE_SUBDIR)
+    }
+
+    /// Re-arm P2P shares saved on disk so seeding starts with the app.
+    fn resume_shares(&self) {
+        let Some(p2p) = &self.p2p else {
+            return;
+        };
+        if !self.prefs.p2p_enabled {
+            return;
+        }
+        for playlist in &self.playlists.items {
+            if !playlist.p2p || playlist.p2p_share.is_none() {
+                continue;
+            }
+            if playlist.p2p_owner {
+                // Re-advertise the manifest we already hold (cheap, no
+                // re-hashing); skip if this session's cache is empty (nothing
+                // seeded yet) so we don't bind needlessly.
+                if self.playlist_synced(playlist.id) {
+                    p2p.reshare(playlist.id);
+                }
+            } else {
+                // Re-seed from the local cache first (no owner needed), then try
+                // to pull any new songs from the network.
+                if self.playlist_synced(playlist.id) {
+                    p2p.reshare(playlist.id);
+                }
+                if let Some(share) = &playlist.p2p_share {
+                    p2p.join_share(playlist.id, share.clone());
+                }
+            }
         }
     }
 
@@ -1038,7 +1193,29 @@ impl Omamusic {
         cx.notify();
     }
 
+    /// Re-publish an owned P2P playlist's share after its tracks change, so
+    /// peers that re-fetch pick up added songs (and drop removed ones).
+    /// Already-downloaded blobs are re-used, so the resync is cheap.
+    fn republish_owner_share(&self, id: u64) {
+        let Some(p2p) = &self.p2p else {
+            return;
+        };
+        if !self.prefs.p2p_enabled {
+            return;
+        }
+        let Some(playlist) = self.playlists.get(id) else {
+            return;
+        };
+        if playlist.p2p && playlist.p2p_owner && !playlist.tracks.is_empty() {
+            p2p.create_share(id, playlist.tracks.clone());
+        }
+    }
+
     fn delete_playlist(&mut self, id: u64, cx: &mut Context<Self>) {
+        // Delete any synced files for a P2P playlist.
+        if let Some(p2p) = self.p2p.as_ref() {
+            p2p.leave(id);
+        }
         self.playlists.delete(id);
         self.playlists.save();
         self.confirm_delete = None;
@@ -1046,6 +1223,298 @@ impl Omamusic {
             self.set_section(Section::Songs, cx);
         }
         cx.notify();
+    }
+
+    /// Start sharing a playlist over P2P (owner). Works on any playlist; the
+    /// first share makes us the owner. Guards on capability + non-empty.
+    fn start_sharing(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(p2p) = &self.p2p else {
+            self.show_notify("P2P is not available".into(), cx);
+            return;
+        };
+        if !self.prefs.p2p_enabled {
+            self.show_notify("P2P capabilities are disabled in Settings".into(), cx);
+            return;
+        }
+        let Some(playlist) = self.playlists.get(id).cloned() else {
+            return;
+        };
+        if playlist.tracks.is_empty() {
+            self.show_notify("Add songs to the playlist before sharing".into(), cx);
+            return;
+        }
+        p2p.create_share(id, playlist.tracks.clone());
+    }
+
+    /// Stop sharing a playlist we own: leave the share (deletes the synced
+    /// copies and stops seeding) but keep the original songs, reverting to a
+    /// normal local playlist.
+    fn stop_sharing(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(p2p) = &self.p2p {
+            p2p.leave(id);
+        }
+        cx.notify();
+    }
+
+    /// A peer chooses whether to re-seed a joined share to others. Never
+    /// deletes the peer's copy or its membership.
+    fn toggle_peer_seed(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(p2p) = &self.p2p else {
+            return;
+        };
+        if p2p.is_seeding(id) {
+            p2p.stop_seeding(id);
+        } else if !self.playlist_synced(id) {
+            self.show_notify("Wait for the playlist to finish syncing".into(), cx);
+        } else {
+            p2p.reshare(id);
+        }
+        cx.notify();
+    }
+
+    /// Copy a share link to the clipboard and flash a "Copied" cue.
+    fn copy_share_link(&mut self, share: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(share));
+        self.p2p_copied = true;
+        cx.notify();
+        let seq = self.notify_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1600))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // Only clear if no newer action took over.
+                if this.notify_seq == seq {
+                    this.p2p_copied = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Remember the synced count the user has seen, clearing the "new" marker.
+    fn mark_playlist_seen(&mut self, id: u64, cx: &mut Context<Self>) {
+        let count = self
+            .playlists
+            .get(id)
+            .map(|p| self.playlist_song_count(p))
+            .unwrap_or(0);
+        if let Some(playlist) = self.playlists.get_mut(id) {
+            if playlist.p2p_seen_songs != count {
+                playlist.p2p_seen_songs = count;
+                self.playlists.save();
+                cx.notify();
+            }
+        }
+    }
+
+    /// Join a P2P share pasted into the search field (`omamusic://<ticket>`).
+    /// Creates a new playlist and starts downloading it. Returns true if the
+    /// text was a P2P share and was handled.
+    fn try_join_p2p_search(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let Some(rest) = text.strip_prefix(p2p::P2P_PREFIX) else {
+            return false;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return false;
+        }
+        if p2p::parse_share(rest).is_err() {
+            self.show_notify("Invalid P2P share string".into(), cx);
+            return true;
+        }
+        let Some(p2p) = &self.p2p else {
+            self.show_notify("P2P is not available".into(), cx);
+            return true;
+        };
+        if !self.prefs.p2p_enabled {
+            self.show_notify("P2P capabilities are disabled in Settings".into(), cx);
+            return true;
+        }
+        let name = self.playlists.untitled_name();
+        let id = self.playlists.create(&name, Vec::new());
+        let ticket = rest.to_string();
+        if let Some(pl) = self.playlists.get_mut(id) {
+            pl.p2p = true;
+            pl.p2p_owner = false;
+            // Keep the ticket so a peer can re-sync on restart and re-seed.
+            pl.p2p_share = Some(ticket.clone());
+        }
+        self.playlists.save();
+        p2p.join_share(id, ticket);
+        self.set_section(Section::Playlist(id), cx);
+        cx.notify();
+        true
+    }
+
+    /// Open (or, if open, close) the "join a P2P share" input row in the sidebar.
+    fn open_p2p_join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.prefs.p2p_enabled {
+            self.show_notify("P2P capabilities are disabled in Settings".into(), cx);
+            return;
+        }
+        if self.p2p_join_open {
+            self.p2p_join_open = false;
+            cx.notify();
+            return;
+        }
+        self.p2p_join_open = true;
+        self.p2p_join_input.update(cx, |field, cx| {
+            field.set_value("", window, cx);
+            field.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Destination base directory for copying P2P songs out of the isolated
+    /// cache: the first configured music folder, else `~/Music`.
+    fn p2p_copy_base(&self) -> PathBuf {
+        self.library
+            .snapshot()
+            .folders
+            .first()
+            .cloned()
+            .or_else(dirs::audio_dir)
+            .or_else(|| dirs::home_dir().map(|h| h.join("Music")))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Copy the given tracks into `<music>/Omamusic P2P`, validating each one
+    /// as real audio before it leaves the cache. The copy is re-indexed by the
+    /// library scanner, so the songs become normal library entries.
+    fn copy_tracks_to_music(&mut self, tracks: Vec<Track>, cx: &mut Context<Self>) {
+        if self.p2p.is_none() {
+            self.show_notify("P2P is not available".into(), cx);
+            return;
+        }
+        let files: Vec<(PathBuf, String)> = tracks
+            .iter()
+            .map(|t| (t.path.clone(), t.title.clone()))
+            .collect();
+        let dest = self.p2p_copy_base().join("Omamusic P2P");
+        let max_file = p2p::DEFAULT_MAX_FILE_SIZE_BYTES;
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let dest_for_copy = dest.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { p2p::copy_audio_files(&files, &dest_for_copy, max_file) })
+                .await;
+            match result {
+                Ok(copied) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.show_notify(
+                            format!(
+                                "Copied {} to {}",
+                                plural(copied.len(), "song"),
+                                dest.display()
+                            ),
+                            cx,
+                        );
+                        this.library.request_rescan();
+                        cx.notify();
+                    });
+                }
+                Err(err) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.show_notify(format!("Copy failed: {err}"), cx);
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Convert a synced P2P playlist into an independent local playlist: copy
+    /// every song into `<music>/Omamusic P2P/<name>`, create a plain playlist
+    /// pointing at the copies, then leave the share (its cache is deleted).
+    fn convert_playlist_to_local(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(playlist) = self.playlists.get(id).cloned() else {
+            return;
+        };
+        let tracks = self.library.p2p_tracks(id);
+        if tracks.is_empty() {
+            self.show_notify("Nothing synced yet to convert".into(), cx);
+            return;
+        }
+        let name = playlist.name.clone();
+        let files: Vec<(PathBuf, String)> = tracks
+            .iter()
+            .map(|t| (t.path.clone(), t.title.clone()))
+            .collect();
+        let dest = self
+            .p2p_copy_base()
+            .join("Omamusic P2P")
+            .join(p2p::sanitize_file_name(&name));
+        let max_file = p2p::DEFAULT_MAX_FILE_SIZE_BYTES;
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { p2p::copy_audio_files(&files, &dest, max_file) })
+                .await;
+            match result {
+                Ok(copied) => {
+                    let _ = this.update(cx, |this, cx| {
+                        let n = copied.len();
+                        let new_id = this.playlists.create(&format!("{name} (local)"), copied);
+                        this.playlists.save();
+                        this.set_section(Section::Playlist(new_id), cx);
+                        if let Some(p2p) = &this.p2p {
+                            p2p.leave(id);
+                        }
+                        this.playlists.delete(id);
+                        this.playlists.save();
+                        this.show_notify(
+                            format!("Converted to a local playlist · {}", plural(n, "song")),
+                            cx,
+                        );
+                        this.library.request_rescan();
+                        cx.notify();
+                    });
+                }
+                Err(err) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.show_notify(format!("Convert failed: {err}"), cx);
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Number of songs a playlist effectively holds for display. A P2P playlist
+    /// reads its synced cache (peers do not keep copies in `playlist.tracks`);
+    /// it falls back to the stored track list before the first sync lands.
+    fn playlist_song_count(&self, playlist: &crate::playlists::Playlist) -> usize {
+        if playlist.p2p {
+            let n = self.library.p2p_tracks(playlist.id).len();
+            if n > 0 {
+                return n;
+            }
+        }
+        playlist.tracks.len()
+    }
+
+    /// A P2P playlist is playable once its songs are synced to disk. We key on
+    /// the cache being populated rather than live network state, so a synced
+    /// playlist plays fully offline — including right after a restart. A
+    /// non-P2P playlist is always considered ready.
+    fn playlist_synced(&self, id: u64) -> bool {
+        match self.playlists.get(id) {
+            Some(p) if p.p2p => !self.library.p2p_tracks(id).is_empty(),
+            _ => true,
+        }
+    }
+
+    /// True when `list` points at a P2P playlist that is not yet synced: its
+    /// songs must not be played until the download is complete.
+    fn playlist_needs_sync(&self, list: &TrackList) -> bool {
+        match list {
+            TrackList::Playlist(id, _) => !self.playlist_synced(*id),
+            _ => false,
+        }
     }
 
     fn set_song_sort(&mut self, column: SongColumn, cx: &mut Context<Self>) {
@@ -1100,7 +1569,107 @@ impl Omamusic {
         }
 
         self.lib_version = version;
+        self.pump_p2p_events(cx);
         cx.notify();
+    }
+
+    /// Drain P2P events from the background thread and apply them to the
+    /// playlist state. Keeps the UI in sync with shares, peers and sync
+    /// progress without holding any locks across await points.
+    fn pump_p2p_events(&mut self, cx: &mut Context<Self>) {
+        let Some(p2p) = &self.p2p else {
+            return;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        for event in p2p.try_events() {
+            match event {
+                P2pEvent::EnabledChanged { .. } => {
+                    cx.notify();
+                }
+                P2pEvent::MaxSizeChanged { .. } => {
+                    cx.notify();
+                }
+                P2pEvent::ShareCreated { playlist_id, share } => {
+                    if let Some(playlist) = self.playlists.get_mut(playlist_id) {
+                        // A plain playlist becoming shared means we are the
+                        // owner. An already-P2P playlist just refreshed its
+                        // ticket (owner re-advertising, or a peer re-seeding),
+                        // so leave ownership as-is.
+                        if !playlist.p2p {
+                            playlist.p2p = true;
+                            playlist.p2p_owner = true;
+                        }
+                        playlist.p2p_share = Some(share);
+                        playlist.p2p_last_updated = Some(now);
+                    }
+                    self.playlists.save();
+                    cx.notify();
+                }
+                P2pEvent::ShareFailed {
+                    playlist_id,
+                    reason,
+                } => {
+                    // If we already have a synced copy, a failed re-sync/update
+                    // is not user-facing: the playlist still works offline.
+                    if !self.playlist_synced(playlist_id) {
+                        self.show_notify(format!("P2P share failed: {reason}"), cx);
+                    }
+                    cx.notify();
+                }
+                P2pEvent::PeerCountChanged { playlist_id, count } => {
+                    if let Some(playlist) = self.playlists.get_mut(playlist_id) {
+                        playlist.p2p_peer_count = count;
+                    }
+                    self.playlists.save();
+                    cx.notify();
+                }
+                P2pEvent::SyncProgress { .. } => {
+                    // Progress is read live from the manager during render;
+                    // just repaint.
+                    cx.notify();
+                }
+                P2pEvent::SyncCompleted { playlist_id, ok } => {
+                    if let Some(playlist) = self.playlists.get_mut(playlist_id) {
+                        playlist.p2p_synced = ok;
+                        playlist.p2p_last_updated = Some(now);
+                    }
+                    self.playlists.save();
+                    cx.notify();
+                }
+                P2pEvent::Left { playlist_id } => {
+                    if let Some(playlist) = self.playlists.get_mut(playlist_id) {
+                        playlist.p2p = false;
+                        playlist.p2p_owner = false;
+                        playlist.p2p_share = None;
+                        playlist.p2p_manifest_hash = None;
+                        playlist.p2p_owner_node_id = None;
+                        playlist.p2p_synced = false;
+                        playlist.p2p_peer_count = 0;
+                    }
+                    self.playlists.save();
+                    cx.notify();
+                }
+                P2pEvent::StoppedSeeding { .. } => {
+                    // We kept the synced files; just repaint the toggle off.
+                    cx.notify();
+                }
+                P2pEvent::SeedingStats {
+                    playlist_id,
+                    seeded_bytes,
+                    peer_count,
+                } => {
+                    if let Some(playlist) = self.playlists.get_mut(playlist_id) {
+                        playlist.p2p_seeded_bytes = seeded_bytes;
+                        playlist.p2p_peer_count = peer_count;
+                    }
+                    self.playlists.save();
+                    cx.notify();
+                }
+            }
+        }
     }
 
     fn show_notify(&mut self, msg: String, cx: &mut Context<Self>) {
@@ -1315,6 +1884,10 @@ impl Omamusic {
         self.pages.clear();
         self.forward.clear();
         self.clear_selection();
+        // Opening a P2P playlist clears its "new songs" marker.
+        if let Section::Playlist(id) = section {
+            self.mark_playlist_seen(id, cx);
+        }
         cx.notify();
     }
 
@@ -1361,6 +1934,15 @@ impl Omamusic {
             vec![row]
         };
         let tracks = selection_tracks(&self.library, list, &rows);
+        if matches!(
+            action,
+            RowAction::Play | RowAction::PlayNext | RowAction::AddToQueue
+        ) && self.playlist_needs_sync(list)
+        {
+            self.show_notify("Waiting for the playlist to finish syncing".into(), cx);
+            cx.notify();
+            return;
+        }
         match action {
             RowAction::Play if queue => self.player.jump(row),
             RowAction::Play if tracks.len() > 1 => self.player.play(tracks, 0),
@@ -1393,6 +1975,7 @@ impl Omamusic {
                     self.playlists.remove(*id, &paths);
                     self.playlists.save();
                     self.clear_selection();
+                    self.republish_owner_share(*id);
                 }
             }
             RowAction::ExportFile => {
@@ -1415,6 +1998,9 @@ impl Omamusic {
                     .detach();
                 }
             }
+            RowAction::CopyToLibrary => {
+                self.copy_tracks_to_music(tracks, cx);
+            }
         }
         cx.notify();
     }
@@ -1436,6 +2022,15 @@ impl Omamusic {
     }
 
     fn tracks_action(&mut self, action: RowAction, list: &TrackList, cx: &mut Context<Self>) {
+        if matches!(
+            action,
+            RowAction::Play | RowAction::PlayNext | RowAction::AddToQueue
+        ) && self.playlist_needs_sync(list)
+        {
+            self.show_notify("Waiting for the playlist to finish syncing".into(), cx);
+            cx.notify();
+            return;
+        }
         let tracks = list.tracks(&self.library);
         match action {
             RowAction::Play => self.player.play(tracks, 0),
@@ -1449,7 +2044,8 @@ impl Omamusic {
             | RowAction::ExportFile
             | RowAction::OpenContainingFolder
             | RowAction::AddToPlaylistMenu
-            | RowAction::RemoveFromPlaylist => {}
+            | RowAction::RemoveFromPlaylist
+            | RowAction::CopyToLibrary => {}
         }
         cx.notify();
     }
@@ -1457,6 +2053,17 @@ impl Omamusic {
     fn add_to_playlist(&mut self, id: Option<u64>, tracks: &[Track], cx: &mut Context<Self>) {
         if tracks.is_empty() {
             return;
+        }
+        // Only the owner may change a P2P playlist; peers just sync it.
+        if let Some(id) = id {
+            if self
+                .playlists
+                .get(id)
+                .is_some_and(|p| p.p2p && !p.p2p_owner)
+            {
+                self.show_notify("Only the owner can add songs to this playlist".into(), cx);
+                return;
+            }
         }
         let paths: Vec<PathBuf> = tracks.iter().map(|t| t.path.clone()).collect();
         let id = match id {
@@ -1478,6 +2085,7 @@ impl Omamusic {
             );
             self.show_notify(msg, cx);
         }
+        self.republish_owner_share(id);
     }
 
     fn context_menu(
@@ -1501,19 +2109,20 @@ impl Omamusic {
         cx: &mut Context<Self>,
     ) -> Popover {
         let this = cx.entity().downgrade();
-        let mut extra = vec![RowAction::NewPlaylistWith];
-        extra.extend(
-            self.playlists
+        // Playlists you can add songs to: your own and plain ones. Joined P2P
+        // playlists are read-only for peers (only their owner edits them).
+        let (extra, names) = {
+            let addable: Vec<&crate::playlists::Playlist> = self
+                .playlists
                 .items
                 .iter()
-                .map(|p| RowAction::AddToPlaylist(p.id)),
-        );
-        let names: Vec<String> = self
-            .playlists
-            .items
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
+                .filter(|p| !p.p2p || p.p2p_owner)
+                .collect();
+            let mut extra = vec![RowAction::NewPlaylistWith];
+            extra.extend(addable.iter().map(|p| RowAction::AddToPlaylist(p.id)));
+            let names: Vec<String> = addable.iter().map(|p| p.name.clone()).collect();
+            (extra, names)
+        };
         let items = actions
             .iter()
             .enumerate()
@@ -1587,7 +2196,11 @@ impl Omamusic {
             .test_support();
         let actions = match &list {
             _ if queue => QUEUE_ACTIONS,
-            TrackList::Playlist(..) => PLAYLIST_TRACK_ACTIONS,
+            TrackList::Playlist(id, _) => match self.playlists.get(*id) {
+                Some(p) if p.p2p && p.p2p_owner => P2P_OWNER_TRACK_ACTIONS,
+                Some(p) if p.p2p => P2P_TRACK_ACTIONS,
+                _ => PLAYLIST_TRACK_ACTIONS,
+            },
             _ => TRACK_ACTIONS,
         };
         self.context_menu(
@@ -1603,6 +2216,13 @@ impl Omamusic {
     /// Apply `text` to the library. Shared by the immediate path used in tests
     /// and the debounced path used by the view.
     fn apply_text(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.starts_with(p2p::P2P_PREFIX) {
+            // A P2P share string is joined on Enter, not searched as a query.
+            self.pages.clear();
+            self.clear_selection();
+            cx.notify();
+            return;
+        }
         if text != self.library.query() {
             if self.library.query().trim().is_empty() {
                 self.search_scope = SearchScope::All;
@@ -1686,6 +2306,37 @@ impl Omamusic {
     }
 
     /// Text of the visible scan-completion toast, if any. For smoke tests.
+    /// Whether the P2P capabilities setting is on.
+    pub fn p2p_enabled(&self) -> bool {
+        self.prefs.p2p_enabled
+    }
+
+    /// Whether the given playlist is marked as P2P.
+    pub fn is_p2p_playlist(&self, id: u64) -> bool {
+        self.playlists.get(id).is_some_and(|p| p.p2p)
+    }
+
+    /// The share string for a P2P playlist (owner only).
+    pub fn playlist_share(&self, id: u64) -> Option<String> {
+        self.playlists
+            .get(id)
+            .and_then(|p| p.p2p_share.clone())
+            .or_else(|| self.p2p.as_ref().and_then(|p| p.share_string(id)))
+    }
+
+    /// Peer count for a P2P playlist.
+    pub fn playlist_peers(&self, id: u64) -> usize {
+        self.p2p
+            .as_ref()
+            .map(|p| p.peer_count(id))
+            .unwrap_or_else(|| {
+                self.playlists
+                    .get(id)
+                    .map(|p| p.p2p_peer_count)
+                    .unwrap_or(0)
+            })
+    }
+
     pub fn notify_text(&self) -> Option<String> {
         self.rescan_notify.as_ref().map(|(msg, _)| msg.clone())
     }
@@ -1799,6 +2450,7 @@ impl Omamusic {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sidebar_btn(
     id: impl Into<ElementId>,
     label: &str,
@@ -1806,10 +2458,11 @@ fn sidebar_btn(
     selected: bool,
     compact: bool,
     cx: &App,
+    badge: Option<AnyElement>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let t = cx.omarchy().clone();
-    let row = div()
+    let mut row = div()
         .id(id)
         .test_support()
         .aria_label(label.to_string())
@@ -1832,8 +2485,11 @@ fn sidebar_btn(
         .child(icon(icon_name).size(rems(0.875)).flex_none())
         .when(!compact, |d| {
             d.child(div().min_w_0().truncate().child(label.to_string()))
-        })
-        .on_click(on_click);
+        });
+    if let Some(badge) = badge {
+        row = row.child(badge);
+    }
+    row = row.on_click(on_click);
     if compact {
         with_tooltip(row.justify_center().px_0(), label.to_string()).into_any_element()
     } else {
@@ -2045,6 +2701,7 @@ impl Omamusic {
                     self.section == section,
                     compact,
                     cx,
+                    None,
                     cx.listener(move |this, _, window, cx| {
                         this.clear_search(window, cx);
                         this.set_section(section, cx)
@@ -2060,32 +2717,88 @@ impl Omamusic {
                 playlist_items.push(self.playlist_name_field(window, cx));
                 continue;
             }
+            let count = self.playlist_song_count(&playlist);
+            let label = format!("{} ({})", playlist.name, plural(count, "song"));
+            let is_peer = playlist.p2p && !playlist.p2p_owner;
+            let seeding = playlist.p2p && self.p2p.as_ref().is_some_and(|p| p.is_seeding(id));
+            let has_new = playlist.p2p && count > playlist.p2p_seen_songs;
+            let badge = playlist.p2p.then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(rems(0.25))
+                    .flex_none()
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("playlist-p2p-badge-{id}").into()))
+                            .test_support()
+                            .text_size(rems(0.625))
+                            // Green while seeding; accent for the owner; muted
+                            // for a read-only joined peer.
+                            .text_color(if seeding {
+                                theme.success
+                            } else if is_peer {
+                                theme.secondary
+                            } else {
+                                theme.accent
+                            })
+                            .child(
+                                icon(if is_peer {
+                                    IconName::Download
+                                } else {
+                                    IconName::Wifi
+                                })
+                                .size(rems(0.625)),
+                            ),
+                    )
+                    .when(has_new, |d| {
+                        d.child(
+                            div()
+                                .id(ElementId::Name(format!("playlist-new-badge-{id}").into()))
+                                .test_support()
+                                .px(rems(0.3))
+                                .rounded_full()
+                                .bg(theme.accent)
+                                .text_size(rems(0.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme.on_accent)
+                                .child("new"),
+                        )
+                    })
+                    .into_any_element()
+            });
             let item = sidebar_btn(
                 ElementId::Name(format!("playlist-{id}").into()),
-                &playlist.name,
+                &label,
                 IconName::ListMusic,
                 self.section == Section::Playlist(id),
                 compact,
                 cx,
+                badge,
                 cx.listener(move |this, _, window, cx| {
                     this.clear_search(window, cx);
                     this.set_section(Section::Playlist(id), cx)
                 }),
             );
             let this = cx.entity().downgrade();
+            let is_local = !playlist.p2p || playlist.p2p_owner;
+            let mut menu_items = Vec::new();
+            if is_local {
+                menu_items.push(MenuItem::new("Rename").icon(IconName::Pencil));
+            }
+            menu_items.push(
+                MenuItem::new("Delete Playlist…")
+                    .icon(IconName::Trash)
+                    .separator_before(),
+            );
             playlist_items.push(
                 menu(
                     ElementId::Name(format!("playlist-menu-{id}").into()),
                     MenuTrigger(item.into_any_element()),
-                    vec![
-                        MenuItem::new("Rename").icon(IconName::Pencil),
-                        MenuItem::new("Delete Playlist…")
-                            .icon(IconName::Trash)
-                            .separator_before(),
-                    ],
+                    menu_items,
                     move |index, window, cx| {
                         let _ = this.update(cx, |this, cx| {
-                            if index == 0 {
+                            if is_local && index == 0 {
                                 this.start_playlist_edit(PlaylistEdit::Rename(id), window, cx);
                             } else {
                                 this.clear_search(window, cx);
@@ -2153,7 +2866,7 @@ impl Omamusic {
                                 icon_button(
                                     "playlist-new",
                                     IconName::Plus,
-                                    "New Playlist",
+                                    "Create Playlist",
                                     ButtonVariant::Secondary,
                                     cx,
                                 )
@@ -2162,10 +2875,35 @@ impl Omamusic {
                                         this.start_playlist_edit(PlaylistEdit::New, window, cx)
                                     },
                                 )),
-                                "New Playlist",
+                                "Create Playlist",
+                            ))
+                            .child(with_tooltip(
+                                icon_button(
+                                    "playlist-join",
+                                    IconName::Link,
+                                    "Join omamusic://…",
+                                    ButtonVariant::Secondary,
+                                    cx,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.open_p2p_join(window, cx);
+                                    },
+                                )),
+                                "Join omamusic://…",
                             )),
                     )
-                    .children(playlist_items),
+                    .children(playlist_items)
+                    .when(self.p2p_join_open, |d| {
+                        d.child(
+                            div()
+                                .id("p2p-join-row")
+                                .test_support()
+                                .px(rems(0.625))
+                                .py(rems(0.25))
+                                .child(input("p2p-join", &self.p2p_join_input, window, cx)),
+                        )
+                    }),
             )
             .when(!compact, |d| {
                 d.child(
@@ -2266,10 +3004,43 @@ impl Omamusic {
             ),
             Section::Playlist(id) => {
                 let playlist = self.playlists.get(id)?;
-                let source = SongSource::Paths(playlist.tracks.clone().into());
-                (playlist.name.clone().into(), self.songs_detail(&source))
+                let count = self.playlist_song_count(playlist);
+                if playlist.p2p {
+                    let updated = playlist
+                        .p2p_last_updated
+                        .map(|n| {
+                            let secs = (n as f64) / 1_000_000_000.0;
+                            self.format_duration_ago(secs)
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    (
+                        playlist.name.clone().into(),
+                        format!(
+                            "P2P · {} · {} · updated {updated}",
+                            plural(count, "song"),
+                            p2p::format_size(playlist.p2p_total_size)
+                        ),
+                    )
+                } else {
+                    let source = SongSource::Paths(playlist.tracks.clone().into());
+                    (playlist.name.clone().into(), self.songs_detail(&source))
+                }
             }
         })
+    }
+
+    /// Human-friendly "updated X ago" for a timestamp in seconds since epoch.
+    fn format_duration_ago(&self, secs: f64) -> String {
+        let secs = secs.max(0.0);
+        if secs < 60.0 {
+            "just now".to_string()
+        } else if secs < 3600.0 {
+            format!("{} min ago", (secs / 60.0) as u64)
+        } else if secs < 86400.0 {
+            format!("{} hr ago", (secs / 3600.0) as u64)
+        } else {
+            format!("{} days ago", (secs / 86400.0) as u64)
+        }
     }
 
     fn songs_detail(&self, source: &SongSource) -> String {
@@ -2508,14 +3279,30 @@ impl Omamusic {
                 let Some(playlist) = self.playlists.get(id) else {
                     return Vec::new();
                 };
-                let paths: Arc<[PathBuf]> = playlist.tracks.clone().into();
-                let empty = paths.is_empty();
-                let play = |shuffle: bool, paths: Arc<[PathBuf]>| {
+                let is_p2p = playlist.p2p;
+                let is_owner = playlist.p2p_owner;
+                let needs_sync = is_p2p && !self.playlist_synced(id);
+                let play_disabled = if is_p2p {
+                    needs_sync
+                } else {
+                    playlist.tracks.is_empty()
+                };
+                let play = |shuffle: bool| {
                     move |this: &mut Omamusic,
                           _: &ClickEvent,
                           _: &mut Window,
                           cx: &mut Context<Self>| {
-                        let tracks = this.library.songs(&SongSource::Paths(paths.clone()));
+                        let tracks = if this.playlists.get(id).is_some_and(|p| p.p2p) {
+                            this.library.p2p_tracks(id)
+                        } else {
+                            let paths: Arc<[PathBuf]> = this
+                                .playlists
+                                .get(id)
+                                .map(|p| p.tracks.clone())
+                                .unwrap_or_default()
+                                .into();
+                            this.library.songs(&SongSource::Paths(paths))
+                        };
                         if tracks.is_empty() {
                             return;
                         }
@@ -2529,53 +3316,68 @@ impl Omamusic {
                         cx.notify();
                     }
                 };
-                vec![
+                let mut controls = vec![
                     pill("playlist-play", IconName::Play, "Play", true, cx)
-                        .disabled(empty)
-                        .on_click(cx.listener(play(false, paths.clone())))
+                        .disabled(play_disabled)
+                        .on_click(cx.listener(play(false)))
                         .into_any_element(),
                     pill("playlist-shuffle", IconName::Shuffle, "Shuffle", false, cx)
-                        .disabled(empty)
-                        .on_click(cx.listener(play(true, paths)))
+                        .disabled(play_disabled)
+                        .on_click(cx.listener(play(true)))
                         .into_any_element(),
-                    with_tooltip(
-                        icon_button(
-                            "playlist-rename",
-                            IconName::Pencil,
+                ];
+                let can_edit = !playlist.p2p || is_owner;
+                if can_edit {
+                    controls.push(
+                        with_tooltip(
+                            icon_button(
+                                "playlist-rename",
+                                IconName::Pencil,
+                                "Rename Playlist",
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.start_playlist_edit(PlaylistEdit::Rename(id), window, cx)
+                                },
+                            )),
                             "Rename Playlist",
-                            ButtonVariant::Secondary,
-                            cx,
                         )
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.start_playlist_edit(PlaylistEdit::Rename(id), window, cx)
-                            },
-                        )),
-                        "Rename Playlist",
-                    )
-                    .into_any_element(),
-                    with_tooltip(
-                        icon_button(
-                            "playlist-delete",
-                            IconName::Trash,
+                        .into_any_element(),
+                    );
+                    controls.push(
+                        with_tooltip(
+                            icon_button(
+                                "playlist-delete",
+                                IconName::Trash,
+                                "Delete Playlist",
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.confirm_delete = Some(id);
+                                    cx.notify();
+                                },
+                            )),
                             "Delete Playlist",
-                            ButtonVariant::Secondary,
-                            cx,
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.confirm_delete = Some(id);
-                            cx.notify();
-                        })),
-                        "Delete Playlist",
-                    )
-                    .into_any_element(),
-                ]
+                        .into_any_element(),
+                    );
+                }
+                controls
             }
             _ => Vec::new(),
         }
     }
 
-    fn render_playlist(&mut self, id: u64, cx: &mut Context<Self>) -> AnyElement {
+    fn render_playlist(
+        &mut self,
+        id: u64,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.omarchy().clone();
         let Some(playlist) = self.playlists.get(id).cloned() else {
             return empty_state("Playlist Not Found", "It may have been deleted.", cx)
@@ -2636,7 +3438,46 @@ impl Omamusic {
                     })),
                 )
         });
-        let body = if playlist.tracks.is_empty() {
+        let synced = self
+            .p2p
+            .as_ref()
+            .map(|p| p.is_synced(id))
+            .unwrap_or(playlist.p2p_synced);
+        let body = if playlist.p2p {
+            if synced {
+                let tracks: Vec<PathBuf> = self
+                    .library
+                    .p2p_tracks(id)
+                    .into_iter()
+                    .map(|t| t.path)
+                    .collect();
+                if tracks.is_empty() {
+                    empty_state("Playlist Not Found", "It may have been deleted.", cx)
+                        .into_any_element()
+                } else {
+                    self.render_song_table(
+                        "playlist-songs",
+                        TrackList::Playlist(id, tracks.into()),
+                        None,
+                        cx,
+                    )
+                }
+            } else {
+                let progress = self.p2p.as_ref().and_then(|p| p.sync_progress(id));
+                let line = progress
+                    .as_ref()
+                    .map(|p| {
+                        format!(
+                            "{} / {} · {}",
+                            p2p::format_size(p.bytes_synced),
+                            p2p::format_size(p.total_bytes.max(1)),
+                            p2p::format_speed(p.speed_bps)
+                        )
+                    })
+                    .unwrap_or_else(|| "starting…".to_string());
+                empty_state("Syncing…", line, cx).into_any_element()
+            }
+        } else if playlist.tracks.is_empty() {
             empty_state(
                 "Empty Playlist",
                 "Right-click a song and choose Add to Playlist.",
@@ -2657,7 +3498,301 @@ impl Omamusic {
             .flex()
             .flex_col()
             .children(confirm)
+            .when(self.prefs.p2p_enabled, |d| {
+                d.child(self.render_p2p_panel(id, cx))
+            })
             .child(body)
+            .into_any_element()
+    }
+
+    fn render_p2p_panel(&mut self, id: u64, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.omarchy().clone();
+        let playlist = self.playlists.get(id).cloned().unwrap_or_default();
+        let is_peer = playlist.p2p && !playlist.p2p_owner;
+        let shared = playlist.p2p;
+        let synced = self.playlist_synced(id);
+        let seeding = self.p2p.as_ref().is_some_and(|p| p.is_seeding(id));
+        let peer_count = self
+            .p2p
+            .as_ref()
+            .map(|p| p.peer_count(id))
+            .unwrap_or(playlist.p2p_peer_count);
+        let seeded_bytes = self
+            .p2p
+            .as_ref()
+            .map(|p| p.seeded_bytes(id))
+            .unwrap_or(playlist.p2p_seeded_bytes);
+        let progress = self.p2p.as_ref().and_then(|p| p.sync_progress(id));
+        let share = playlist.p2p_share.clone();
+
+        // Clear role tag inside the view: owner vs read-only peer.
+        let tag = shared.then(|| {
+            let (label, color) = if is_peer {
+                ("peer read-only", theme.secondary)
+            } else {
+                ("owner", theme.accent)
+            };
+            div()
+                .id(ElementId::Name(format!("p2p-tag-{id}").into()))
+                .test_support()
+                .px(rems(0.35))
+                .rounded(rems(0.25))
+                .border_1()
+                .border_color(color)
+                .text_size(rems(0.5625))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color)
+                .child(format!("[{label}]"))
+                .into_any_element()
+        });
+
+        // [i] hint explaining how P2P sharing works.
+        let info = with_tooltip(
+            icon_button(
+                ElementId::Name(format!("p2p-info-{id}").into()),
+                IconName::Info,
+                "How sharing works",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .text_color(theme.secondary),
+            "Playlists are shared peer-to-peer over the internet with iroh \u{2014} no \
+             server holds your music. Your device serves the songs you own to peers you \
+             share the link with, and any peer that already has a song can pass it on. Only \
+             the owner can add or remove songs. Files are audio-only, content-verified, and \
+             the playlist manifest is signed by its owner, so a malicious peer cannot alter \
+             it or sneak in other files. Synced songs live in a hidden folder inside your \
+             music library and keep playing offline.",
+        );
+
+        // Primary action, shown BEFORE the share link.
+        let primary = if is_peer {
+            let label = if seeding {
+                "Stop seeding"
+            } else {
+                "Seed to others"
+            };
+            button(
+                ElementId::Name(
+                    format!("playlist-p2p-{}", if seeding { "unseed" } else { "seed" }).into(),
+                ),
+                label,
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_peer_seed(id, cx)))
+            .into_any_element()
+        } else if shared {
+            button(
+                "playlist-p2p-stop",
+                "Stop sharing",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.stop_sharing(id, cx)))
+            .into_any_element()
+        } else {
+            button(
+                "playlist-p2p-start",
+                "Start sharing",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.start_sharing(id, cx)))
+            .into_any_element()
+        };
+
+        // Top row: tag + info on the left, primary action on the right.
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(rems(0.5))
+            .flex_wrap()
+            .children(tag)
+            .child(info)
+            .child(div().flex_1())
+            .child(primary);
+
+        // Status / seeding meter (bytes you gave), only when seeding.
+        let status_line: Option<AnyElement> = match (shared, seeding, synced) {
+            (true, true, _) => Some(
+                div()
+                    .id("p2p-seeding")
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .gap(rems(0.3))
+                    .text_size(rems(0.6875))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.success)
+                    .child(div().size(rems(0.5)).rounded_full().bg(theme.success))
+                    .child(format!(
+                        "Seeding · sent {} · {}",
+                        p2p::format_size(seeded_bytes),
+                        plural(peer_count, "peer")
+                    ))
+                    .into_any_element(),
+            ),
+            (true, false, true) => Some(
+                div()
+                    .text_size(rems(0.6875))
+                    .text_color(theme.secondary)
+                    .child(format!(
+                        "Synced · {}",
+                        plural(self.playlist_song_count(&playlist), "song")
+                    ))
+                    .into_any_element(),
+            ),
+            (true, false, false) => {
+                let text = progress
+                    .as_ref()
+                    .map(|p| {
+                        format!(
+                            "Syncing… {} / {}",
+                            p2p::format_size(p.bytes_synced),
+                            p2p::format_size(p.total_bytes.max(1))
+                        )
+                    })
+                    .unwrap_or_else(|| "Syncing…".to_string());
+                Some(
+                    div()
+                        .id("p2p-syncing")
+                        .test_support()
+                        .text_size(rems(0.6875))
+                        .text_color(theme.secondary)
+                        .child(text)
+                        .into_any_element(),
+                )
+            }
+            (false, _, _) => Some(
+                div()
+                    .text_size(rems(0.6875))
+                    .text_color(theme.secondary)
+                    .child(
+                        "Not shared yet — start sharing to send this list to other Omamusic users.",
+                    )
+                    .into_any_element(),
+            ),
+        };
+
+        // Copyable share link (owner, or a peer that is currently seeding).
+        let show_link = shared && share.is_some() && (!is_peer || seeding);
+        let link_row = show_link.then(|| {
+            let text = share.clone().unwrap_or_default();
+            let copied = self.p2p_copied;
+            let to_copy = text.clone();
+            div()
+                .flex()
+                .flex_col()
+                .gap(rems(0.125))
+                .child(
+                    div()
+                        .text_size(rems(0.625))
+                        .text_color(theme.secondary)
+                        .child("Share link — paste it into another Omamusic's search"),
+                )
+                .child(
+                    div()
+                        .id("p2p-share-link")
+                        .test_support()
+                        .flex()
+                        .items_center()
+                        .gap(rems(0.5))
+                        .px(rems(0.5))
+                        .py(rems(0.3))
+                        .rounded(rems(0.3))
+                        .bg(theme.hover_fill())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.selected_fill()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_share_link(to_copy.clone(), cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(rems(0.625))
+                                .font_family(theme.mono_font.clone())
+                                .text_color(theme.accent)
+                                .child(text),
+                        )
+                        .child(
+                            div()
+                                .id("p2p-copy-label")
+                                .test_support()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(rems(0.2))
+                                .text_size(rems(0.625))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(if copied {
+                                    theme.success
+                                } else {
+                                    theme.secondary
+                                })
+                                .child(
+                                    icon(if copied {
+                                        IconName::Check
+                                    } else {
+                                        IconName::Copy
+                                    })
+                                    .size(rems(0.625)),
+                                )
+                                .child(if copied { "Copied!" } else { "Click to copy" }),
+                        ),
+                )
+        });
+
+        // Peer-only extras: save a copy to the music folder, and leave.
+        let peer_actions =
+            is_peer.then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(rems(0.5))
+                    .flex_wrap()
+                    .when(synced, |d| {
+                        d.child(
+                            button(
+                                "playlist-p2p-convert",
+                                "Save to Music",
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.convert_playlist_to_local(id, cx),
+                            )),
+                        )
+                    })
+                    .child(
+                        button(
+                            "playlist-p2p-leave",
+                            "Leave (delete my copy)",
+                            ButtonVariant::Danger,
+                            cx,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.stop_sharing(id, cx))),
+                    )
+            });
+
+        div()
+            .id("p2p-panel")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap(rems(0.375))
+            .px(rems(0.75))
+            .py(rems(0.5))
+            .rounded(rems(0.5))
+            .bg(theme.normal_fill())
+            .border_1()
+            .border_color(theme.border)
+            .child(header)
+            .children(status_line)
+            .children(link_row)
+            .children(peer_actions)
             .into_any_element()
     }
 
@@ -3278,7 +4413,7 @@ impl Omamusic {
             Section::Albums => self.render_albums_section(window, cx),
             Section::Artists => self.render_artist_list(cx),
             Section::Genres => self.render_genre_list(window, cx),
-            Section::Playlist(id) => self.render_playlist(id, cx),
+            Section::Playlist(id) => self.render_playlist(id, window, cx),
         }
     }
 
@@ -4884,6 +6019,76 @@ impl Omamusic {
         }
         let lookup = settings_section("ONLINE LOOKUP", lookup_rows, cx);
 
+        let p2p_enabled = self.prefs.p2p_enabled;
+        let max_text = self.p2p_max_size.read(cx).text().to_string();
+        let p2p_entity = cx.entity().downgrade();
+        let p2p_toggle = toggle(
+            "pref-p2p-enabled",
+            "P2P capabilities",
+            p2p_enabled,
+            window,
+            cx,
+        )
+        .on_change(move |on, _, _, cx| {
+            let _ = p2p_entity.update(cx, |this, cx| {
+                this.prefs.p2p_enabled = on;
+                AppConfig::update(|c| c.p2p_enabled = on);
+                if let Some(p2p) = &this.p2p {
+                    p2p.set_enabled(on);
+                }
+                cx.notify();
+            });
+        });
+        let p2p_section = settings_section(
+            "P2P SHARING",
+            vec![
+                settings_row(
+                    "P2P capabilities",
+                    Some(
+                        div()
+                            .text_size(rems(0.6875))
+                            .text_color(theme.secondary)
+                            .child("Share playlists over the internet and join shares from other Omamusic users")
+                            .into_any_element(),
+                    ),
+                    p2p_toggle,
+                    cx,
+                )
+                .into_any_element(),
+                settings_row(
+                    "Max P2P playlist size",
+                    Some(
+                        div()
+                            .text_size(rems(0.6875))
+                            .text_color(theme.secondary)
+                            .child("Playlist size limit enforced when sharing or joining")
+                            .into_any_element(),
+                    ),
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(rems(0.25))
+                        .child(
+                            input("p2p-max-size", &self.p2p_max_size, window, cx)
+                                .w(rems(5.)),
+                        )
+                        .child(div().text_size(rems(0.6875)).text_color(theme.secondary).child("GB"))
+                        .when(max_text.trim().parse::<u64>().is_err() && !max_text.trim().is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .text_size(rems(0.625))
+                                    .text_color(theme.danger)
+                                    .child("enter a whole number"),
+                            )
+                        }),
+                    cx,
+                )
+                .into_any_element(),
+            ],
+            cx,
+        );
+
         let mut folder_rows: Vec<AnyElement> = snap
             .folders
             .iter()
@@ -5046,6 +6251,7 @@ impl Omamusic {
                     .child(interface)
                     .child(behavior)
                     .child(lookup)
+                    .child(p2p_section)
                     .child(folders)
                     .child(about),
             )

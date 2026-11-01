@@ -191,7 +191,18 @@ fn open(cx: &mut TestAppContext) -> Smoke<'_> {
 }
 
 fn open_with(cx: &mut TestAppContext, library: Arc<Library>) -> Smoke<'_> {
+    open_with_seed(cx, library, |_| {})
+}
+
+/// Like `open_with`, but runs a hook after the isolated config dir exists so
+/// a test can seed `playlists.json` or `config.json` before the view starts.
+fn open_with_seed(
+    cx: &mut TestAppContext,
+    library: Arc<Library>,
+    seed: impl FnOnce(&std::path::Path),
+) -> Smoke<'_> {
     let config_dir = isolated_config_dir();
+    seed(&config_dir);
     // The player decodes and paces audio on real threads, and those wake the
     // view's subscription when a song ends or seeks. GPUI's test scheduler
     // treats a wake from another thread as nondeterminism unless parking is
@@ -1400,7 +1411,7 @@ async fn the_playing_album_is_marked_in_the_grid_and_the_list(cx: &mut TestAppCo
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("Low Tide.wav");
-    silent_wav(&path);
+    silent_wav_lasting(&path, 60);
     let library = Arc::new(Library::empty());
     for (path, album) in [
         (path.clone(), "Afterglow"),
@@ -1414,7 +1425,7 @@ async fn the_playing_album_is_marked_in_the_grid_and_the_list(cx: &mut TestAppCo
                 album: album.into(),
                 track_number: 1,
                 year: 2020,
-                duration: 1.0,
+                duration: 60.0,
                 album_id: album.to_lowercase(),
                 genre: "Synth-pop".into(),
                 plays: 0,
@@ -1526,4 +1537,312 @@ async fn search_shrinks_with_the_window_then_folds_into_a_button(cx: &mut TestAp
     assert!(app.has("search"), "the button opens the field");
     app.typing("Bra");
     assert_eq!(app.search_text(), "Bra");
+}
+
+// ---------------------------------------------------------------------------
+// P2P playlist sharing
+// ---------------------------------------------------------------------------
+
+/// A playlist file with one synced, owned P2P playlist plus one joining peer.
+fn seed_p2p_playlists(dir: &std::path::Path) {
+    let json = serde_json::json!({
+        "next_id": 2,
+        "items": [
+            {
+                "id": 1,
+                "name": "Shared",
+                "tracks": [],
+                "p2p": true,
+                "p2p_owner": true,
+                "p2p_share": "omamusic://seeded",
+                "p2p_synced": true,
+                "p2p_peer_count": 0,
+                "p2p_total_size": 2048u64,
+                "p2p_last_updated": null
+            },
+            {
+                "id": 2,
+                "name": "Joined",
+                "tracks": [],
+                "p2p": true,
+                "p2p_owner": false,
+                "p2p_synced": false
+            }
+        ]
+    });
+    std::fs::write(
+        dir.join("playlists.json"),
+        serde_json::to_vec_pretty(&json).unwrap(),
+    )
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn p2p_capabilities_switch_defaults_on_and_persists(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    // P2P capabilities are on by default.
+    assert!(
+        app.view.read_with(app.cx, |v, _| v.p2p_enabled()),
+        "P2P starts enabled"
+    );
+    app.click("settings");
+    assert!(
+        app.has("pref-p2p-enabled"),
+        "the settings page shows the switch"
+    );
+    assert!(
+        app.has("p2p-max-size"),
+        "the settings page shows the max-size field"
+    );
+    // Turning it off persists to the config file.
+    app.click("pref-p2p-enabled");
+    assert_eq!(app.saved("p2p_enabled"), serde_json::json!(false));
+    app.click("pref-p2p-enabled");
+    assert_eq!(app.saved("p2p_enabled"), serde_json::json!(true));
+}
+
+#[gpui_kit::test]
+async fn p2p_max_size_saves_on_enter(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    app.click("settings");
+    // Replace the default "5" with a new value and commit.
+    app.click_on("p2p-max-size");
+    app.press("ctrl-a");
+    app.typing("9");
+    app.press("enter");
+    assert_eq!(app.saved("p2p_max_playlist_size_gb"), serde_json::json!(9));
+}
+
+#[gpui_kit::test]
+async fn p2p_sharing_starts_off_on_a_normal_playlist(cx: &mut TestAppContext) {
+    // A plain playlist offers "Start sharing" and the [i] hint, has no share
+    // link yet, and is tagged as the owner's (not a read-only peer join).
+    let seed = |dir: &std::path::Path| {
+        let json = serde_json::json!({
+            "next_id": 1,
+            "items": [{ "id": 1, "name": "Local", "tracks": ["/music/Mod/Alpha.flac"] }]
+        });
+        std::fs::write(
+            dir.join("playlists.json"),
+            serde_json::to_vec_pretty(&json).unwrap(),
+        )
+        .unwrap();
+    };
+    let mut app = open_with_seed(cx, songs_library(), seed);
+    app.click_on(ElementId::Name("playlist-1".into()));
+    assert!(
+        app.has("p2p-panel"),
+        "the panel is available on any playlist"
+    );
+    assert!(
+        app.has("playlist-p2p-start"),
+        "a local playlist shows a Start sharing button"
+    );
+    assert!(
+        !app.has("playlist-p2p-stop"),
+        "it is not shared yet, so no Stop sharing"
+    );
+    assert!(
+        !app.has("p2p-share-link"),
+        "no share link appears before sharing starts"
+    );
+    // The [i] hint is present inside the view.
+    assert!(
+        app.has(ElementId::Name("p2p-info-1".into())),
+        "an info hint explains sharing"
+    );
+}
+
+#[gpui_kit::test]
+async fn sidebar_playlists_show_song_count(cx: &mut TestAppContext) {
+    let seed = |dir: &std::path::Path| {
+        let json = serde_json::json!({
+            "next_id": 2,
+            "items": [{
+                "id": 1,
+                "name": "Mix",
+                "tracks": ["/music/Mod/Alpha.flac", "/music/Mod/Bravo.flac"],
+                "p2p": false
+            }, {
+                "id": 2,
+                "name": "Solo",
+                "tracks": ["/music/Mod/Alpha.flac"],
+                "p2p": false
+            }]
+        });
+        std::fs::write(
+            dir.join("playlists.json"),
+            serde_json::to_vec_pretty(&json).unwrap(),
+        )
+        .unwrap();
+    };
+    let mut app = open_with_seed(cx, songs_library(), seed);
+    let label = app
+        .label_of(ElementId::Name("playlist-1".into()))
+        .expect("the sidebar playlist row");
+    assert_eq!(label, "Mix (2 songs)", "sidebar shows name plus song count");
+    let one = app
+        .label_of(ElementId::Name("playlist-2".into()))
+        .expect("the second sidebar row");
+    assert_eq!(one, "Solo (1 song)", "one song is singular, not one songs");
+}
+
+#[gpui_kit::test]
+async fn p2p_playlist_has_badge_share_and_leave(cx: &mut TestAppContext) {
+    let mut app = open_with_seed(cx, songs_library(), seed_p2p_playlists);
+    // The owned P2P playlist carries a wifi badge in the sidebar.
+    assert!(
+        app.has(ElementId::Name("playlist-p2p-badge-1".into())),
+        "P2P playlists are badged in the sidebar"
+    );
+    // Open the owned share and confirm the panel exposes sharing controls.
+    app.click_on(ElementId::Name("playlist-1".into()));
+    assert_eq!(
+        app.label("view-title").as_deref(),
+        Some("Shared"),
+        "navigated to playlist 1"
+    );
+    assert!(
+        app.has("p2p-panel"),
+        "the playlist page shows the P2P panel"
+    );
+    assert!(app.has("p2p-share-link"), "the share link is visible");
+    assert!(app.has("playlist-p2p-stop"), "the owner can stop sharing");
+    // A joining, not-yet-synced playlist shows a Leave action and no Play.
+    app.click_on(ElementId::Name("playlist-2".into()));
+    assert!(app.has("playlist-p2p-leave"), "a peer sees a Leave action");
+    assert!(
+        !app.has("playlist-p2p-stop"),
+        "a non-owner cannot stop the owner's share"
+    );
+}
+
+#[gpui_kit::test]
+async fn join_button_reveals_share_input(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    assert!(!app.has("p2p-join-row"), "the join input starts hidden");
+    app.click("playlist-join");
+    assert!(
+        app.has("p2p-join-row"),
+        "the join button reveals the omamusic:// input"
+    );
+    assert!(app.has("p2p-join"));
+    // A second click closes it (acts like the new-playlist row).
+    app.click("playlist-join");
+    assert!(
+        !app.has("p2p-join-row"),
+        "clicking the join button again closes it"
+    );
+}
+
+#[gpui_kit::test]
+async fn clicking_the_share_link_copies_to_clipboard(cx: &mut TestAppContext) {
+    let mut app = open_with_seed(cx, songs_library(), seed_p2p_playlists);
+    app.click_on(ElementId::Name("playlist-1".into()));
+    assert!(app.has("p2p-share-link"), "the owner sees a share link");
+    app.click_on("p2p-share-link");
+    // The text landed on the clipboard and the cue flipped to "Copied!".
+    let clip = app.cx.read_from_clipboard().expect("something was copied");
+    let text = clip.text().expect("clipboard holds text");
+    assert!(
+        text.starts_with("omamusic://"),
+        "clipboard holds the link: {text}"
+    );
+    assert!(
+        app.has("p2p-copy-label"),
+        "a copy cue is shown after copying"
+    );
+}
+
+#[gpui_kit::test]
+async fn peer_sees_seed_save_and_leave_but_not_stop(cx: &mut TestAppContext) {
+    // A synced, joined (read-only) playlist offers Seed to others, Save to
+    // Music and Leave, never the owner's Stop sharing.
+    let seed = |dir: &std::path::Path| {
+        let json = serde_json::json!({
+            "next_id": 1,
+            "items": [{
+                "id": 1, "name": "Joined", "tracks": [],
+                "p2p": true, "p2p_owner": false, "p2p_synced": true,
+                "p2p_share": "omamusic://seeded", "p2p_total_size": 4096u64
+            }]
+        });
+        std::fs::write(
+            dir.join("playlists.json"),
+            serde_json::to_vec_pretty(&json).unwrap(),
+        )
+        .unwrap();
+    };
+    let mut app = open_with_seed(cx, songs_library(), seed);
+    app.click_on(ElementId::Name("playlist-1".into()));
+    assert!(app.has("p2p-panel"));
+    assert!(
+        app.has(ElementId::Name("playlist-p2p-seed".into())),
+        "a peer can offer to seed to others"
+    );
+    assert!(
+        !app.has("playlist-p2p-stop"),
+        "a peer cannot stop the owner's share"
+    );
+    assert!(app.has("playlist-p2p-leave"), "a peer can leave");
+    // The read-only tag makes it unmistakable whose list it is.
+    assert!(
+        app.has(ElementId::Name("p2p-tag-1".into())),
+        "the view tags this as a read-only peer join"
+    );
+}
+
+#[gpui_kit::test]
+async fn searching_a_share_string_creates_a_p2p_playlist(cx: &mut TestAppContext) {
+    let mut app = open_with(cx, songs_library());
+    let share = omamusic::p2p::sample_share();
+    app.press("ctrl-f");
+    app.typing(&share);
+    app.press("enter");
+    // A new P2P playlist was created and selected.
+    let json = app.playlists_file();
+    let items = json["items"].as_array().expect("playlist array");
+    assert_eq!(items.len(), 1, "joining created one playlist");
+    assert_eq!(items[0]["p2p"], serde_json::json!(true), "marked as P2P");
+    assert_eq!(
+        items[0]["p2p_owner"],
+        serde_json::json!(false),
+        "the joiner is not the owner"
+    );
+    // The header shows the P2P panel.
+    assert!(app.has("p2p-panel"), "the joined playlist shows the panel");
+}
+
+#[gpui_kit::test]
+async fn invalid_share_string_is_reported(cx: &mut TestAppContext) {
+    let mut app = open(cx);
+    app.press("ctrl-f");
+    app.typing("omamusic://not-a-valid-ticket");
+    app.press("enter");
+    let note = app
+        .view
+        .read_with(app.cx, |v, _| v.notify_text())
+        .expect("a toast is shown");
+    assert!(
+        note.contains("Invalid P2P share"),
+        "the bad share is rejected: {note}"
+    );
+}
+
+#[gpui_kit::test]
+async fn disabled_p2p_hides_the_join_button_action(cx: &mut TestAppContext) {
+    let mut app = open_with_seed(cx, Arc::new(Library::empty()), |_| {});
+    // Turn P2P off in settings.
+    app.click("settings");
+    app.click("pref-p2p-enabled");
+    assert_eq!(app.saved("p2p_enabled"), serde_json::json!(false));
+    app.click("close-settings-x");
+    // The join button reports it is disabled rather than opening the input.
+    app.click("playlist-join");
+    assert!(!app.has("p2p-join-row"), "the join input stays closed");
+    let note = app
+        .view
+        .read_with(app.cx, |v, _| v.notify_text())
+        .expect("the user is told P2P is disabled");
+    assert!(note.contains("disabled"), "message: {note}");
 }

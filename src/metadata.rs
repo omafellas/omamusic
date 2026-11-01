@@ -41,6 +41,15 @@ pub fn is_macos_junk(path: &Path) -> bool {
     })
 }
 
+/// True when a path is inside the hidden folder that holds synced P2P shares.
+/// The indexer skips these so shared songs stay isolated from the main library
+/// while still living inside the user's music directory (and playing offline).
+pub fn is_shared_p2p(path: &Path) -> bool {
+    let marker = std::ffi::OsStr::new(crate::p2p::SHARE_SUBDIR);
+    path.components()
+        .any(|component| component.as_os_str() == marker)
+}
+
 pub fn is_audio(path: &Path) -> bool {
     if is_macos_junk(path) {
         return false;
@@ -569,6 +578,18 @@ mod tests {
         assert!(is_audio(Path::new("/m/song.mp3")));
         assert!(is_audio(Path::new("/m/song.FLAC")));
         assert!(!is_audio(Path::new("/m/cover.jpg")));
+    }
+
+    #[test]
+    fn shared_p2p_folder_is_skipped_by_the_indexer() {
+        use crate::p2p::SHARE_SUBDIR;
+        let shared = Path::new("/m/Music")
+            .join(SHARE_SUBDIR)
+            .join("7")
+            .join("abc.flac");
+        assert!(is_shared_p2p(&shared));
+        // A normal song in the same music folder is not skipped.
+        assert!(!is_shared_p2p(Path::new("/m/Music/Album/song.mp3")));
     }
 
     #[test]

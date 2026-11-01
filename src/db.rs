@@ -79,6 +79,35 @@ CREATE TABLE IF NOT EXISTS plays (
     last_played_ns INTEGER NOT NULL DEFAULT 0
 );
 
+-- P2P playlist cache. Disposable: it can always be rebuilt from the shared
+-- blobs, so an unreadable row is simply ignored.
+CREATE TABLE IF NOT EXISTS p2p_shares (
+    playlist_id   INTEGER PRIMARY KEY,
+    owner_node_id TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    total_size    INTEGER NOT NULL DEFAULT 0,
+    song_count    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS p2p_tracks (
+    playlist_id INTEGER NOT NULL,
+    path        TEXT NOT NULL,
+    hash        TEXT NOT NULL DEFAULT '',
+    title       TEXT NOT NULL DEFAULT '',
+    artist      TEXT NOT NULL DEFAULT '',
+    album       TEXT NOT NULL DEFAULT '',
+    duration    REAL NOT NULL DEFAULT 0,
+    size        INTEGER NOT NULL DEFAULT 0,
+    mime        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (playlist_id, path)
+);
+CREATE TABLE IF NOT EXISTS p2p_peers (
+    playlist_id    INTEGER NOT NULL,
+    peer_node_id   TEXT NOT NULL,
+    connected_at   INTEGER NOT NULL,
+    PRIMARY KEY (playlist_id, peer_node_id)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
     title, artist, album, genre,
     content='tracks', content_rowid='id',
@@ -251,6 +280,231 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     }
     conn.execute_batch(SCHEMA)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// Ensure the P2P cache tables exist. These are disposable and created
+/// idempotently so existing libraries are never wiped to add them.
+pub fn ensure_p2p_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS p2p_shares ( \
+            playlist_id   INTEGER PRIMARY KEY, \
+            owner_node_id TEXT NOT NULL, \
+            manifest_hash TEXT NOT NULL, \
+            created_at    INTEGER NOT NULL, \
+            total_size    INTEGER NOT NULL DEFAULT 0, \
+            song_count    INTEGER NOT NULL DEFAULT 0, \
+            seeded_bytes  INTEGER NOT NULL DEFAULT 0, \
+            share         TEXT NOT NULL DEFAULT ''); \
+         CREATE TABLE IF NOT EXISTS p2p_tracks ( \
+            playlist_id INTEGER NOT NULL, \
+            path        TEXT NOT NULL, \
+            hash        TEXT NOT NULL DEFAULT '', \
+            title       TEXT NOT NULL DEFAULT '', \
+            artist      TEXT NOT NULL DEFAULT '', \
+            album       TEXT NOT NULL DEFAULT '', \
+            duration    REAL NOT NULL DEFAULT 0, \
+            size        INTEGER NOT NULL DEFAULT 0, \
+            mime        TEXT NOT NULL DEFAULT '', \
+            PRIMARY KEY (playlist_id, path)); \
+         CREATE TABLE IF NOT EXISTS p2p_peers ( \
+            playlist_id    INTEGER NOT NULL, \
+            peer_node_id   TEXT NOT NULL, \
+            connected_at   INTEGER NOT NULL, \
+            PRIMARY KEY (playlist_id, peer_node_id));",
+    )?;
+    // Add newer columns to pre-existing cache DBs; ignore "duplicate column".
+    for ddl in [
+        "ALTER TABLE p2p_shares ADD COLUMN seeded_bytes INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE p2p_shares ADD COLUMN share TEXT NOT NULL DEFAULT ''",
+    ] {
+        let _ = conn.execute_batch(ddl);
+    }
+    Ok(())
+}
+
+/// Everything needed to resume seeding a playlist after a restart.
+pub struct P2pShareRecord {
+    pub owner_node_id: String,
+    pub manifest_hash: String,
+    pub total_size: u64,
+    pub song_count: u64,
+    pub seeded_bytes: u64,
+    pub share: String,
+}
+
+/// Load the full resume record for a playlist's share, if present.
+pub fn load_p2p_share(conn: &Connection, playlist_id: u64) -> Result<Option<P2pShareRecord>> {
+    let row = conn
+        .query_row(
+            "SELECT owner_node_id, manifest_hash, total_size, song_count, seeded_bytes, share \
+             FROM p2p_shares WHERE playlist_id = ?1",
+            rusqlite::params![playlist_id as i64],
+            |row| {
+                Ok(P2pShareRecord {
+                    owner_node_id: row.get(0)?,
+                    manifest_hash: row.get(1)?,
+                    total_size: row.get::<_, i64>(2)?.max(0) as u64,
+                    song_count: row.get::<_, i64>(3)?.max(0) as u64,
+                    seeded_bytes: row.get::<_, i64>(4)?.max(0) as u64,
+                    share: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Update the running seeded-bytes total and advertised share for a playlist.
+pub fn record_p2p_seed_stats(
+    conn: &Connection,
+    playlist_id: u64,
+    seeded_bytes: u64,
+    share: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE p2p_shares SET seeded_bytes = ?2, share = ?3 WHERE playlist_id = ?1",
+        rusqlite::params![playlist_id as i64, seeded_bytes as i64, share],
+    )?;
+    Ok(())
+}
+
+/// Record or update a P2P share in the cache.
+pub fn record_p2p_share(
+    conn: &Connection,
+    playlist_id: u64,
+    owner_node_id: &str,
+    manifest_hash: &str,
+    total_size: u64,
+    song_count: u64,
+) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64);
+    conn.execute(
+        "INSERT INTO p2p_shares(playlist_id, owner_node_id, manifest_hash, created_at, total_size, song_count) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(playlist_id) DO UPDATE SET owner_node_id=excluded.owner_node_id, manifest_hash=excluded.manifest_hash, \
+         created_at=excluded.created_at, total_size=excluded.total_size, song_count=excluded.song_count",
+        rusqlite::params![
+            playlist_id as i64, owner_node_id, manifest_hash, now, total_size as i64,
+            song_count as i64
+        ],
+    )?;
+    Ok(())
+}
+
+/// A cached P2P song row: `(path, hash, title, artist, album, duration, size, mime)`.
+pub type P2pTrackRow = (String, String, String, String, String, f64, u64, String);
+
+/// Replace the cached tracks for a P2P playlist.
+pub fn replace_p2p_tracks(
+    conn: &Connection,
+    playlist_id: u64,
+    tracks: &[P2pTrackRow],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM p2p_tracks WHERE playlist_id = ?1",
+        rusqlite::params![playlist_id as i64],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO p2p_tracks(playlist_id, path, hash, title, artist, album, duration, size, mime) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for (path, hash, title, artist, album, duration, size, mime) in tracks {
+        stmt.execute(rusqlite::params![
+            playlist_id as i64,
+            path,
+            hash,
+            title,
+            artist,
+            album,
+            duration,
+            *size as i64,
+            mime
+        ])?;
+    }
+    drop(stmt);
+    Ok(())
+}
+
+/// Cached tracks for a P2P playlist, in storage order.
+pub fn list_p2p_tracks(conn: &Connection, playlist_id: u64) -> Result<Vec<P2pTrackRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, hash, title, artist, album, duration, size, mime FROM p2p_tracks \
+         WHERE playlist_id = ?1 ORDER BY rowid",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![playlist_id as i64], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get::<_, i64>(6)? as u64,
+            row.get(7)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Record a peer that is (or was) syncing a playlist.
+pub fn record_p2p_peer(conn: &Connection, playlist_id: u64, peer_node_id: &str) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64);
+    conn.execute(
+        "INSERT INTO p2p_peers(playlist_id, peer_node_id, connected_at) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(playlist_id, peer_node_id) DO UPDATE SET connected_at=excluded.connected_at",
+        rusqlite::params![playlist_id as i64, peer_node_id, now],
+    )?;
+    Ok(())
+}
+
+/// Peers currently known for a playlist.
+pub fn list_p2p_peers(conn: &Connection, playlist_id: u64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT peer_node_id FROM p2p_peers WHERE playlist_id = ?1")?;
+    let rows = stmt.query_map(rusqlite::params![playlist_id as i64], |row| row.get(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The stored manifest hash + owner node id for a playlist, if cached.
+pub fn get_p2p_share(conn: &Connection, playlist_id: u64) -> Result<Option<(String, String)>> {
+    let row = conn
+        .query_row(
+            "SELECT manifest_hash, owner_node_id FROM p2p_shares WHERE playlist_id = ?1",
+            rusqlite::params![playlist_id as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Drop all cache rows for a playlist (tracks, peers, share).
+pub fn remove_p2p_playlist(conn: &Connection, playlist_id: u64) -> Result<()> {
+    let id = playlist_id as i64;
+    conn.execute(
+        "DELETE FROM p2p_tracks WHERE playlist_id = ?1",
+        rusqlite::params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM p2p_peers WHERE playlist_id = ?1",
+        rusqlite::params![id],
+    )?;
+    conn.execute(
+        "DELETE FROM p2p_shares WHERE playlist_id = ?1",
+        rusqlite::params![id],
+    )?;
     Ok(())
 }
 
@@ -1359,6 +1613,53 @@ mod tests {
         let album = album_detail(&conn, &key).unwrap().unwrap();
         let titles: Vec<&str> = album.tracks.iter().map(|t| t.title.as_str()).collect();
         assert_eq!(titles, ["First", "Second"]);
+    }
+
+    #[test]
+    fn p2p_tables_round_trip() {
+        let conn = memory();
+        ensure_p2p_schema(&conn).unwrap();
+        record_p2p_share(&conn, 3, "owner-node", "manifest-hash", 4096, 12).unwrap();
+        record_p2p_share(&conn, 3, "owner-node", "manifest-hash2", 5000, 12).unwrap();
+        let tracks = vec![
+            (
+                "/cache/1.mp3".to_string(),
+                "hash-1".to_string(),
+                "Title".to_string(),
+                "Artist".to_string(),
+                "Album".to_string(),
+                100.0,
+                1024u64,
+                "audio/mpeg".to_string(),
+            ),
+            (
+                "/cache/2.flac".to_string(),
+                "hash-2".to_string(),
+                "Two".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                30.0,
+                2048u64,
+                "audio/flac".to_string(),
+            ),
+        ];
+        replace_p2p_tracks(&conn, 3, &tracks).unwrap();
+        replace_p2p_tracks(&conn, 3, &tracks[1..]).unwrap(); // replace, not append
+        let list = list_p2p_tracks(&conn, 3).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "/cache/2.flac");
+        assert_eq!(list[0].2, "Two");
+        assert_eq!(list[0].5, 30.0);
+        assert_eq!(list[0].6, 2048);
+        // A second playlist does not disturb the first.
+        assert!(list_p2p_tracks(&conn, 4).unwrap().is_empty());
+        record_p2p_peer(&conn, 3, "peer-x").unwrap();
+        record_p2p_peer(&conn, 3, "peer-y").unwrap();
+        record_p2p_peer(&conn, 3, "peer-x").unwrap(); // dedup
+        let peers = list_p2p_peers(&conn, 3).unwrap();
+        assert_eq!(peers.len(), 2);
+        assert!(peers.contains(&"peer-x".to_string()));
+        assert!(peers.contains(&"peer-y".to_string()));
     }
 
     #[test]
