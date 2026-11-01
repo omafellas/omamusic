@@ -10,12 +10,6 @@ Minimalist local music player optimized for Omarchy Linux written in Rust & GPUI
 cargo install --path .
 ```
 
-The installed player needs no separate media player, codec package, or GStreamer plugin. It uses the desktop's normal audio service through PulseAudio (including PipeWire's PulseAudio compatibility service), with ALSA available as a fallback. The optional folder picker uses `zenity` or `kdialog`; you can also type a directory path in Settings.
-
-Building from source on Linux requires the ALSA development headers for CPAL (`alsa-lib` on Arch/Omarchy or `libasound2-dev` on Ubuntu), in addition to GPUI's normal graphics build requirements. These are build requirements, not playback plugins or companion programs.
-
-Run `omamusic`: on first launch it picks up `~/Music` automatically, no setup needed. Settings can add, browse or remove folders. Configuration is stored at `~/.config/omamusic/config.json`. Set `OMAMUSIC_CONFIG_DIR` to use a different config directory.
-
 ## Features
 
 - Local library indexed into a SQLite database at `~/.cache/omamusic/library.db`; album, artist and song views; no accounts, and no network use unless you turn it on.
@@ -32,6 +26,12 @@ Run `omamusic`: on first launch it picks up `~/Music` automatically, no setup ne
 - Omarchy theme following through `gpui-omarchy`.
 
 Space toggles playback, Left/Right changes tracks, Ctrl+F jumps to the search field, and Ctrl+R rescans the library. Ctrl+= / Ctrl+- adjust the text size (Ctrl+0 resets it); the setting is also in Settings and persists across restarts. A folder picker uses `zenity` or `kdialog` if available.
+
+The installed player needs no separate media player, codec package, or GStreamer plugin. It uses the desktop's normal audio service through PulseAudio (including PipeWire's PulseAudio compatibility service), with ALSA available as a fallback. The optional folder picker uses `zenity` or `kdialog`; you can also type a directory path in Settings.
+
+Building from source on Linux requires the ALSA development headers for CPAL (`alsa-lib` on Arch/Omarchy or `libasound2-dev` on Ubuntu), in addition to GPUI's normal graphics build requirements. These are build requirements, not playback plugins or companion programs.
+
+Run `omamusic`: on first launch it picks up `~/Music` automatically, no setup needed. Settings can add, browse or remove folders. Configuration is stored at `~/.config/omamusic/config.json`. Set `OMAMUSIC_CONFIG_DIR` to use a different config directory.
 
 ## Flatpak
 
