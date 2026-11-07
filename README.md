@@ -1,6 +1,6 @@
 # Omamusic
 
-Minimalist local music player optimized for Omarchy Linux written in Rust & GPUI.
+Minimalist local music player optimized for [Omarchy Linux](https://github.com/omacom/omarchy) written in [Rust](https://github.com/rust-lang/rust) & [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
 
 [![CI](https://github.com/omafellas/omamusic/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/omafellas/omamusic/actions/workflows/ci.yml?query=branch%3Amain)
 
