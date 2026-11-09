@@ -5,6 +5,22 @@
 - Do not run the full suite (`cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`) while a task is in progress. Run them once, at the end, before finishing.
 - During iteration, keep feedback fast: `cargo check` or a single targeted test (`cargo test <name>`), and prefer the edit tool's exact-match feedback over recompiling for every small change.
 
+## Architecture
+
+- Linux is the only first-class supported target; macOS and Windows should compile but are not actively supported. The UI is GPUI through `gpui-kit`; theme colors come from `gpui-omarchy`. Use `cx.omarchy()` and existing kit components instead of hardcoded styling.
+- `Library` (`src/library.rs`) is the read model. It pages from SQLite (`src/db.rs`) and runs `src/index.rs` on a background thread. `src/app.rs` renders snapshots and owns UI state; `src/player.rs` owns playback.
+- The SQLite index is disposable, but the `plays` table is user data. To change the schema, bump `db::SCHEMA_VERSION`; the next start drops and rebuilds the index tables. Keep `plays` out of the drop and never add a migration.
+- `src/player.rs` decodes on a worker thread and feeds a CPAL callback from a buffer. Keep disk reads, decoding and allocation out of the callback.
+- Network work belongs in `src/lookup/` and runs only when `online_lookup` is on. Do not add network calls to the UI or scan paths.
+- Desktop integration (`src/desktop.rs`, `src/mpris.rs`, `src/tray.rs`) runs on its own thread and must not stop the app from working when no session bus is available.
+- Persist settings through `AppConfig::update`. `config.json`, `liked.json` and `playlists.json` live in the config directory; tests must isolate it with `AppConfig::use_dir`.
+
+Useful during development:
+
+- `OMAMUSIC_CONFIG_DIR=/tmp/omamusic-qa cargo run` uses a throwaway config.
+- `cargo run -- --dump-library` prints the index without opening a window.
+- `OMADRIVE_VIEW=songs|artists|genres|settings|album|queue` opens a section directly.
+
 ## Tests
 
 Smoke tests first. Every user-visible change needs a UI smoke test in `tests/ui.rs`.
@@ -65,9 +81,7 @@ RENDERING_REQUIRED=1 cargo test --test rendering   # fail instead of skip (CI do
 RENDERING_DUMP_DIR=/tmp/shots cargo test --test rendering   # save every capture as PNG
 ```
 
-Linux is the only supported target. CI (`.github/workflows/ci.yml`) runs on Ubuntu with Mesa lavapipe for the pixel tests, on every push, pull request and release.
-
-Manual QA against a throwaway config: `OMAMUSIC_CONFIG_DIR=/tmp/omamusic-qa cargo run`.
+CI (`.github/workflows/ci.yml`) runs on Ubuntu with Mesa lavapipe for the pixel tests, on every push, pull request and release.
 
 ## Before committing
 
